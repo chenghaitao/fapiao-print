@@ -2,6 +2,14 @@
 REM 发票酱 桌面 exe 编译脚本（OCR 版，含 PP-OCRv5）
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+if exist "C:\Program Files\LLVM\bin\libclang.dll" (
+	set "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
+	set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+)
+if not defined LIBCLANG_PATH (
+	echo LLVM/libclang not found. Install LLVM and retry.
+	exit /b 1
+)
 cd /D "%~dp0"
 echo [1/2] npm install ...
 call npm install

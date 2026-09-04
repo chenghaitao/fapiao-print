@@ -157,6 +157,9 @@ input, textarea, select, [contenteditable="true"], .modal-body, .modal-body *, p
   cursor: pointer; transition: background 0.15s; gap: 8px;
 }
 .file-item:hover { background: var(--surface2); }
+.file-item.file-dragging { opacity: 0.45; cursor: grabbing; user-select: none; }
+.file-item.file-drop-before { box-shadow: inset 0 3px 0 var(--accent); }
+.file-item.file-drop-after { box-shadow: inset 0 -3px 0 var(--accent); }
 .file-item.active-item { background: var(--accent-light); box-shadow: inset 3px 0 0 var(--accent); }
 .file-item.active-item .file-name { color: var(--accent); }
 .file-check {

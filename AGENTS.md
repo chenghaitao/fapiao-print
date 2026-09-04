@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-- **版本**: v2.5.0
+- **版本**: v2.5.1
 
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架）
 
@@ -152,6 +152,12 @@ npm run bump <版本号>    # 同步版本号到 Cargo.toml + tauri.conf.json
 - **排序语义**: splice 两步法（先移除源、再 `indexOf` 重取目标索引）；倒序打印时 before/after 反映射；选中态跨页跟随；相邻槽位往自侧插入 = 原位，直接 no-op
 - **⚠️ `_dragHintShown` 必须在 layout.js 顶层声明**: 未声明时 `showDragHint()` 抛 ReferenceError 被 mousemove 事件派发边界吞掉，`dropZone/dropIdx` 静默保持空值，落点判定全灭（v2.5.0 实测踩坑）
 - **web 同步**: web 分支 layout.js 同逻辑（无倒序反映射，web 无 pageOrder）
+
+### 左侧列表拖拽排序 (v2.5.1)
+
+- 列表/方格视图的 `.file-item` 均支持 HTML5 拖拽排序
+- 拖到目标项上半区插入前面，下半区插入后面；复选框和操作按钮不启动拖拽
+- 排序后 `_activeFileIdx` 跟随文件对象，统一刷新列表与预览
 
 ### 预览滚轮交互 (v2.4.0)
 

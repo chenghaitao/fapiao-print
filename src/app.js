@@ -1413,6 +1413,83 @@ function buildAmtBadge(f) {
   return '';
 }
 
+var _fileDrag = null;
+var _fileDragClickSuppressed = false;
+
+function startFileDrag(e, idx) {
+  if (e.button !== 0 || e.target.closest('.file-check, button') || !S.files[idx] || S.files[idx]._loading) return;
+  _fileDrag = {
+    index: idx,
+    startX: e.clientX,
+    startY: e.clientY,
+    target: -1,
+    position: '',
+    moved: false,
+    element: e.currentTarget
+  };
+  document.addEventListener('mousemove', moveFileDrag);
+  document.addEventListener('mouseup', finishFileDrag);
+}
+
+function moveFileDrag(e) {
+  if (!_fileDrag) return;
+  var dx = e.clientX - _fileDrag.startX;
+  var dy = e.clientY - _fileDrag.startY;
+  if (!_fileDrag.moved && Math.hypot(dx, dy) < 5) return;
+  if (!_fileDrag.moved) {
+    _fileDrag.moved = true;
+    _fileDrag.element.classList.add('file-dragging');
+  }
+  e.preventDefault();
+  var targetEl = document.elementFromPoint(e.clientX, e.clientY);
+  targetEl = targetEl && targetEl.closest ? targetEl.closest('.file-item') : null;
+  var target = targetEl ? parseInt(targetEl.dataset.idx) : -1;
+  if (!targetEl || isNaN(target) || target === _fileDrag.index || !S.files[target]) {
+    clearFileDropTarget();
+    _fileDrag.target = -1;
+    _fileDrag.position = '';
+    return;
+  }
+  var rect = targetEl.getBoundingClientRect();
+  var position = (e.clientY - rect.top) < rect.height / 2 ? 'before' : 'after';
+  if (_fileDrag.target === target && _fileDrag.position === position) return;
+  clearFileDropTarget();
+  _fileDrag.target = target;
+  _fileDrag.position = position;
+  targetEl.classList.add(position === 'before' ? 'file-drop-before' : 'file-drop-after');
+}
+
+function clearFileDropTarget() {
+  document.querySelectorAll('.file-drop-before, .file-drop-after').forEach(function(el) {
+    el.classList.remove('file-drop-before', 'file-drop-after');
+  });
+}
+
+function finishFileDrag() {
+  if (!_fileDrag) return;
+  var drag = _fileDrag;
+  document.removeEventListener('mousemove', moveFileDrag);
+  document.removeEventListener('mouseup', finishFileDrag);
+  clearFileDropTarget();
+  if (drag.element) drag.element.classList.remove('file-dragging');
+  _fileDrag = null;
+  if (!drag.moved || drag.target < 0) return;
+  var source = drag.index;
+  var target = drag.target;
+  var position = drag.position;
+  var file = S.files[source];
+  S.files.splice(source, 1);
+  if (source < target) target--;
+  if (position === 'after') target++;
+  S.files.splice(target, 0, file);
+  _activeFileIdx = S.files.indexOf(file);
+  _fileDragClickSuppressed = true;
+  renderFileList();
+  updatePreview();
+  var item = document.querySelector('.file-item[data-idx="' + _activeFileIdx + '"]');
+  if (item) item.scrollIntoView({ block: 'nearest' });
+}
+
 /**
  * Incrementally update a single file item's badges in the sidebar
  */
@@ -2002,7 +2079,7 @@ function renderFileList() {
     var hideStyle = hidden ? ' style="display:none"' : '';
     if (grid) {
       if (f._placeholder) {
-        return '<div class="file-item file-card placeholder-item" data-idx="' + i + '"' + hideStyle + '>' +
+        return '<div class="file-item file-card placeholder-item" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + '>' +
           '<div class="file-thumb"><div class="blank-thumb">\u25A6</div></div>' +
           '<div class="card-name">空白占位</div>' +
           '<div class="card-meta"><button class="ib card-ib danger" onclick="rmFile(' + i + ')" title="删除空白占位">\u2715</button></div></div>';
@@ -2028,7 +2105,7 @@ function renderFileList() {
       } else {
         gacts = '<button class="ib card-ib danger" onclick="rmFile(' + i + ')" title="删除">\u2715</button>';
       }
-      return '<div class="' + cls + ' file-card" data-idx="' + i + '"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
+      return '<div class="' + cls + ' file-card" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
         '<div class="file-thumb">' + gthumb + '<div class="type-badge">' + gtype + '</div>' +
         '<div class="file-check ' + (f.checked ? 'checked' : '') + '" onclick="togCheck(' + i + ')"></div>' +
         '<div class="card-actions">' + gacts + '</div></div>' +
@@ -2043,7 +2120,7 @@ function renderFileList() {
         '<button class="ib sort-btn' + (i === 0 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',-1)" title="上移">\u25B2</button>' +
         '<button class="ib sort-btn' + (i === S.files.length - 1 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',1)" title="下移">\u25BC</button>' +
         '<button class="ib danger" onclick="rmFile(' + i + ')" title="删除空白占位">\u2715</button></div>';
-      return '<div class="file-item placeholder-item" data-idx="' + i + '"' + hideStyle + '>' +
+      return '<div class="file-item placeholder-item" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + '>' +
         '<div class="file-check disabled"></div>' +
         '<div class="file-thumb"><div class="blank-thumb">\u25A6</div></div>' +
         '<div class="file-info"><div class="file-name">空白占位</div><div class="file-meta">' + pMeta + '</div></div></div>';
@@ -2073,7 +2150,7 @@ function renderFileList() {
         '<button class="ib sort-btn' + (i === 0 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',-1)" title="上移">\u25B2</button>' +
         '<button class="ib sort-btn' + (i === S.files.length - 1 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',1)" title="下移">\u25BC</button>' +
         ocrBtnHtml + '<button class="ib" onclick="rotFile(' + i + ')" title="旋转90°">\u21BB</button><button class="ib danger" onclick="rmFile(' + i + ')">\u2715</button></div>';
-    return '<div class="' + cls + '" data-idx="' + i + '"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
+    return '<div class="' + cls + '" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
       '<div class="file-check ' + (f.checked ? 'checked' : '') + '" onclick="togCheck(' + i + ')"></div>' +
       '<div class="file-thumb">' + thumbContent + '<div class="type-badge">' + typeBadgeText + '</div></div>' +
       '<div class="file-info"><div class="file-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + '</div>' + (sb ? '<div class="file-seller" title="' + escHtml(f.sellerName) + '">' + sb + '</div>' : '') + '<div class="file-meta">' + metaActions + '</div></div>' +
@@ -2241,6 +2318,10 @@ function resetLayout() {
 
 // Click file item → navigate preview to the page containing this invoice
 function clickFileItem(idx, event) {
+  if (_fileDragClickSuppressed) {
+    _fileDragClickSuppressed = false;
+    return;
+  }
   // Ignore clicks on checkbox, sort buttons, and action buttons
   if (event && (event.target.closest('.file-check') || event.target.closest('.sort-btn') || event.target.closest('button'))) return;
   var f = S.files[idx];

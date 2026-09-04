@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue.svg)]()
 [![Tauri 2.x](https://img.shields.io/badge/Tauri-2.x-orange.svg)]()
-[![Version](https://img.shields.io/badge/Version-2.4.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-2.5.1-blue.svg)]()
 
 轻量桌面应用，专为批量打印电子发票设计。支持 PDF、OFD、图片等多格式导入，智能排版，一键打印或导出。
 
@@ -35,6 +35,7 @@ OFD（开放版式文档）是国家标准电子发票格式，本工具提供�
 - **骨架屏渐进加载**：批量导入时骨架屏秒出 + 逐文件渐进渲染 + 持久进度 toast，大文件不卡 UI
 - **日期排序**（v2.0.8）：📅 按钮弹出菜单，可选旧→新 / 新→旧，空日期自动排末尾
 - **版面拖拽排序**（v2.5.0）：预览区拖动发票到另一槽位即排序——拖到边缘 = 顺位插入，拖到中间 = 两张对调
+- **左侧列表拖拽排序**（v2.5.1）：列表和缩略图方格视图均支持拖动发票排序，拖到目标项上方/下方分别插入前后
 - **缩略图方格视图**（v2.4.0）：左侧列表可切换卡片式方格视图，缩略图 + 金额/份数/重复/已打印标记 + hover 操作条，视图选择持久化
 - **↑↓ 排序**：↑↓ 按钮排序（替换 Tauri webview 拖拽卡顿），hover 浮动显示不占空间
 - **批量重命名**（v2.0.5）：汇总表内嵌面板，预设模板（金额+销售方+号码等）或自定义字段勾选，一键批量重命名发票磁盘文件，重名自动序号

@@ -107,28 +107,40 @@ jobs:
           }
 
       # 兜底：NSIS 在 CI 上偶尔丢失中文文件名，强制改名
-      - name: Rename if Chinese lost (fallback)
+      - name: Normalize artifact filenames (force Chinese)
         shell: pwsh
         run: |
-          $dist = "dist"
+          $dist    = "dist"
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Write-Host "目标版本: $version"
 
-          $renameMap = @{
-            "_${version}_x64-setup.exe"      = "发票酱_${version}_x64-setup.exe"
-            "_${version}_x64_OCR.-setup.exe" = "发票酱_${version}_x64_OCR版-setup.exe"
-            "_${version}_x64_OCR-setup.exe"  = "发票酱_${version}_x64_OCR版-setup.exe"
-            "_${version}_x64_.exe"           = "发票酱_${version}_x64_绿色版.exe"
-            "_${version}_x64_OCR.zip"        = "发票酱_${version}_x64_OCR绿色版.zip"
-          }
+          # 不依赖中文前缀做匹配：CI 上中文可能被丢弃成空/点号。
+          # 只用「是否含 OCR」+「扩展名」两个 ASCII 特征归类，再强制写成中文名。
+          foreach ($f in @(Get-ChildItem -Path $dist -File)) {
+            $n     = $f.Name
+            $isOcr = $n -match 'OCR'
+            if ($isOcr -and $n -like '*-setup.exe') {
+              $target = "发票酱_${version}_x64_OCR版-setup.exe"
+            } elseif ($isOcr -and $n -like '*.zip') {
+              $target = "发票酱_${version}_x64_OCR绿色版.zip"
+            } elseif (-not $isOcr -and $n -like '*-setup.exe') {
+              $target = "发票酱_${version}_x64-setup.exe"
+            } elseif (-not $isOcr -and $n -like '*.exe') {
+              $target = "发票酱_${version}_x64_绿色版.exe"
+            } else {
+              $target = $null
+            }
 
-          foreach ($entry in $renameMap.GetEnumerator()) {
-            $oldPath = Join-Path $dist $entry.Key
-            $newPath = Join-Path $dist $entry.Value
-            if (Test-Path $oldPath) {
-              Move-Item -Force $oldPath $newPath
-              Write-Host "🔄 重命名: $($entry.Key) → $($entry.Value)"
+            if ($target -and $n -ne $target) {
+              Rename-Item -Path $f.FullName -NewName $target -Force
+              Write-Host "重命名: $n -> $target"
+            } elseif ($target) {
+              Write-Host "已是正确名称: $n"
             }
           }
+
+          Write-Host "`n=== 规范化后的文件名 ==="
+          Get-ChildItem -Path $dist -File | ForEach-Object { Write-Host "  $($_.Name)" }
 
       - name: List final artifacts
         shell: pwsh
@@ -205,16 +217,33 @@ jobs:
           Write-Host "`n=== Release Body Preview ==="
           Write-Host $body
 
-      - name: Create Release & Upload
-        uses: softprops/action-gh-release@v2
+      # 不用 softprops/action-gh-release：它在 Windows runner 上会丢掉中文文件名
+      # （v2.5.1 实测 4 个产物上传后全变成 _2.5.1_x64-setup.exe 这类无中文名）。
+      # 改用 runner 预装的 gh CLI（Go 实现，UTF-8 处理正确）。
+      - name: Create Release & Upload (gh CLI)
         if: startsWith(github.ref, 'refs/tags/') || inputs.publish_release
-        with:
-          tag_name: ${{ steps.resolve_tag.outputs.tag }}
-          name: ${{ steps.resolve_tag.outputs.tag }}
-          body_path: release_body.txt
-          draft: false
-          prerelease: false
-          files: dist/*
-          fail_on_unmatched_files: true
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag  = "${{ steps.resolve_tag.outputs.tag }}"
+          $repo = "chenghaitao/fapiao-print"
+
+          gh release view "$tag" --repo $repo 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "创建 Release $tag"
+            gh release create "$tag" --repo $repo --title "$tag" --notes-file release_body.txt
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::创建 Release 失败"; exit 1 }
+          } else {
+            Write-Host "Release $tag 已存在，仅覆盖更新资产"
+          }
+
+          Get-ChildItem -Path dist -File | ForEach-Object {
+            $mb = [math]::Round($_.Length / 1MB, 1)
+            Write-Host "上传: $($_.Name)  ($mb MB)"
+            gh release upload "$tag" $_.FullName --repo $repo --clobber
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::上传失败: $($_.Name)"; exit 1 }
+          }
+
+          Write-Host "`n=== Release 最终资产 ==="
+          gh release view "$tag" --repo $repo --json assets --jq '.assets[].name'

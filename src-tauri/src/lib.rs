@@ -1392,16 +1392,25 @@ pub fn run() {
                             }
                             tauri::DragDropEvent::Drop { paths, .. } => {
                                 let _ = win.eval("if(window._tauriDragHover)window._tauriDragHover(false)");
-                                let valid: Vec<String> = paths.iter()
-                                    .filter_map(|p| {
-                                        let valid_ext = p.extension()
-                                            .and_then(|e| e.to_str())
-                                            .map(|e| ["pdf", "jpg", "jpeg", "png", "bmp", "webp", "tiff", "tif", "ofd", "xml"].contains(&e.to_lowercase().as_str()))
-                                            .unwrap_or(false);
-                                        if valid_ext { Some(p.to_string_lossy().to_string()) } else { None }
-                                    })
-                                    .collect();
-                                let json = serde_json::to_string(&valid).unwrap_or_default();
+                                let supported = ["pdf", "jpg", "jpeg", "png", "bmp", "webp", "tiff", "tif", "ofd", "xml"];
+                                let mut valid = Vec::new();
+                                let mut skipped = 0usize;
+                                let mut pending = paths.clone();
+                                while let Some(path) = pending.pop() {
+                                    if path.is_dir() {
+                                        if let Ok(entries) = std::fs::read_dir(&path) {
+                                            for entry in entries.flatten() { pending.push(entry.path()); }
+                                        }
+                                        continue;
+                                    }
+                                    let valid_ext = path.extension()
+                                        .and_then(|e| e.to_str())
+                                        .map(|e| supported.contains(&e.to_lowercase().as_str()))
+                                        .unwrap_or(false);
+                                    if valid_ext { valid.push(path.to_string_lossy().to_string()); } else { skipped += 1; }
+                                }
+                                let payload = serde_json::json!({ "paths": valid, "skipped": skipped });
+                                let json = serde_json::to_string(&payload).unwrap_or_default();
                                 let js = format!("if(window._tauriFileDrop)window._tauriFileDrop({})", json);
                                 let _ = win.eval(&js);
                             }

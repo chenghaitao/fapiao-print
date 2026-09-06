@@ -473,6 +473,15 @@ function applyOcrResult(fileObj, ocrResult) {
   }
 }
 
+function isNonInvoiceTif(fileObj) {
+  if (!fileObj || !/^(tif|tiff)$/i.test(fileObj.type)) return false;
+  var text = String(fileObj._ocrText || '').replace(/\s/g, '');
+  if (!text) return true;
+  var hasInvoiceMarker = /发票|电子客票|客票号|通行费|税率|价税合计|校验码|发票号码|发票代码|金额合计/.test(text);
+  var hasRecognizedField = !!(fileObj.amountTax || fileObj.amountNoTax || fileObj.sellerName || fileObj.invoiceNo || fileObj.invoiceDate || fileObj._isTicket || fileObj._isNonTax || fileObj._isToll);
+  return !hasInvoiceMarker && !hasRecognizedField;
+}
+
 /**
  * Apply PDF text layer extraction result to a file object.
  * Called BEFORE OCR — structured extraction (PDF text / OFD XML) takes priority.
@@ -602,17 +611,19 @@ function applyPdfTextResult(fileObj, pdfTextResult) {
  * @param {string} [filePath] - Disk path to the image file (preferred — skips base64)
  */
 async function applyOcr(fileObj, dataUrl, filePath) {
-  if (!hasOcr || !isTauri || !invoke) return;
+  if (!hasOcr || !isTauri || !invoke) return false;
   try {
     var ocrResult = await invoke('ocr_image', {
       dataUrl: dataUrl || '',
       filePath: filePath || fileObj._filePath || null,
       ocrPrecision: S.ocrPrecision || 'standard'
     });
-    if (!ocrResult) return;
+    if (!ocrResult) return false;
     applyOcrResult(fileObj, ocrResult);
+    return true;
   } catch(e) {
     console.warn('[OCR] 识别失败:', e);
+    return false;
   }
 }
 
@@ -623,17 +634,19 @@ async function applyOcr(fileObj, dataUrl, filePath) {
  * Instead: Rust render → decode in memory → OCR → return result directly.
  */
 async function applyOcrPdfPage(fileObj) {
-  if (!hasOcr || !isTauri || !invoke) return;
+  if (!hasOcr || !isTauri || !invoke) return false;
   try {
     var ocrResult = await invoke('ocr_pdf_page', {
       pdfPath: fileObj._pdfPath,
       pageIndex: fileObj._pdfPageIdx,
       ocrPrecision: S.ocrPrecision || 'standard'
     });
-    if (!ocrResult) return;
+    if (!ocrResult) return false;
     applyOcrResult(fileObj, ocrResult);
+    return true;
   } catch(e) {
     console.warn('[OCR] PDF页识别失败:', e);
+    return false;
   }
 }
 

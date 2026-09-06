@@ -185,6 +185,25 @@ function toastLoading(msg) {
 }
 function toastDone(msg) { toast(msg, 2500); }
 function hideToast() { var e = document.getElementById('toast'); e.classList.remove('show'); clearTimeout(toastT); }
+function showAddSummary(stats) {
+  var e = document.getElementById('toast');
+  e.innerHTML = '已添加' + stats.files + '个文件，成功解析' + stats.parsed + '张发票，已跳过' + stats.skipped + '个不支持的文件 <button class="toast-close" type="button" aria-label="关闭" onclick="hideToast()">×</button>';
+  e.classList.add('show');
+  clearTimeout(toastT);
+}
+function markNonInvoiceImageSkipped(fileObj) {
+  if (!fileObj || !/^(tif|tiff)$/i.test(fileObj.type) || fileObj._nonInvoiceSkipped) return false;
+  fileObj._nonInvoiceSkipped = true;
+  var idx = S.files.indexOf(fileObj);
+  if (idx < 0) return false;
+  S.files.splice(idx, 1);
+  if (_pendingAddSummary) {
+    _pendingAddSummary.parsed = Math.max(0, _pendingAddSummary.parsed - 1);
+    _pendingAddSummary.skipped++;
+  }
+  renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn();
+  return true;
+}
 function syncSlider(s, n) { document.getElementById(n).value = s.value; }
 function syncRange(n, s) { document.getElementById(s).value = n.value; }
 
@@ -593,17 +612,18 @@ async function openFileDialog() {
   return null;
 }
 
-async function addPaths(paths) {
+async function addPaths(paths, skipped) {
+  var batchInfo = { files: paths.length, skipped: skipped || 0 };
   if (paths.length <= 3) {
     toastLoading('读取 ' + paths.length + ' 个文件...');
     var fileDataList = await invoke('open_invoice_files', { paths: paths });
     if (fileDataList && fileDataList.length > 0) {
-      await processFileDataList(fileDataList);
+      await processFileDataList(fileDataList, batchInfo);
     } else {
       toast('无法读取所选文件');
     }
   } else {
-    await processFilesIncremental(paths);
+    await processFilesIncremental(paths, batchInfo);
   }
 }
 
@@ -634,6 +654,7 @@ async function triggerUpload() {
     }
     if (paths.length === 0) return;
     await addPaths(paths);
+    await addPaths(paths, 0);
   } catch (err) {
     console.error('Add files error:', err);
     toast('文件加载失败: ' + String(err));
@@ -760,7 +781,9 @@ function scrollActiveFileIntoView() {
 async function handleFileInput(fl) {
   try {
     if (!fl || !fl.length) return;
-    await processFiles(Array.from(fl));
+    var files = Array.from(fl);
+    var supported = files.filter(isSupportedFile);
+    await processFiles(supported, { files: supported.length, skipped: files.length - supported.length });
   } finally {
     _insertSlotIdx = -1;
     _slotUploadActive = false;
@@ -769,10 +792,11 @@ async function handleFileInput(fl) {
 }
 
 // Process FileData array from Rust backend — instant placeholders, then load in parallel + render sequentially
-async function processFileDataList(fileDataList) {
+async function processFileDataList(fileDataList, batchInfo) {
   var total = fileDataList.length;
   var completed = 0;
   var added = 0;
+    batchInfo = batchInfo || { files: total, skipped: 0 };
   var slotInsert = _insertSlotIdx >= 0;
   var firstPlaceholder = null;
   _loadingBatchActive = true;
@@ -918,24 +942,26 @@ async function processFileDataList(fileDataList) {
     _ocrToastActive = false;
     _ocrBatchTotal = 0;
     _ocrBatchAddedCount = 0;
-    var elapsed = Date.now() - startTime;
-    var minToastDelay = Math.max(300, 800 - elapsed);
-    if (added > 0) {
-      var doneMsg = '已加载 ' + added + ' 张发票';
-      setTimeout(function() { toast(doneMsg, 2500); }, minToastDelay);
-    } else {
-      toast('文件加载失败');
-    }
+    _pendingAddSummary = { files: batchInfo.files, parsed: added, skipped: batchInfo.skipped };
+    showAddSummary(_pendingAddSummary);
+    _pendingAddSummary = null;
   } else {
+    _pendingAddSummary = { files: batchInfo.files, parsed: added, skipped: batchInfo.skipped };
     _ocrBatchAddedCount = added;
   }
 }
 
+function isSupportedFile(file) {
+  var ext = (file.name || '').split('.').pop().toLowerCase();
+  return ['pdf', 'jpg', 'jpeg', 'png', 'bmp', 'webp', 'tiff', 'tif', 'ofd', 'xml'].indexOf(ext) >= 0;
+}
+
 // Process an array of File objects (browser fallback) — instant placeholders, then load in parallel + render sequentially
-async function processFiles(files) {
+async function processFiles(files, batchInfo) {
   var total = files.length;
   var completed = 0;
   var added = 0;
+  batchInfo = batchInfo || { files: total, skipped: 0 };
   var slotInsert = _insertSlotIdx >= 0;
   var firstPlaceholder = null;
   _loadingBatchActive = true;
@@ -1069,17 +1095,21 @@ async function processFiles(files) {
     _ocrToastActive = false;
     _ocrBatchTotal = 0;
     _ocrBatchAddedCount = 0;
-    toastDone(added > 0 ? '已加载 ' + added + ' 张发票' : '文件加载失败');
+    _pendingAddSummary = { files: batchInfo.files, parsed: added, skipped: batchInfo.skipped };
+    showAddSummary(_pendingAddSummary);
+    _pendingAddSummary = null;
   } else {
+    _pendingAddSummary = { files: batchInfo.files, parsed: added, skipped: batchInfo.skipped };
     _ocrBatchAddedCount = added;
   }
 }
 
 // Incremental loading: read files one-by-one, render in small batches.
 // Strategy: skeleton placeholders (stable layout) + parallel background load + batch render every 3 files.
-async function processFilesIncremental(paths) {
+async function processFilesIncremental(paths, batchInfo) {
   var total = paths.length;
   var added = 0;
+  batchInfo = batchInfo || { files: total, skipped: 0 };
   var startTime = Date.now();
   var slotInsert = _insertSlotIdx >= 0;
   _loadingBatchActive = true;
@@ -1228,13 +1258,13 @@ async function processFilesIncremental(paths) {
     _ocrBatchAddedCount = 0;
     var elapsed = Date.now() - startTime;
     var minToastDelay = Math.max(300, 800 - elapsed);
-    if (added > 0) {
-      var doneMsg = '已加载 ' + added + ' 张发票';
-      setTimeout(function() { toast(doneMsg, 2500); }, minToastDelay);
-    } else {
-      toast('文件加载失败');
-    }
+    setTimeout(function() {
+      _pendingAddSummary = { files: batchInfo.files, parsed: added, skipped: batchInfo.skipped };
+      showAddSummary(_pendingAddSummary);
+      _pendingAddSummary = null;
+    }, minToastDelay);
   } else {
+    _pendingAddSummary = { files: batchInfo.files, parsed: added, skipped: batchInfo.skipped };
     _ocrBatchAddedCount = added;
   }
 }
@@ -1267,6 +1297,7 @@ var _ocrToastActive = false; // track if "识别中" toast is showing
 var _ocrFromButton = false;  // true = OCR triggered by single-file button click (show per-file result toast)
 var _ocrBatchTotal = 0;     // Total files in current batch (for progress display)
 var _ocrBatchAddedCount = 0; // Total added files in current loading batch (for final toast message)
+var _pendingAddSummary = null;
 
 
 /** Yield to browser for reliable painting — double rAF ensures at least one frame is painted */
@@ -1316,7 +1347,10 @@ function _drainOcrQueue() {
     // Single-file OCR from button click shows its own result toast in applyOcrAsync
     // For batch operations (loading or ocrAll), show completion toast here
     if (!wasFromButton) {
-      if (wasAddedCount > 0) {
+      if (_pendingAddSummary) {
+        showAddSummary(_pendingAddSummary);
+        _pendingAddSummary = null;
+      } else if (wasAddedCount > 0) {
         toastDone('已加载并识别 ' + wasAddedCount + ' 张发票');
       } else if (wasBatchTotal > 0) {
         toastDone('识别完成');
@@ -1368,8 +1402,12 @@ function applyOcrAsync(fileObj, dataUrl) {
         return applyOcr(fileObj, ocrDataUrl);
       });
     }
-    return ocrPromise.then(function() {
+    return ocrPromise.then(function(ocrSucceeded) {
       fileObj._ocrPending = false;
+      if (ocrSucceeded && isNonInvoiceTif(fileObj)) {
+        markNonInvoiceImageSkipped(fileObj);
+        return;
+      }
       if (S.feat.autoDedup) {
         var autoRemoved = removeDuplicates(true);
         if (autoRemoved) { updatePreview(); updatePrintBtn(); updateSummaryBtn(); }
@@ -2075,6 +2113,7 @@ function renderFileList() {
 
   var grid = S.fileView === 'grid';
   list.classList.toggle('grid', grid);
+  var indexWidth = Math.max(2, String(S.files.length).length) + 'ch';
 
   list.innerHTML = S.files.map(function(f, i) {
     var cls = 'file-item';
@@ -2087,7 +2126,7 @@ function renderFileList() {
     if (grid) {
       if (f._placeholder) {
         return '<div class="file-item file-card placeholder-item" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + '>' +
-          '<div class="file-thumb"><div class="blank-thumb">\u25A6</div></div>' +
+          '<div class="file-thumb"><div class="blank-thumb">\u25A6</div><span class="file-index">' + (i + 1) + '</span></div>' +
           '<div class="card-name">空白占位</div>' +
           '<div class="card-meta"><button class="ib card-ib danger" onclick="rmFile(' + i + ')" title="删除空白占位">\u2715</button></div></div>';
       }
@@ -2113,7 +2152,7 @@ function renderFileList() {
         gacts = '<button class="ib card-ib danger" onclick="rmFile(' + i + ')" title="删除">\u2715</button>';
       }
       return '<div class="' + cls + ' file-card" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
-        '<div class="file-thumb">' + gthumb + '<div class="type-badge">' + gtype + '</div>' +
+        '<div class="file-thumb">' + gthumb + '<span class="file-index">' + (i + 1) + '</span><div class="type-badge">' + gtype + '</div>' +
         '<div class="file-check ' + (f.checked ? 'checked' : '') + '" onclick="togCheck(' + i + ')"></div>' +
         '<div class="card-actions">' + gacts + '</div></div>' +
         '<div class="card-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + '</div>' +
@@ -2129,6 +2168,7 @@ function renderFileList() {
         '<button class="ib danger" onclick="rmFile(' + i + ')" title="删除空白占位">\u2715</button></div>';
       return '<div class="file-item placeholder-item" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + '>' +
         '<div class="file-check disabled"></div>' +
+        '<div class="file-index" style="width:' + indexWidth + '">' + (i + 1) + '</div>' +
         '<div class="file-thumb"><div class="blank-thumb">\u25A6</div></div>' +
         '<div class="file-info"><div class="file-name">空白占位</div><div class="file-meta">' + pMeta + '</div></div></div>';
     }
@@ -2159,6 +2199,7 @@ function renderFileList() {
         ocrBtnHtml + '<button class="ib" onclick="rotFile(' + i + ')" title="旋转90°">\u21BB</button><button class="ib danger" onclick="rmFile(' + i + ')">\u2715</button></div>';
     return '<div class="' + cls + '" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
       '<div class="file-check ' + (f.checked ? 'checked' : '') + '" onclick="togCheck(' + i + ')"></div>' +
+      '<div class="file-index" style="width:' + indexWidth + '">' + (i + 1) + '</div>' +
       '<div class="file-thumb">' + thumbContent + '<div class="type-badge">' + typeBadgeText + '</div></div>' +
       '<div class="file-info"><div class="file-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + '</div>' + (sb ? '<div class="file-seller" title="' + escHtml(f.sellerName) + '">' + sb + '</div>' : '') + '<div class="file-meta">' + metaActions + '</div></div>' +
     '</div>';
@@ -3939,7 +3980,11 @@ document.body.addEventListener('dragover', function(e) { e.preventDefault(); });
 document.body.addEventListener('drop', function(e) {
   e.preventDefault();
   if (_slotUploadActive || _loadingBatchActive) { toast('当前仍在加载发票，请稍候再添加'); return; }
-  if (e.dataTransfer.files.length) processFiles(Array.from(e.dataTransfer.files));
+  if (e.dataTransfer.files.length) {
+    var droppedFiles = Array.from(e.dataTransfer.files);
+    var supported = droppedFiles.filter(isSupportedFile);
+    processFiles(supported, { files: supported.length, skipped: droppedFiles.length - supported.length });
+  }
 });
 
 // 拖入提示浮层 — 桌面版由 Rust DragDropEvent::Enter/Leave 调 _tauriDragHover，
@@ -3977,23 +4022,23 @@ window.addEventListener('beforeunload', function() {
 
 // Tauri drag & drop — Rust calls window._tauriFileDrop(paths) via eval()
 window._tauriFileDrop = function(paths) {
-  if (!Array.isArray(paths)) return;
-  if (paths.length === 0) {
+  if (!paths || !Array.isArray(paths.paths)) return;
+  if (paths.paths.length === 0) {
     toast('不支持的文件格式，请拖入 PDF/JPG/PNG/OFD/XML 等发票文件');
     return;
   }
   (async function() {
     try {
-      if (paths.length <= 3) {
-        toastLoading('读取 ' + paths.length + ' 个文件...');
-        var fileDataList = await invoke('open_invoice_files', { paths: paths });
+      if (paths.paths.length <= 3) {
+        toastLoading('读取 ' + paths.paths.length + ' 个文件...');
+        var fileDataList = await invoke('open_invoice_files', { paths: paths.paths });
         if (fileDataList && fileDataList.length > 0) {
-          await processFileDataList(fileDataList);
+          await processFileDataList(fileDataList, { files: paths.paths.length, skipped: paths.skipped || 0 });
         } else {
           toast('无法读取拖放的文件');
         }
       } else {
-        await processFilesIncremental(paths);
+        await processFilesIncremental(paths.paths, { files: paths.paths.length, skipped: paths.skipped || 0 });
       }
     } catch(err) {
       hideToast();

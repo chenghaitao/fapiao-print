@@ -58,6 +58,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM ── CHANGELOG 检查（缺失只警告，可 Ctrl+C 中止）────
+findstr /B /C:"## v%V%" CHANGELOG.md >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   [警告] CHANGELOG.md 里没有 "## v%V%" 段落
+    echo          Release 说明会退化成通用文案。
+    echo          建议先补写 CHANGELOG 再发版 —— 现在按 Ctrl+C 可中止，回车则继续。
+    pause
+)
+
 REM ── 3/5 提交 ────────────────────────────────
 echo.
 echo [3/5] 提交改动 ...
@@ -86,7 +96,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
-git push origin v%V% --force
+REM 关键：若远程已存在同名 tag，直接 push 会返回 "Everything up-to-date"
+REM 而不触发任何构建。必须先删掉远程 tag 再推送。
+git ls-remote --exit-code --tags origin "refs/tags/v%V%" >nul 2>&1
+if errorlevel 1 (
+    echo   远程无 tag v%V%，直接推送
+) else (
+    echo   [提示] 远程已存在 tag v%V%，先删除以便重新触发构建
+    git push origin ":refs/tags/v%V%"
+    if errorlevel 1 (
+        echo   [错误] 删除远程 tag 失败
+        exit /b 1
+    )
+)
+
+git push origin v%V%
 if errorlevel 1 (
     echo   [错误] 推送 tag 失败
     exit /b 1

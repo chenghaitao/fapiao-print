@@ -159,6 +159,17 @@ npm run bump <版本号>    # 同步版本号到 Cargo.toml + tauri.conf.json
 - 拖到目标项上半区插入前面，下半区插入后面；复选框和操作按钮不启动拖拽
 - 排序后 `_activeFileIdx` 跟随文件对象，统一刷新列表与预览
 
+### 尾部空槽临时占位留白 (v2.5.1)
+
+按下版面尾部第一个空槽（`fileIdx === activeLen`）拖动即临时创建占位对象进入现有拖拽链路，松手落在实体之间 = 中间留白，复用全部既有排序语义。
+
+- **创建**: `insertTempPlaceholder()` — `createFileObj({name:'空白占位', _placeholder:true})` 插入 S.files（正序插到最后一个 active 之后，倒序插到 active 区头部，与 `moveSlotInvoiceToTail` 同构），**不重渲染**，`activeLen` 自然变 n+1，updateDropTarget/move/swap 判定零修改直接复用
+- **放行重构**: `onSlotMouseDown` 三分支——loading 槽拦截；尾部空槽 temp 模式（`fileIdx !== files.length` 的中间空槽仍拒绝）；`.slot-blank` 占位槽与常规文件一样可拖拽排序（click 仍触发上传）
+- **保留/取消**: before/after/swap 有效落点 → 走既有函数（自带 renderFileList + toast，toast 追加「已在中间留白」）；未移动/无效落点/拖回尾部（dropZone === 'tail'）→ `S.files.splice(indexOf(temp), 1)` + updatePreview 销毁
+- **temp 不 selectSlot**: 避免调整面板误指临时对象；成功落位由排序函数内部把选中态跟随到新位置
+- **合成 click 抑制**: `_slotSuppressClick` + capture 阶段吞一次（复用 app.js `_listDragSuppressClick` 模式），防止松手合成 click 误触空槽 `onclick=addFileToSlot` 弹上传框
+- **持久化**: temp 占位与常规占位一致不保存，重启消失
+
 ### 预览滚轮交互 (v2.4.0)
 
 `previewWrap` wheel 监听按优先级三分支：

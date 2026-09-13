@@ -1539,11 +1539,23 @@ function finishFileDrag() {
   var target = drag.target;
   var position = drag.position;
   var file = S.files[source];
+  if (!file || !S.files[target] || source === target) return;
   S.files.splice(source, 1);
   if (source < target) target--;
   if (position === 'after') target++;
   S.files.splice(target, 0, file);
   _activeFileIdx = S.files.indexOf(file);
+  // Recalculate the preview position from object identity. The list index is
+  // no longer reliable after insertion, especially when copies are expanded.
+  var activeFiles = getActiveFiles();
+  var activeIdx = activeFiles.indexOf(file);
+  var perPage = getPerPage(getSettings());
+  if (activeIdx >= 0) {
+    S.currentPage = Math.floor(activeIdx / perPage);
+    S.selectedSlot = activeIdx % perPage;
+  } else {
+    S.selectedSlot = -1;
+  }
   _fileDragClickSuppressed = true;
   renderFileList();
   updatePreview();

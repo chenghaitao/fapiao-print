@@ -102,7 +102,7 @@ input, textarea, select, [contenteditable="true"], .modal-body, .modal-body *, p
 
 /* ===== Main Layout ===== */
 .main-layout {
-  display: grid; grid-template-columns: 340px 1fr;
+  display: grid; grid-template-columns: clamp(340px, 30vw, 520px) minmax(0, 1fr);
   height: 100vh; overflow: hidden;
 }
 
@@ -260,10 +260,10 @@ input, textarea, select, [contenteditable="true"], .modal-body, .modal-body *, p
 .file-name { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-meta {
   font-size: 11px; color: var(--text-muted); display: flex; gap: 4px; align-items: center;
-  min-height: 18px; overflow: hidden;
+  min-height: 18px; flex-wrap: wrap;
 }
 .file-size { font-size: 10px; flex-shrink: 0; white-space: nowrap; }
-.file-meta-left { display: flex; gap: 4px; align-items: center; min-width: 0; overflow: hidden; flex-shrink: 1; white-space: nowrap; }
+.file-meta-left { display: flex; gap: 4px; align-items: center; min-width: 0; overflow: visible; flex-shrink: 1; flex-wrap: wrap; white-space: normal; }
 .file-meta-sep { flex: 1; }
 .file-meta-right { display: flex; gap: 2px; align-items: center; flex-shrink: 0; }
 .copy-badge { background: var(--warning-light); color: var(--warning); padding: 2px 7px; border-radius: 3px; font-size: 11px; font-weight: 700; }

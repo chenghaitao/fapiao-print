@@ -661,7 +661,6 @@ async function triggerUpload() {
     }
     if (paths.length === 0) return;
     await addPaths(paths);
-    await addPaths(paths, 0);
   } catch (err) {
     console.error('Add files error:', err);
     toast('文件加载失败: ' + String(err));
@@ -2169,16 +2168,7 @@ function selectDuplicateExtras() {
 }
 
 function getFilteredFiles() {
-  var files = S.files;
-  if (S.typeFilter !== 'all') files = files.filter(isTypeMatch);
-  if (S.formatFilter !== 'all') files = files.filter(isFormatMatch);
-  if (S.fileFilter === 'duplicates') return files.filter(function(f) { return f._dup; });
-  if (S.printedFilter === 'all') return files;
-  return files.filter(function(f) {
-    if (S.printedFilter === 'printed') return f._printed;
-    if (S.printedFilter === 'unprinted') return !f._printed;
-    return true;
-  });
+  return S.files.filter(function(f) { return !isFileHidden(f); });
 }
 
 // 生成发票去重key：优先发票号，回退到 销售方+含税金额+日期（针对重复下载被改名的文件）
@@ -2243,7 +2233,7 @@ function renderFileList() {
   var scrollTop = list.scrollTop;
   var filtered = getFilteredFiles();
   var realCount = filtered.filter(function(f) { return !f._placeholder; }).length;
-  var sel = filtered.filter(function(f) { return f.checked; }).length;
+  var sel = filtered.filter(function(f) { return isSelectableFile(f) && f.checked; }).length;
   document.getElementById('fileCount').textContent = realCount + ' 张，已选 ' + sel;
   updateSelectToggle();
   syncDeleteBtn();
@@ -2412,11 +2402,12 @@ function setAllCopies(e, n) {
   renderFileList();
   updatePreview();
 }
-function togCheck(i) { if (S.files[i]._placeholder) return; S.files[i].checked = !S.files[i].checked; renderFileList(); updatePreview(); updateSummaryBtn(); }
+function togCheck(i) { if (!isSelectableFile(S.files[i])) return; S.files[i].checked = !S.files[i].checked; renderFileList(); updatePreview(); updateSummaryBtn(); }
 
 // 当前筛选条件下可勾选的文件（全选/取消全选只作用于可见项，issue #27）
+function isSelectableFile(f) { return !!f && !f._placeholder && !f._loading; }
 function getSelectableInView() {
-  return getFilteredFiles().filter(function(f) { return !f._placeholder; });
+  return getFilteredFiles().filter(isSelectableFile);
 }
 function selectAll() { getSelectableInView().forEach(function(f) { f.checked = true; }); renderFileList(); updatePreview(); updateSummaryBtn(); }
 function deselectAll() { getSelectableInView().forEach(function(f) { f.checked = false; }); renderFileList(); updatePreview(); updateSummaryBtn(); }
@@ -2683,75 +2674,6 @@ function ocrAll() {
   updateOcrAllBtn();
   toastLoading('识别中，共 ' + targets.length + ' 张...');
   targets.forEach(function(f) { applyOcrAsync(f, f.previewUrl); });
-}
-
-function clearAll() {
-  if (!S.files.length) return;
-  if (!confirm('确认清除所有发票？')) return;
-  S.files = [];
-  _activeFileIdx = -1;
-  _printedMap = {};
-  saveSettings();
-  renderFileList();
-  updatePreview();
-  updatePrintBtn();
-  updateSummaryBtn();
-}
-
-function resetLayout() {
-  S.files.forEach(function(f) {
-    f.slotScale = 1;
-    f.slotOffsetX = 0;
-    f.slotOffsetY = 0;
-  });
-  if (S._fileAdjMap) S._fileAdjMap = {};
-  updateAdjPanel();
-  updatePreview();
-  saveSettings();
-  toast('已恢复默认排版布局');
-}
-
-// Click file item → navigate preview to the page containing this invoice
-function clickFileItem(idx, event, opts) {
-  if (_fileDragClickSuppressed) {
-    _fileDragClickSuppressed = false;
-    return;
-  }
-  // Ignore clicks on checkbox, sort buttons, and action buttons
-  if (event && (event.target.closest('.file-check') || event.target.closest('.sort-btn') || event.target.closest('button'))) return;
-  var f = S.files[idx];
-  if (f._loading || f._placeholder) return;
-
-  _activeFileIdx = idx;
-
-  // Auto-check if unchecked so the file appears in preview
-  // （opts.autoCheck=false：右键联动等场景只同步选中态，不改变勾选）
-  if (!f.checked && (!opts || opts.autoCheck !== false)) {
-    f.checked = true;
-  }
-
-  // Find which page this file is on
-  var activeFiles = getActiveFiles();
-  var perPage = getPerPage(getSettings());
-  var activeIdx = -1;
-  for (var i = 0; i < activeFiles.length; i++) {
-    if (activeFiles[i].id === f.id) { activeIdx = i; break; }
-  }
-  if (activeIdx >= 0) {
-    S.currentPage = Math.floor(activeIdx / perPage);
-    S.selectedSlot = activeIdx % perPage;
-    updatePreview();
-  } else {
-    // 不参与排版的文件（如 XML 数电票）：清除预览槽位选中态并刷新面板
-    S.selectedSlot = -1;
-    var selEl = document.querySelector('.invoice-slot.selected');
-    if (selEl) selEl.classList.remove('selected');
-    updateAdjPanel();
-    updatePrintBtn();
-  }
-
-  updateActiveFileHighlight();
-  renderFileList();
 }
 
 // Update sidebar highlight to match _activeFileIdx

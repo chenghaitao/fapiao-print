@@ -13,7 +13,6 @@
 <div class="toast" id="toast"></div>
 
 <!-- File input — browser fallback only -->
-<input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png,.bmp,.webp,.tiff,.tif,.ofd" multiple style="display:none" onchange="handleFileInput(this.files)">
 <input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png,.bmp,.webp,.tiff,.tif,.ofd,.xml" multiple style="display:none" onchange="handleFileInput(this.files)">
 
 <div class="main-layout">
@@ -30,7 +29,6 @@
       <div class="sidebar-panel-scroll">
         <div class="file-header">
           <div class="file-actions">
-            <button class="ib" id="selectAllBtn" onclick="toggleSelectAll()" title="全选"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="2"/></svg></button>
             <div class="copy-ctrl">
               <button class="ib" onclick="toggleCopyMenu()" title="设置选中发票排版份数"><img src="icons/copy_layout_32.png" alt="份数" class="ib-icon"></button>
               <div class="copy-menu hidden" id="copyMenu">

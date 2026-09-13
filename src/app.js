@@ -2270,7 +2270,7 @@ function renderFileList() {
     var hideStyle = hidden ? ' style="display:none"' : '';
     if (grid) {
       if (f._placeholder) {
-        return '<div class="file-item file-card placeholder-item" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + '>' +
+        return '<div class="file-item file-card placeholder-item" data-idx="' + i + '"' + hideStyle + '>' +
           '<div class="file-thumb"><div class="blank-thumb">\u25A6</div><span class="file-index">' + (i + 1) + '</span></div>' +
           '<div class="card-name">空白占位</div>' +
           '<div class="card-meta"><button class="ib card-ib danger" onclick="rmFile(' + i + ')" title="删除空白占位">\u2715</button></div></div>';
@@ -2296,7 +2296,7 @@ function renderFileList() {
       } else {
         gacts = '<button class="ib card-ib danger" onclick="rmFile(' + i + ')" title="删除">\u2715</button>';
       }
-      return '<div class="' + cls + ' file-card" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
+      return '<div class="' + cls + ' file-card" data-idx="' + i + '"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
         '<div class="file-thumb">' + gthumb + '<span class="file-index">' + (i + 1) + '</span><div class="type-badge">' + gtype + '</div>' +
         '<div class="file-check ' + (f.checked ? 'checked' : '') + '" onclick="togCheck(' + i + ')"></div>' +
         '<div class="card-actions">' + gacts + '</div></div>' +
@@ -2311,7 +2311,7 @@ function renderFileList() {
         '<button class="ib sort-btn' + (i === 0 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',-1)" title="上移">\u25B2</button>' +
         '<button class="ib sort-btn' + (i === S.files.length - 1 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',1)" title="下移">\u25BC</button>' +
         '<button class="ib danger" onclick="rmFile(' + i + ')" title="删除空白占位">\u2715</button></div>';
-      return '<div class="file-item placeholder-item" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + '>' +
+      return '<div class="file-item placeholder-item" data-idx="' + i + '"' + hideStyle + '>' +
         '<div class="file-check disabled"></div>' +
         '<div class="file-index" style="width:' + indexWidth + '">' + (i + 1) + '</div>' +
         '<div class="file-thumb"><div class="blank-thumb">\u25A6</div></div>' +
@@ -2342,7 +2342,7 @@ function renderFileList() {
         '<button class="ib sort-btn' + (i === 0 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',-1)" title="上移">\u25B2</button>' +
         '<button class="ib sort-btn' + (i === S.files.length - 1 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',1)" title="下移">\u25BC</button>' +
         ocrBtnHtml + '<button class="ib" onclick="rotFile(' + i + ')" title="旋转90°">\u21BB</button><button class="ib danger" onclick="rmFile(' + i + ')">\u2715</button></div>';
-    return '<div class="' + cls + '" data-idx="' + i + '" onmousedown="startFileDrag(event,' + i + ')"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
+    return '<div class="' + cls + '" data-idx="' + i + '"' + hideStyle + ' onclick="clickFileItem(' + i + ',event)" ondblclick="openInvModal(' + i + ')">' +
       '<div class="file-check ' + (f.checked ? 'checked' : '') + '" onclick="togCheck(' + i + ')"></div>' +
       '<div class="file-index" style="width:' + indexWidth + '">' + (i + 1) + '</div>' +
       '<div class="file-thumb">' + thumbContent + '<div class="type-badge">' + typeBadgeText + '</div></div>' +

@@ -142,6 +142,22 @@ jobs:
           Write-Host "`n=== 规范化后的文件名 ==="
           Get-ChildItem -Path $dist -File | ForEach-Object { Write-Host "  $($_.Name)" }
 
+          $expected = @(
+            "发票酱_${version}_x64-setup.exe",
+            "发票酱_${version}_x64_绿色版.exe",
+            "发票酱_${version}_x64_OCR版-setup.exe",
+            "发票酱_${version}_x64_OCR绿色版.zip"
+          )
+          $actual = @(Get-ChildItem -Path $dist -File | Select-Object -ExpandProperty Name)
+          $missing = @($expected | Where-Object { $_ -notin $actual })
+          $unexpected = @($actual | Where-Object { $_ -notin $expected })
+          if ($missing.Count -or $unexpected.Count -or $actual.Count -ne $expected.Count) {
+            if ($missing.Count) { Write-Host "::error::缺少产物: $($missing -join ', ')" }
+            if ($unexpected.Count) { Write-Host "::error::存在未预期产物: $($unexpected -join ', ')" }
+            exit 1
+          }
+          Write-Host "✅ 四个产物文件名校验通过"
+
       - name: List final artifacts
         shell: pwsh
         run: |
@@ -228,6 +244,13 @@ jobs:
         run: |
           $tag  = "${{ steps.resolve_tag.outputs.tag }}"
           $repo = "chenghaitao/fapiao-print"
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $expected = @(
+            "发票酱_${version}_x64-setup.exe",
+            "发票酱_${version}_x64_绿色版.exe",
+            "发票酱_${version}_x64_OCR版-setup.exe",
+            "发票酱_${version}_x64_OCR绿色版.zip"
+          )
 
           gh release view "$tag" --repo $repo 2>$null
           if ($LASTEXITCODE -ne 0) {
@@ -238,10 +261,21 @@ jobs:
             Write-Host "Release $tag 已存在，仅覆盖更新资产"
           }
 
+          # 删除当前版本历史上传的错误命名资产，避免新旧文件同时显示。
+          $oldAssets = @(gh release view "$tag" --repo $repo --json assets --jq '.assets[].name')
+          foreach ($asset in $oldAssets) {
+            if ($asset -match "_${version}_x64" -and $asset -notin $expected) {
+              Write-Host "删除旧资产: $asset"
+              gh release delete-asset "$tag" $asset --repo $repo --yes
+              if ($LASTEXITCODE -ne 0) { Write-Host "::error::删除旧资产失败: $asset"; exit 1 }
+            }
+          }
+
           Get-ChildItem -Path dist -File | ForEach-Object {
             $mb = [math]::Round($_.Length / 1MB, 1)
             Write-Host "上传: $($_.Name)  ($mb MB)"
-            gh release upload "$tag" $_.FullName --repo $repo --clobber
+            # Explicitly set the asset label to preserve the Chinese filename.
+            gh release upload "$tag" "$($_.FullName)#$($_.Name)" --repo $repo --clobber
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::上传失败: $($_.Name)"; exit 1 }
           }
 

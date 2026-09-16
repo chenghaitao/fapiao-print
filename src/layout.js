@@ -118,6 +118,22 @@ function calculateLayout(settings, pxPerMm) {
 }
 
 /**
+ * 有效显示尺寸（px）。开启「裁剪白边」且已生成裁剪缓存时用裁剪后的尺寸，
+ * 否则用文件原始尺寸（ow/oh）。预览适配、拖拽约束、九宫格对齐与 PDF 导出
+ * 必须统一走这里，否则各处算出的适配比例会不一致。
+ * @param {Object} fileObj - File object with ow, oh, trimmedW, trimmedH
+ * @param {Object} settings - Settings with trimWhite
+ * @returns {{w:number,h:number}}
+ */
+function getObjDims(fileObj, settings) {
+  if (!fileObj) return { w: 1, h: 1 };
+  if (settings && settings.trimWhite && fileObj.trimmedW > 0 && fileObj.trimmedH > 0) {
+    return { w: fileObj.trimmedW, h: fileObj.trimmedH };
+  }
+  return { w: fileObj.ow || 1, h: fileObj.oh || 1 };
+}
+
+/**
  * Calculate rotation for a file in a slot.
  * @param {Object} fileObj - File object with ow, oh, rotation
  * @param {Object} slot - Slot with w, h
@@ -127,7 +143,8 @@ function calculateLayout(settings, pxPerMm) {
 function getRotation(fileObj, slot, settings) {
   if (settings.globalRotation === 'auto') {
     var isSlotL = slot.w > slot.h;
-    var isImgL = (fileObj.ow || 1) > (fileObj.oh || 1);
+    var dims = getObjDims(fileObj, settings);
+    var isImgL = dims.w > dims.h;
     return (isSlotL !== isImgL) ? (fileObj.rotation + 90) % 360 : fileObj.rotation;
   }
   return ((parseInt(settings.globalRotation) || 0) + fileObj.rotation) % 360;
@@ -196,25 +213,30 @@ function renderPage(pageFiles, pi, total, s) {
         transforms = 'translate(' + txPx.toFixed(1) + 'px, ' + tyPx.toFixed(1) + 'px) ' + transforms;
       }
       // Calculate contained image dimensions for border to follow invoice
-      var imgObjW = f.ow || 1;
-      var imgObjH = f.oh || 1;
+      var _dispDims = getObjDims(f, s);
+      var imgObjW = _dispDims.w;
+      var imgObjH = _dispDims.h;
       // 旋转 90°/270°：与 PDF 导出一致，按旋转后的视觉宽高适配槽位（先旋转后适配）。
       // wrapper 是旋转前的盒子，取视觉盒的转置，CSS 旋转后正好落在视觉盒上。
       var isRot90 = (rot === 90 || rot === 270);
       var fitW = isRot90 ? imgObjH : imgObjW;
       var fitH = isRot90 ? imgObjW : imgObjH;
-      var containedW, containedH;
+      var containedW, containedH, visW, visH;
       if (s.fitMode === 'original') {
         containedW = imgObjW;
         containedH = imgObjH;
+        visW = isRot90 ? containedH : containedW;
+        visH = isRot90 ? containedW : containedH;
       } else if (s.fitMode === 'fill') {
         containedW = isRot90 ? imgH : imgW;
         containedH = isRot90 ? imgW : imgH;
+        visW = isRot90 ? containedH : containedW;
+        visH = isRot90 ? containedW : containedH;
       } else {
         // contain / custom: 旋转后视觉宽高 contain-fit 槽位，wrapper 转置
         var fitScale = Math.min(imgW / fitW, imgH / fitH);
-        var visW = fitW * fitScale;
-        var visH = fitH * fitScale;
+        visW = fitW * fitScale;
+        visH = fitH * fitScale;
         containedW = isRot90 ? visH : visW;
         containedH = isRot90 ? visW : visH;
       }
@@ -232,8 +254,12 @@ function renderPage(pageFiles, pi, total, s) {
           wrapperStyle += 'left:0;top:0;';
         }
       } else {
+        // 「裁剪白边」开启时垂直贴顶（视觉盒顶 = 槽位顶）：wrapper 中心对齐到 visH/2，
+        // 否则居中。水平方向始终居中 —— 左右裁剪本来就对得准。
+        var wrapTop = ((imgH - containedH) / 2);
+        if (s.trimWhite) wrapTop = visH / 2 - containedH / 2;
         wrapperStyle += 'left:' + ((imgW - containedW) / 2).toFixed(1) + 'px;';
-        wrapperStyle += 'top:' + ((imgH - containedH) / 2).toFixed(1) + 'px;';
+        wrapperStyle += 'top:' + wrapTop.toFixed(1) + 'px;';
       }
       wrapperStyle += 'transform-origin:center center;';
       if (transforms) wrapperStyle += 'transform:' + transforms + ';';
@@ -337,6 +363,8 @@ var _slotTempDrag = null; // 尾部空槽拖拽的临时占位对象（未移动
 
 var _slotSuppressClick = false; // 槽位拖拽松手后吞掉浏览器合成的 click
 
+var DRAG_THRESHOLD_PX = 4; // 位移阈值：小于它不算拖拽，避免微小抖动吞掉 click
+
 /**
  * Bind mousedown on invoice-slot elements for drag-move and corner-resize.
  * Called after each renderPage(). Only binds once.
@@ -408,35 +436,36 @@ function onSlotMouseDown(e) {
   var fileIdx = S.currentPage * perPage + idx;
   var f = fileIdx < files.length ? files[fileIdx] : null;
 
-  var temp = null;
+  // 尾部第一个空槽按下即拖：占位延迟到确认拖拽后再落 —— 若在 mousedown 就插占位，
+  // 纯点击会在 mouseup 销毁占位并重建预览 DOM，浏览器随之不再派发 click（issue #37②）
+  var pendingTail = false;
   if (slotEl.querySelector('.slot-empty')) {
     if (f && f._loading) return;
     if (!f) {
-      // 尾部第一个空槽按下即拖：临时占位进入拖拽链路，其余空槽保持点击上传
       if (fileIdx !== files.length) return;
-      temp = insertTempPlaceholder();
-      f = temp;
-      files = getActiveFiles();
+      pendingTail = true;
     }
     // 空白占位（slot-blank）：与常规文件一样可拖拽排序，click 仍触发上传
   }
-  if (!f) return;
+  if (!f && !pendingTail) return;
 
   // Otherwise: click to select + drag to move
-  e.preventDefault();
-  if (!temp) selectSlot(idx);
+  // 尾部空槽的纯点击不进拖拽：不 preventDefault、不加 dragging，保证 click 正常派发
+  if (!pendingTail) e.preventDefault();
+  if (!pendingTail) selectSlot(idx);
 
   _slotDrag = {
     mode: 'move',
     slotEl: slotEl,
     wrapperEl: slotEl.querySelector(':scope > div'),
     fileObj: f,
-    tempPlaceholder: temp,
+    tempPlaceholder: null,
+    pendingTail: pendingTail,
     idx: idx,
     startX: e.clientX,
     startY: e.clientY,
-    startOffX: f.slotOffsetX || 0,
-    startOffY: f.slotOffsetY || 0,
+    startOffX: f ? (f.slotOffsetX || 0) : 0,
+    startOffY: f ? (f.slotOffsetY || 0) : 0,
     previewScale: getCurrentPreviewScale(),
     // Cache settings/layout for perf (avoid getSettings() every mousemove)
     cachedSettings: settings,
@@ -449,7 +478,7 @@ function onSlotMouseDown(e) {
     dropIdx: -1,
     dropZone: ''
   };
-  slotEl.classList.add('dragging');
+  if (!pendingTail) slotEl.classList.add('dragging');
 
   document.addEventListener('mousemove', onSlotMouseMove);
   document.addEventListener('mouseup', onSlotMouseUp);
@@ -494,7 +523,21 @@ function startResize(e, idx, slotEl, corner) {
 function onSlotMouseMove(e) {
   if (!_slotDrag) return;
   e.preventDefault();
+  // 位移不够不算拖拽：避免微小手抖把纯点击误判成拖拽，吞掉浏览器合成的 click
+  var totalDx = e.clientX - _slotDrag.startX;
+  var totalDy = e.clientY - _slotDrag.startY;
+  if (!_slotDrag.moved && Math.hypot(totalDx, totalDy) < DRAG_THRESHOLD_PX) return;
   _slotDrag.moved = true;  // Track actual mouse movement
+
+  // 尾部空槽：确认是拖拽后才落临时占位，进入排序链路
+  if (_slotDrag.pendingTail) {
+    _slotDrag.pendingTail = false;
+    var tailTemp = insertTempPlaceholder();
+    _slotDrag.tempPlaceholder = tailTemp;
+    _slotDrag.fileObj = tailTemp;
+    _slotDrag.activeLen = getActiveFiles().length;
+    _slotDrag.slotEl.classList.add('dragging');
+  }
 
   var settings = _slotDrag.cachedSettings;
   var layout = _slotDrag.cachedLayout;
@@ -512,9 +555,10 @@ function onSlotMouseMove(e) {
     // Clamp: limit offset so invoice doesn't go fully outside slot
     var slot = layout.slots[_slotDrag.idx];
     var f = _slotDrag.fileObj;
-    var imgW = f.ow || 1;
-    var imgH = f.oh || 1;
     var s = _slotDrag.cachedSettings;
+    var _clampDims = getObjDims(f, s);
+    var imgW = _clampDims.w;
+    var imgH = _clampDims.h;
     // 旋转 90°/270° 时约束范围按旋转后的视觉尺寸计算（与 renderPage 一致）
     var clampRot = getRotation(f, slot, s);
     var clampRot90 = (clampRot === 90 || clampRot === 270);

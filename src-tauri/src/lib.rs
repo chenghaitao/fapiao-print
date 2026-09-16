@@ -426,9 +426,24 @@ fn compare_versions(a: &str, b: &str) -> i32 {
     0
 }
 
+/// 构建带 TLS 的 ureq agent（统一超时配置）。
+///
+/// ⚠️ ureq 2.12 的 `native-tls` feature **不会**自动成为默认 TLS 后端：
+/// 未启用 `tls`(rustls) feature 时 `default_tls_config()` 返回一个直接报错的桩，
+/// 所有 https 请求都会以 "cannot make HTTPS request because no TLS backend is configured" 失败。
+/// 必须显式注入连接器，才能用系统 schannel 走 https。
+fn build_http_agent(timeout: std::time::Duration) -> Result<ureq::Agent, String> {
+    let tls = ureq::native_tls::TlsConnector::new()
+        .map_err(|e| format!("初始化 TLS 失败: {}", e))?;
+    Ok(ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .tls_connector(std::sync::Arc::new(tls))
+        .build())
+}
+
 /// Check for updates by querying GitHub Releases API (latest release).
 /// Returns update info including latest version, release notes, and download assets.
-/// Uses async reqwest to avoid blocking the IPC thread.
+/// Uses blocking ureq offloaded to the blocking thread pool.
 ///
 /// 主备双源: 先尝试直连 api.github.com,失败后 fallback 到 gh-proxy.com 加速代理。
 /// 保证大陆网络环境下更新检查可用,网络通畅时直连最快。
@@ -436,70 +451,68 @@ fn compare_versions(a: &str, b: &str) -> i32 {
 async fn check_for_updates() -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<UpdateInfo, String> {
+        let agent = build_http_agent(std::time::Duration::from_secs(15))?;
 
-    // 主备双源: 直连 → gh-proxy.com 代理
-    let urls = [
-        "https://api.github.com/repos/erma0/fapiao-print/releases/latest",
-        "https://gh-proxy.com/https://api.github.com/repos/erma0/fapiao-print/releases/latest",
-    ];
+        // 主备双源: 直连 → gh-proxy.com 代理
+        let urls = [
+            "https://api.github.com/repos/erma0/fapiao-print/releases/latest",
+            "https://gh-proxy.com/https://api.github.com/repos/erma0/fapiao-print/releases/latest",
+        ];
 
-    let mut body: Option<String> = None;
-    let mut last_err = String::new();
-    for url in &urls {
-        match client
-            .get(*url)
-            .header("User-Agent", "ticketchan-updater")
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.text().await {
+        let mut body: Option<String> = None;
+        let mut last_err = String::new();
+        for url in &urls {
+            match agent
+                .get(url)
+                .set("User-Agent", "ticketchan-updater")
+                .set("Accept", "application/vnd.github+json")
+                .call()
+            {
+                Ok(resp) => match resp.into_string() {
                     Ok(text) => { body = Some(text); break; }
                     Err(e) => last_err = format!("读取响应失败: {}", e),
-                }
+                },
+                Err(ureq::Error::Status(code, _)) => last_err = format!("API返回状态: {}", code),
+                Err(e) => last_err = format!("请求失败: {}", e),
             }
-            Ok(resp) => last_err = format!("API返回状态: {}", resp.status()),
-            Err(e) => last_err = format!("请求失败: {}", e),
         }
-    }
-    let body = body.ok_or_else(|| format!("GitHub更新检查失败: {}", last_err))?;
+        let body = body.ok_or_else(|| format!("GitHub更新检查失败: {}", last_err))?;
 
-    let json: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("解析响应失败: {}", e))?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("解析响应失败: {}", e))?;
 
-    let tag = json["tag_name"].as_str().unwrap_or("").to_string();
-    let latest = tag.trim_start_matches('v').to_string();
-    let release_notes = json["body"].as_str().unwrap_or("").to_string();
-    let release_url = json["html_url"].as_str().unwrap_or("").to_string();
-    let published_at = json["published_at"].as_str().unwrap_or("").to_string();
+        let tag = json["tag_name"].as_str().unwrap_or("").to_string();
+        let latest = tag.trim_start_matches('v').to_string();
+        let release_notes = json["body"].as_str().unwrap_or("").to_string();
+        let release_url = json["html_url"].as_str().unwrap_or("").to_string();
+        let published_at = json["published_at"].as_str().unwrap_or("").to_string();
 
-    let mut assets = Vec::new();
-    if let Some(arr) = json["assets"].as_array() {
-        for a in arr {
-            assets.push(UpdateAsset {
-                name: a["name"].as_str().unwrap_or("").to_string(),
-                download_url: a["browser_download_url"].as_str().unwrap_or("").to_string(),
-                size: a["size"].as_u64().unwrap_or(0),
-            });
+        let mut assets = Vec::new();
+        if let Some(arr) = json["assets"].as_array() {
+            for a in arr {
+                assets.push(UpdateAsset {
+                    name: a["name"].as_str().unwrap_or("").to_string(),
+                    download_url: a["browser_download_url"].as_str().unwrap_or("").to_string(),
+                    size: a["size"].as_u64().unwrap_or(0),
+                });
+            }
         }
-    }
 
-    let has_update = compare_versions(&current, &latest) < 0;
+        let has_update = compare_versions(&current, &latest) < 0;
 
-    Ok(UpdateInfo {
-        has_update,
-        current_version: current,
-        latest_version: latest,
-        release_notes,
-        release_url,
-        published_at,
-        assets,
+        Ok(UpdateInfo {
+            has_update,
+            current_version: current,
+            latest_version: latest,
+            release_notes,
+            release_url,
+            published_at,
+            assets,
+        })
     })
+    .await
+    .map_err(|e| format!("更新检查任务失败: {}", e))?
 }
 
 /// Get backend configuration (for runtime DPI validation)
@@ -532,15 +545,26 @@ fn show_window(app: tauri::AppHandle) {
 // New Commands: Trim Image & Layout-based PDF Generation
 // =====================================================
 
-/// Trim white edges from an image (base64 data URL → trimmed base64 data URL)
+/// 白边裁剪结果：裁剪后的图像 + 裁剪框（供 PDF 直通路径做矢量裁切换算）
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrimImageResult {
+    data_url: String,
+    /// [x, y, w, h]，像素坐标、原点左上，基于入参位图；未检测到白边时为 None
+    trim_box: Option<pdf_engine::TrimBox>,
+}
+
+/// Trim white edges from an image (base64 data URL → 裁剪后 data URL + 裁剪框)
+/// `pad`: 裁剪后向外保留的边距（px，前端「留边」配置项；缺省 3，上限 60）
 #[command]
-fn trim_image(data_url: String) -> Result<String, String> {
+fn trim_image(data_url: String, pad: Option<u32>) -> Result<TrimImageResult, String> {
     use base64::Engine;
     use std::io::Cursor;
 
     let img = pdf_engine::decode_base64_image(&data_url)
         .map_err(|e| format!("解码失败: {}", e))?;
-    let trimmed = pdf_engine::trim_white_edges(&img, 245);
+    let pad = pad.unwrap_or(pdf_engine::TRIM_PAD_DEFAULT).min(pdf_engine::TRIM_PAD_MAX);
+    let (trimmed, trim_box) = pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad);
 
     // Encode back to PNG base64
     let mut buf = Cursor::new(Vec::new());
@@ -548,7 +572,10 @@ fn trim_image(data_url: String) -> Result<String, String> {
         .map_err(|e| format!("PNG编码失败: {}", e))?;
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
-    Ok(format!("data:image/png;base64,{}", b64))
+    Ok(TrimImageResult {
+        data_url: format!("data:image/png;base64,{}", b64),
+        trim_box,
+    })
 }
 
 /// Enhance a faint/blurry invoice image (levels stretch + gamma + unsharp mask).
@@ -918,82 +945,94 @@ async fn download_pdfium_dll(app: tauri::AppHandle) -> Result<pdf_engine::PdfRes
     let dll_url = "https://gh-proxy.com/https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7834/pdfium-win-x64.tgz";
     let tgz_path = tools_dir.join("pdfium-win-x64.tgz");
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("创建下载客户端失败: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<pdf_engine::PdfResult, String> {
+        use std::io::{Read, Write};
 
-    {
+        let agent = build_http_agent(std::time::Duration::from_secs(120))?;
+
+        let resp = match agent.get(dll_url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => {
+                std::fs::remove_file(&tgz_path).ok();
+                return Err(format!("下载失败，HTTP 状态: {}", code));
+            }
+            Err(e) => {
+                std::fs::remove_file(&tgz_path).ok();
+                return Err(format!("下载失败: {}", e));
+            }
+        };
+
+        let total_size = resp.header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+
         let mut file = std::fs::File::create(&tgz_path)
             .map_err(|e| format!("创建临时文件失败: {}", e))?;
-        let mut stream = client.get(dll_url)
-            .send()
-            .await
-            .map_err(|e| format!("下载失败: {}", e))?;
-
-        if !stream.status().is_success() {
-            std::fs::remove_file(&tgz_path).ok();
-            return Err(format!("下载失败，HTTP 状态: {}", stream.status()));
-        }
-
-        let total_size = stream.content_length().unwrap_or(0);
+        let mut reader = resp.into_reader();
+        let mut buf = [0u8; 64 * 1024];
         let mut downloaded: u64 = 0;
 
-        while let Some(chunk) = stream.chunk().await.map_err(|e| format!("下载出错: {}", e))? {
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| format!("下载出错: {}", e))?;
+            if n == 0 { break; }
             if DOWNLOAD_CANCELLED.load(AtomicOrdering::SeqCst) {
                 drop(file);
+                drop(reader);
                 std::fs::remove_file(&tgz_path).ok();
                 return Err("下载已取消".to_string());
             }
-            use std::io::Write;
-            file.write_all(&chunk)
+            file.write_all(&buf[..n])
                 .map_err(|e| format!("写入文件失败: {}", e))?;
-            downloaded += chunk.len() as u64;
+            downloaded += n as u64;
             let _ = app.emit("pdfium-download-progress", serde_json::json!({
                 "current": downloaded,
                 "total": total_size,
                 "percent": if total_size > 0 { (downloaded as f64 / total_size as f64) * 100.0 } else { 0.0 }
             }));
         }
-    }
+        drop(file);
+        drop(reader);
 
-    let tgz_file = std::fs::File::open(&tgz_path)
-        .map_err(|e| format!("打开 tgz 失败: {}", e))?;
-    let gz_decoder = flate2::read::GzDecoder::new(tgz_file);
-    let mut archive = tar::Archive::new(gz_decoder);
-    let mut found_dll = false;
+        let tgz_file = std::fs::File::open(&tgz_path)
+            .map_err(|e| format!("打开 tgz 失败: {}", e))?;
+        let gz_decoder = flate2::read::GzDecoder::new(tgz_file);
+        let mut archive = tar::Archive::new(gz_decoder);
+        let mut found_dll = false;
 
-    for entry_result in archive.entries().map_err(|e| format!("解析 tgz 失败: {}", e))? {
-        let mut entry = entry_result.map_err(|e| format!("读取 tgz 条目失败: {}", e))?;
-        let path = entry.path().map_err(|e| format!("获取路径失败: {}", e))?;
-        let file_name = path.file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
+        for entry_result in archive.entries().map_err(|e| format!("解析 tgz 失败: {}", e))? {
+            let mut entry = entry_result.map_err(|e| format!("读取 tgz 条目失败: {}", e))?;
+            let path = entry.path().map_err(|e| format!("获取路径失败: {}", e))?;
+            let file_name = path.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
 
-        if file_name.eq_ignore_ascii_case("pdfium.dll") {
-            let mut out_file = std::fs::File::create(&dest)
-                .map_err(|e| format!("创建 pdfium.dll 失败: {}", e))?;
-            std::io::copy(&mut entry, &mut out_file)
-                .map_err(|e| format!("解压失败: {}", e))?;
-            found_dll = true;
-            break;
+            if file_name.eq_ignore_ascii_case("pdfium.dll") {
+                let mut out_file = std::fs::File::create(&dest)
+                    .map_err(|e| format!("创建 pdfium.dll 失败: {}", e))?;
+                std::io::copy(&mut entry, &mut out_file)
+                    .map_err(|e| format!("解压失败: {}", e))?;
+                found_dll = true;
+                break;
+            }
         }
-    }
 
-    std::fs::remove_file(&tgz_path).ok();
+        std::fs::remove_file(&tgz_path).ok();
 
-    if !found_dll {
-        return Err("tgz 中未找到 pdfium.dll".to_string());
-    }
+        if !found_dll {
+            return Err("tgz 中未找到 pdfium.dll".to_string());
+        }
 
-    log::info!("pdfium.dll downloaded to: {}", dest.display());
+        log::info!("pdfium.dll downloaded to: {}", dest.display());
 
-    Ok(pdf_engine::PdfResult {
-        success: true,
-        message: format!("pdfium.dll 已下载到: {}", dest.display()),
-        pdf_path: Some(dest.to_string_lossy().to_string()),
-        warnings: None,
+        Ok(pdf_engine::PdfResult {
+            success: true,
+            message: format!("pdfium.dll 已下载到: {}", dest.display()),
+            pdf_path: Some(dest.to_string_lossy().to_string()),
+            warnings: None,
+        })
     })
+    .await
+    .map_err(|e| format!("下载任务失败: {}", e))?
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1055,90 +1094,102 @@ async fn download_sumatrapdf(app: tauri::AppHandle) -> Result<pdf_engine::PdfRes
     let zip_url = "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64.zip";
     let zip_path = tools_dir.join("SumatraPDF-3.6.1-64.zip");
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("创建下载客户端失败: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<pdf_engine::PdfResult, String> {
+        use std::io::{Read, Write};
 
-    {
+        let agent = build_http_agent(std::time::Duration::from_secs(120))?;
+
+        let resp = match agent.get(zip_url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => {
+                std::fs::remove_file(&zip_path).ok();
+                return Err(format!("下载失败，HTTP 状态: {}", code));
+            }
+            Err(e) => {
+                std::fs::remove_file(&zip_path).ok();
+                return Err(format!("下载失败: {}", e));
+            }
+        };
+
+        let total_size = resp.header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+
         let mut file = std::fs::File::create(&zip_path)
             .map_err(|e| format!("创建临时文件失败: {}", e))?;
-        let mut stream = client.get(zip_url)
-            .send()
-            .await
-            .map_err(|e| format!("下载失败: {}", e))?;
-
-        if !stream.status().is_success() {
-            std::fs::remove_file(&zip_path).ok();
-            return Err(format!("下载失败，HTTP 状态: {}", stream.status()));
-        }
-
-        let total_size = stream.content_length().unwrap_or(0);
+        let mut reader = resp.into_reader();
+        let mut buf = [0u8; 64 * 1024];
         let mut downloaded: u64 = 0;
 
-        while let Some(chunk) = stream.chunk().await.map_err(|e| format!("下载出错: {}", e))? {
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| format!("下载出错: {}", e))?;
+            if n == 0 { break; }
             if DOWNLOAD_CANCELLED.load(AtomicOrdering::SeqCst) {
                 drop(file);
+                drop(reader);
                 std::fs::remove_file(&zip_path).ok();
                 return Err("下载已取消".to_string());
             }
-            use std::io::Write;
-            file.write_all(&chunk)
+            file.write_all(&buf[..n])
                 .map_err(|e| format!("写入文件失败: {}", e))?;
-            downloaded += chunk.len() as u64;
+            downloaded += n as u64;
             let _ = app.emit("sumatra-download-progress", serde_json::json!({
                 "current": downloaded,
                 "total": total_size,
                 "percent": if total_size > 0 { (downloaded as f64 / total_size as f64) * 100.0 } else { 0.0 }
             }));
         }
-    }
+        drop(file);
+        drop(reader);
 
-    let zip_file = std::fs::File::open(&zip_path)
-        .map_err(|e| format!("打开 ZIP 失败: {}", e))?;
-    let mut archive = zip::ZipArchive::new(zip_file)
-        .map_err(|e| format!("解析 ZIP 失败: {}", e))?;
+        let zip_file = std::fs::File::open(&zip_path)
+            .map_err(|e| format!("打开 ZIP 失败: {}", e))?;
+        let mut archive = zip::ZipArchive::new(zip_file)
+            .map_err(|e| format!("解析 ZIP 失败: {}", e))?;
 
-    let mut found_exe = false;
-    let mut zip_entries: Vec<String> = Vec::new();
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)
-            .map_err(|e| format!("读取 ZIP 条目失败: {}", e))?;
-        let name = file.name().to_string();
-        zip_entries.push(name.clone());
+        let mut found_exe = false;
+        let mut zip_entries: Vec<String> = Vec::new();
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)
+                .map_err(|e| format!("读取 ZIP 条目失败: {}", e))?;
+            let name = file.name().to_string();
+            zip_entries.push(name.clone());
 
-        let file_name = std::path::Path::new(&name)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !file.is_dir()
-            && file_name.to_lowercase().contains("sumatrapdf")
-            && file_name.to_lowercase().ends_with(".exe")
-        {
-            let mut out_file = std::fs::File::create(&dest)
-                .map_err(|e| format!("创建 SumatraPDF.exe 失败: {}", e))?;
-            std::io::copy(&mut file, &mut out_file)
-                .map_err(|e| format!("解压失败: {}", e))?;
-            found_exe = true;
-            break;
+            let file_name = std::path::Path::new(&name)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !file.is_dir()
+                && file_name.to_lowercase().contains("sumatrapdf")
+                && file_name.to_lowercase().ends_with(".exe")
+            {
+                let mut out_file = std::fs::File::create(&dest)
+                    .map_err(|e| format!("创建 SumatraPDF.exe 失败: {}", e))?;
+                std::io::copy(&mut file, &mut out_file)
+                    .map_err(|e| format!("解压失败: {}", e))?;
+                found_exe = true;
+                break;
+            }
         }
-    }
 
-    std::fs::remove_file(&zip_path).ok();
+        std::fs::remove_file(&zip_path).ok();
 
-    if !found_exe {
-        log::warn!("ZIP entries: {:?}", zip_entries);
-        return Err(format!("ZIP 中未找到 SumatraPDF.exe，包含文件: {}", zip_entries.join(", ")));
-    }
+        if !found_exe {
+            log::warn!("ZIP entries: {:?}", zip_entries);
+            return Err(format!("ZIP 中未找到 SumatraPDF.exe，包含文件: {}", zip_entries.join(", ")));
+        }
 
-    log::info!("SumatraPDF downloaded to: {}", dest.display());
+        log::info!("SumatraPDF downloaded to: {}", dest.display());
 
-    Ok(pdf_engine::PdfResult {
-        success: true,
-        message: format!("SumatraPDF 已下载到: {}", dest.display()),
-        pdf_path: Some(dest.to_string_lossy().to_string()),
-        warnings: None,
+        Ok(pdf_engine::PdfResult {
+            success: true,
+            message: format!("SumatraPDF 已下载到: {}", dest.display()),
+            pdf_path: Some(dest.to_string_lossy().to_string()),
+            warnings: None,
+        })
     })
+    .await
+    .map_err(|e| format!("下载任务失败: {}", e))?
 }
 
 /// Print an existing PDF file using SumatraPDF CLI
@@ -1309,8 +1360,6 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(

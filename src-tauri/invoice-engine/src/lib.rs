@@ -1916,6 +1916,38 @@ fn parse_cn_date(text: &str) -> Option<String> {
     Some(format!("{}-{:0>2}-{:0>2}", year, month, day))
 }
 
+/// 发票类型判定：逐条文本匹配，避免跨文本拼接出来的假关键词。
+/// 「普通」优先于「专用」—— 票面其它位置出现「专用」字样、或 OCR/文字层误识时，不会被误判成专票。
+fn detect_invoice_type<'a, I>(texts: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut general = false;
+    let mut special = false;
+    let mut electronic = false;
+    for text in texts {
+        let s: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if s.contains("普通发票") || s.contains("增值税普通") || s.contains("电子普通") {
+            general = true;
+        }
+        if s.contains("专用发票") || s.contains("增值税专用") {
+            special = true;
+        }
+        if s.contains("电子发票") {
+            electronic = true;
+        }
+    }
+    if general {
+        Some("增值税普通发票".to_string())
+    } else if special {
+        Some("增值税专用发票".to_string())
+    } else if electronic {
+        Some("电子发票".to_string())
+    } else {
+        None
+    }
+}
+
 /// Extract invoice data from text content when no CustomData or CustomTag is available.
 /// This handles OFD files from non-standard producers that embed subset fonts
 /// but don't include structured XML metadata.
@@ -2069,17 +2101,10 @@ fn extract_invoice_from_text(texts: &[&OfdTextObject]) -> OfdInvoiceInfo {
             }
         }
 
-        // Invoice type detection
-        if info.invoice_type.is_none() {
-            if t.contains("增值税专用") {
-                info.invoice_type = Some("增值税专用发票".to_string());
-            } else if t.contains("增值税普通") || t.contains("增值税电子普通") {
-                info.invoice_type = Some("增值税普通发票".to_string());
-            } else if t.contains("电子发票") {
-                info.invoice_type = Some("电子发票".to_string());
-            }
-        }
     }
+
+    // 发票类型：在合并后的文本序列上判定（连续单字已拼接，拆字票同样可识别）
+    info.invoice_type = detect_invoice_type(composite_texts.iter().map(|s| s.as_str()));
 
     // Compute missing amount fields
     // If we have amount_tax but no breakdown, assume no_tax = amount_tax and tax = 0
@@ -2500,34 +2525,12 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
         invoice_info.is_toll = Some(has_toll_text);
     }
 
-    // Detect invoice type from template title
-    for t in &tpl_texts {
-        if t.text.contains("增值税专用") {
-            invoice_info.invoice_type = Some("增值税专用发票".to_string());
-            break;
-        } else if t.text.contains("增值税普通") || t.text.contains("增值税电子普通") {
-            invoice_info.invoice_type = Some("增值税普通发票".to_string());
-            break;
-        } else if t.text.contains("电子发票") {
-            invoice_info.invoice_type = Some("电子发票".to_string());
-            break;
-        }
-    }
-    // Also detect from page texts (when there's no template layer)
-    if invoice_info.invoice_type.is_none() {
-        for t in &page_texts {
-            if t.text.contains("增值税专用") {
-                invoice_info.invoice_type = Some("增值税专用发票".to_string());
-                break;
-            } else if t.text.contains("增值税普通") || t.text.contains("增值税电子普通") {
-                invoice_info.invoice_type = Some("增值税普通发票".to_string());
-                break;
-            } else if t.text.contains("电子发票") {
-                invoice_info.invoice_type = Some("电子发票".to_string());
-                break;
-            }
-        }
-    }
+    // 发票类型：模板层 + 数据层文本合并判定（「普通」优先；逐条未命中时用拼接串兜底拆字票）
+    let mut type_texts: Vec<&str> = tpl_texts.iter().chain(page_texts.iter())
+        .map(|t| t.text.as_str()).collect();
+    let type_text_merged: String = type_texts.concat();
+    type_texts.push(type_text_merged.as_str());
+    invoice_info.invoice_type = detect_invoice_type(type_texts);
 
     // 11b. Text-based fallback extraction when no CustomData or CustomTag
     // This handles OFD files from non-tax producers (e.g., dzcp) that embed fonts
@@ -2629,6 +2632,8 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
     // Track LabelName values from EInvoiceType and GeneralOrSpecialVAT
     let mut einvoice_type_label: Option<String> = None;
     let mut general_or_special_label: Option<String> = None;
+    // LabelCode 兜底（部分结构变体只有码值没有名称）
+    let mut general_or_special_code: Option<String> = None;
     // Item names (IssuItemInformation) — used for toll detection
     let mut item_names: Vec<String> = Vec::new();
 
@@ -2685,6 +2690,13 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
                             }
                             _ => {}
                         },
+                        // LabelCode 兜底：标准码表 01=增值税专用发票、02=普通发票
+                        "LabelCode" => match parent_tag {
+                            "GeneralOrSpecialVAT" if general_or_special_code.is_none() => {
+                                general_or_special_code = Some(text.to_string());
+                            }
+                            _ => {}
+                        },
                         // Item names — used for toll detection (通行费)
                         "ItemName" => item_names.push(text.to_string()),
                         _ => {}
@@ -2701,7 +2713,15 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
     // Compose invoice_type from EInvoiceType + GeneralOrSpecialVAT labels
     // e.g. "电子发票" + "普通发票" → "电子发票(普通发票)"
     // e.g. "电子发票" + "增值税专用发票" → "电子发票(增值税专用发票)"
-    if let Some(special_label) = &general_or_special_label {
+    // LabelName 缺失时按 LabelCode 兜底（01=增值税专用发票，02=普通发票）
+    let special_label = general_or_special_label.clone().or_else(|| {
+        match general_or_special_code.as_deref() {
+            Some("01") => Some("增值税专用发票".to_string()),
+            Some("02") => Some("普通发票".to_string()),
+            _ => None,
+        }
+    });
+    if let Some(special_label) = special_label {
         let prefix = einvoice_type_label.as_deref().unwrap_or("电子发票");
         info.invoice_type = Some(format!("{}({})", prefix, special_label));
     } else if let Some(type_label) = &einvoice_type_label {
@@ -2888,6 +2908,74 @@ mod tests {
 
         let info = parse_xml_invoice_content(xml).unwrap();
         assert_eq!(info.invoice_date.as_deref(), Some("2026-01-15"));
+    }
+
+    #[test]
+    fn test_parse_xml_label_code_fallback() {
+        // GeneralOrSpecialVAT 只有码值没有名称时按码表兜底：01=专票、02=普票
+        let special = r#"<EInvoice><Header><InherentLabel>
+            <EInvoiceType><LabelCode>01</LabelCode><LabelName>电子发票</LabelName></EInvoiceType>
+            <GeneralOrSpecialVAT><LabelCode>01</LabelCode></GeneralOrSpecialVAT>
+        </InherentLabel></Header><EInvoiceData/></EInvoice>"#;
+        assert_eq!(
+            parse_xml_invoice_content(special).unwrap().invoice_type.as_deref(),
+            Some("电子发票(增值税专用发票)")
+        );
+
+        let general = r#"<EInvoice><Header><InherentLabel>
+            <EInvoiceType><LabelCode>01</LabelCode><LabelName>电子发票</LabelName></EInvoiceType>
+            <GeneralOrSpecialVAT><LabelCode>02</LabelCode></GeneralOrSpecialVAT>
+        </InherentLabel></Header><EInvoiceData/></EInvoice>"#;
+        assert_eq!(
+            parse_xml_invoice_content(general).unwrap().invoice_type.as_deref(),
+            Some("电子发票(普通发票)")
+        );
+    }
+
+    #[test]
+    fn test_parse_xml_label_name_wins_over_code() {
+        // 名称与码值同时存在时以名称为准
+        let xml = r#"<EInvoice><Header><InherentLabel>
+            <EInvoiceType><LabelCode>01</LabelCode><LabelName>电子发票</LabelName></EInvoiceType>
+            <GeneralOrSpecialVAT><LabelCode>01</LabelCode><LabelName>增值税普通发票</LabelName></GeneralOrSpecialVAT>
+        </InherentLabel></Header><EInvoiceData/></EInvoice>"#;
+        assert_eq!(
+            parse_xml_invoice_content(xml).unwrap().invoice_type.as_deref(),
+            Some("电子发票(增值税普通发票)")
+        );
+    }
+
+    #[test]
+    fn test_detect_invoice_type_variants() {
+        let detect = |texts: Vec<&str>| detect_invoice_type(texts).unwrap_or_default();
+        // 数电票标题
+        assert_eq!(detect(vec!["电子发票（普通发票）"]), "增值税普通发票");
+        assert_eq!(detect(vec!["电子发票（增值税专用发票）"]), "增值税专用发票");
+        // 老式纸票标题
+        assert_eq!(detect(vec!["江苏增值税普通发票"]), "增值税普通发票");
+        assert_eq!(detect(vec!["江苏增值税专用发票"]), "增值税专用发票");
+        // 无专普信息时退化为「电子发票」
+        assert_eq!(detect(vec!["电子发票"]), "电子发票");
+        // 无任何类型信息
+        assert_eq!(detect(vec!["某某公司", "价税合计"]), "");
+    }
+
+    #[test]
+    fn test_detect_invoice_type_general_wins() {
+        // 票面其它位置出现「专用」字样时，仍按「普通」判定（普票优先）
+        let got = detect_invoice_type(vec!["电子发票（普通发票）", "备注：本票非增值税专用发票"]);
+        assert_eq!(got.as_deref(), Some("增值税普通发票"));
+    }
+
+    #[test]
+    fn test_detect_invoice_type_no_cross_item_match() {
+        // 逐条匹配：跨文本拼接出的「增值税专用」不算命中
+        assert_eq!(detect_invoice_type(vec!["增值税", "专用"]), None);
+        // 连续单字拼接后的整串可识别（OFD/PDF 拆字场景由调用方先合并）
+        assert_eq!(
+            detect_invoice_type(vec!["增值税专用发票"]).as_deref(),
+            Some("增值税专用发票")
+        );
     }
 }
 

@@ -402,6 +402,7 @@ function applyOcrResult(fileObj, ocrResult) {
     fileObj._isTicket = info.isTicket || false;
     fileObj._isNonTax = info.isNonTax || false;
     fileObj._isToll = info.isToll || false;
+    if (info.invoiceType && !fileObj.invoiceType) fileObj.invoiceType = info.invoiceType;
 
     // If amounts already set by PDF text extraction, skip OCR amount validation
     // to avoid duplicate warning logs
@@ -560,6 +561,7 @@ function applyPdfTextResult(fileObj, pdfTextResult) {
     fileObj._isTicket = info.isTicket || false;
     fileObj._isNonTax = info.isNonTax || false;
     fileObj._isToll = info.isToll || false;
+    if (info.invoiceType && !fileObj.invoiceType) fileObj.invoiceType = info.invoiceType;
 
     // Only fill empty fields — structured extraction priority
     if (info.invoiceNo && !fileObj.invoiceNo) fileObj.invoiceNo = info.invoiceNo;
@@ -685,8 +687,16 @@ function _normText(s) {
   s = s.replace(/[Ａ-Ｚａ-ｚ]/g, function(c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
   s = s.replace(/％/g, '%').replace(/．/g, '.').replace(/，/g, ',').replace(/：/g, ':');
   s = s.replace(/￥/g, '¥');
-  // Collapse spaces between CJK chars
-  s = s.replace(/([\u4e00-\u9fff])\s+([\u4e00-\u9fff])/g, '$1$2');
+  // Collapse spaces between CJK chars. Must loop: a single pass with the global
+  // flag skips overlapping neighbours, e.g. "售 方 信 息" → "售方 信息" (one space left).
+  // PDF text layers split text into Tj runs and often leave spaces inside/between
+  // fragments ("名 " / "售 方 信 息"), which breaks every exact/short-word match.
+  for (var _ci = 0; _ci < 5; _ci++) {
+    var _ciPrev = '';
+    while (_ciPrev !== s) { _ciPrev = s; s = s.replace(/([\u4e00-\u9fff])\s+([\u4e00-\u9fff])/g, '$1$2'); }
+  }
+  // Trim stray leading/trailing whitespace ("名 " → "名")
+  s = s.replace(/^\s+|\s+$/g, '');
   return s;
 }
 
@@ -790,6 +800,10 @@ function _cleanName(raw) {
   name = name.replace(/^[\s:：]+/, '');
   // Skip if it's a label itself or non-company text
   if (/^(?:购买方信息|销售方信息|购买方|销售方|名称|信息|纳税人|地址|电话|开户行|账号|项目名称|规格型号|交款人)$/.test(name)) return '';
+  // Skip label/header fragments — 竖排页眉（购买方信息/销售方信息）在文字层里会被拆成
+  // 单字或多个碎片，可能拼出 "售方信息" 这类非公司名文本。真公司名必然含公司后缀，
+  // 不会只由标签字构成。
+  if (/^[购买销售方信息名称备注项目单位数量金额税率税额合计开票收款复核出行等级交通栏]+$/.test(name)) return '';
   // Skip table header terms and section labels
   if (/^(?:单价|数量|金额|税率|税额|合\s*计|大\s*写|小\s*写|备\s*注|出行人|证件号|出行日期|出发地|到达地|等\s*级|交通工具|开票人|收款人|复核人|价税合计|金额合计|收款单位|校验码|票据代码|票据号码|项目编码|项目名称|单位|标准)$/.test(name)) return '';
   // Skip metadata/watermark annotations (download count, verification count, etc.)
@@ -807,6 +821,22 @@ function _cleanName(raw) {
   // Must contain CJK and be at least 2 chars
   if (name.length < 2 || !/[\u4e00-\u9fff]/.test(name)) return '';
   return name;
+}
+
+/**
+ * 坐标法与跨行法结果择优：
+ * - 坐标值含冒号 → 标签残留（脏值），用跨行候选；
+ * - 两值互为子串 → 坐标法截断/丢字，取更长的跨行候选；
+ * - 其余（同名/完全不同名）保持坐标值 —— 跨行在乱序文本上可能配错侧，不盲目覆盖。
+ */
+function _betterCoordName(coord, cross) {
+  if (!coord) return cross || '';
+  if (!cross) return coord;
+  if (/[:：]/.test(coord)) return cross;
+  if (coord !== cross && (cross.indexOf(coord) >= 0 || coord.indexOf(cross) >= 0)) {
+    return cross.length > coord.length ? cross : coord;
+  }
+  return coord;
 }
 
 /**
@@ -1571,23 +1601,22 @@ function _extractByText(fullText, words) {
   }
   // Pattern 3: Loose cross-line (label and value separated by multiple lines)
   // e.g., "发票号码：\n...\n25322000000337005189"
-  // Find ALL digit sequences of 8-20 digits after the label, pick the longest one.
-  // This avoids matching credit code prefixes like "91320583" (8 digits) when the
-  // actual invoice number is "25327200000104224588" (20 digits).
+  // 文字层按内容流顺序产出时（数电票 PDF），号码可能远在标签之后，中间还夹着
+  // 购销双方的信用代码。扫描标签之后的所有 8~20 位纯数字串，取最长的一个，并剔除：
+  //   - 信用代码尾段：数字串紧邻字母（如 ...34916R / ...48368W）
+  //   - 小数/长数字片段：数字串紧邻 "." 或数字（被 {8,20} 截断，如 61.06333333）
   if (!result.invoiceNo) {
-    var noLooseAll = text.match(/(?:发\s*票\s*号\s*码|票\s*据\s*号\s*码|票\s*据\s*号\s*码)[:：][\s\S]*?\d{8,20}/g);
-    if (noLooseAll) {
-      var bestNo = '';
-      for (var _ni = 0; _ni < noLooseAll.length; _ni++) {
-        // Extract all digit sequences of 8-20 digits from each match
-        var _digitMatches = noLooseAll[_ni].match(/\d{8,20}/g);
-        if (_digitMatches) {
-          for (var _di = 0; _di < _digitMatches.length; _di++) {
-            if (_digitMatches[_di].length > bestNo.length) {
-              bestNo = _digitMatches[_di];
-            }
-          }
-        }
+    var _noLabelPos = text.search(/(?:发\s*票\s*号\s*码|票\s*据\s*号\s*码|票\s*据\s*号\s*码)/);
+    if (_noLabelPos >= 0) {
+      var _noTail = text.substring(_noLabelPos);
+      var _noRunRe = /\d{8,20}/g;
+      var _noRunM, bestNo = '';
+      while ((_noRunM = _noRunRe.exec(_noTail)) !== null) {
+        var _noRun = _noRunM[0];
+        if (/[A-Za-z]/.test(_noTail.charAt(_noRunM.index + _noRun.length))) continue;
+        var _noPrevCh = _noTail.charAt(_noRunM.index - 1);
+        if (_noPrevCh === '.' || /\d/.test(_noPrevCh)) continue;
+        if (_noRun.length > bestNo.length) bestNo = _noRun;
       }
       // Only accept if >= 10 digits (credit code prefixes are typically 8 digits,
       // invoice numbers are 10-20 digits)
@@ -1691,6 +1720,11 @@ function _extractByText(fullText, words) {
   }
 
   // --- Buyer/Seller names ---
+  // Priority 0: Cross-line candidates（文本顺序，对拆字 PDF 稳定）。
+  // 坐标邻近提取在拆字 PDF 上用近似宽度取值，易截断/混入标签冒号，
+  // 先预跑跨行候选，坐标法跑完后做合成（见 _betterCoordName）。
+  var crossNames = {};
+  _extractNamesCrossLine(text, crossNames);
   // Priority 1: Explicit labels "购买方名称：" / "销售方名称：" (same line)
   // Also handles non-tax invoices: "交款人：" for buyer
   var buyerLabelMatch = text.match(/(?:购\s*买\s*方(?:信息)?名\s*称|交\s*款\s*人\s*[:：])\s*([^\n]+)/);
@@ -1708,6 +1742,10 @@ function _extractByText(fullText, words) {
   if ((!result.buyerName || !result.sellerName) && words && words.length > 0) {
     _extractNamesByCoords(words, result);
   }
+  // 合成：坐标法残缺值（标签冒号残留 / 截断成跨行候选的子串）用跨行候选修复；
+  // 干净的坐标值保持不变（跨行在乱序文本上可能配错侧，不盲目覆盖）
+  result.buyerName = _betterCoordName(result.buyerName, crossNames.buyerName);
+  result.sellerName = _betterCoordName(result.sellerName, crossNames.sellerName);
   // Priority 1c: Cross-line format (label and value on separate lines)
   // Only if coordinate method didn't find both names
   if (!result.buyerName || !result.sellerName) {
@@ -2765,6 +2803,39 @@ function _detectInvoiceType(words, imgW, imgH) {
 }
 
 /**
+ * 增值税发票 专票/普票 判定。
+ * 三层兜底：票头标题区（ny < 0.18）→ 全文原始串（内容流顺序，标题连续）→ 词序拼接。
+ * 「普通」优先于「专用」——票面其它位置出现「专用」字样或识别噪声时，不会把普票误判成专票。
+ * fullText 必传：部分 PDF 的文字层坐标失效（整页并成一行、词按 x 重排），
+ * 按 words 拼接会把连续标题打散，只有内容流顺序的原始串能保住连续关键词。
+ * @returns {'专票'|'普票'|''}
+ */
+function _detectVatSubtype(words, fullText) {
+  function pick(text) {
+    var s = (text || '').replace(/\s/g, '');
+    if (/普通发票|增值税普通|电子普通/.test(s)) return '普票';
+    if (/专用发票|增值税专用/.test(s)) return '专票';
+    return '';
+  }
+  var head = words.filter(function(w) { return w.ny < 0.18; })
+    .map(function(w) { return w.normText; }).join('');
+  return pick(head) || pick(fullText) || pick(words.map(function(w) { return w.normText; }).join(''));
+}
+
+/**
+ * 判断一个词是否属于标签/表头碎片（不是名称内容）。
+ * 文字层把竖排页眉"购买方信息/销售方信息"拆成单字（销/售/方/信/息）时，
+ * 这些字与信用代码标签会混进名称收集区，被拼成名称尾缀（如"…公司方信统一社会"）。
+ * 仅对整词生效，不影响公司名内部字符。
+ */
+function _isLabelFragmentWord(w) {
+  var t = (w && (w.normText || w.text)) || '';
+  if (!t) return false;
+  if (/^[购买销售方信息名称备注项目单位数量金额税率税额合计开票收款复核出行等级交通栏]+$/.test(t)) return true;
+  return /统一社会|信用代码|纳税人识别号/.test(t);
+}
+
+/**
  * Extract seller info using coordinates.
  * Strategy: find "销售方信息" or "名称:" in right half → grab name + credit code.
  */
@@ -2773,7 +2844,8 @@ function _extractSeller(words, imgW, imgH) {
 
   // Right-half words (nx > 0.45) in top 40% (seller region)
   var sellerWords = words.filter(function(w) {
-    return w.nx > 0.45 && w.ny > 0.15 && w.ny < 0.45;
+    if (w.nx <= 0.45 || w.ny <= 0.15 || w.ny >= 0.45) return false;
+    return !_isLabelFragmentWord(w);
   });
   var sellerText = sellerWords.map(function(w) { return w.normText; }).join('');
 
@@ -2883,27 +2955,32 @@ function _extractSeller(words, imgW, imgH) {
     }
   }
 
-  // Pattern 3: Company name with suffix in seller region
-  if (!sellerName) {
-    var csSuffix = '(?:公司|集团|商行|商店|厂|部|院|所|中心|店|馆|站|社|行|会|处|室|局|办|坊|铺|有限合伙|合伙企业|个体工商户|个体户|工作室|经营部|门市部|分公司|事业部|事务所|医院|学校|幼儿园|合作社|企业|商社|贸易行|服务部)';
-    var companyRe = new RegExp('([\\u4e00-\\u9fff][\\u4e00-\\u9fff\\w（）()·\\-\\.]+' + csSuffix + ')');
-    var companyMatch = sellerText.match(companyRe);
-    if (companyMatch) sellerName = companyMatch[1].trim();
-  }
-
-  // Pattern 4: Company name with suffix in ALL words (fallback for compact layouts
-  // where the seller company name might not be in the strict seller region)
+  // Pattern 3: Company name with suffix, matched at WORD level first.
+  // 词级匹配最精确（文字层里公司名通常就是一个整词），放在整段文本正则之前：
+  // 后者用后缀表（含"行/会/社"等单字后缀）贪心匹配，会把标签残片一起吃进去
+  // （如"…有限公司" + "方信统一社会" → 末尾"会"命中后缀）。
   if (!sellerName && words && words.length > 0) {
-    var csSuffix4 = '(?:公司|集团|商行|商店|厂|部|院|所|中心|店|馆|站|社|行|会|处|室|局|办|坊|铺|有限合伙|合伙企业|个体工商户|个体户|工作室|经营部|门市部|分公司|事业部|事务所|医院|学校|幼儿园|合作社|企业|商社|贸易行|服务部)';
-    var companyRe4 = new RegExp('^([\\u4e00-\\u9fff][\\u4e00-\\u9fff\\w（）()·\\-\\.]+' + csSuffix4 + ')$');
-    // Find company name words in the right half (nx >= 0.5) — seller side
+    var csSuffix3 = '(?:公司|集团|商行|商店|厂|部|院|所|中心|店|馆|站|社|行|会|处|室|局|办|坊|铺|有限合伙|合伙企业|个体工商户|个体户|工作室|经营部|门市部|分公司|事业部|事务所|医院|学校|幼儿园|合作社|企业|商社|贸易行|服务部)';
+    var companyRe3 = new RegExp('^([\\u4e00-\\u9fff][\\u4e00-\\u9fff\\w（）()·\\-\\.]+' + csSuffix3 + ')$');
     var sellerCompWords = words.filter(function(w) {
       if (w.nx < 0.4) return false;  // Must be in right portion of page
-      return companyRe4.test(w.normText) || companyRe4.test(w.text);
+      if (_isLabelFragmentWord(w)) return false;
+      var t = (w.normText || w.text || '').trim();
+      if (t.length < 6) return false;  // 排除"有限公司"等纯后缀片段
+      return companyRe3.test(w.normText) || companyRe3.test(t);
     });
     if (sellerCompWords.length > 0) {
       sellerName = sellerCompWords[0].normText || sellerCompWords[0].text;
     }
+  }
+
+  // Pattern 4: Company name with suffix in the concatenated seller-region text
+  // (last resort — covers names split across several words)
+  if (!sellerName) {
+    var csSuffix = '(?:公司|集团|商行|商店|厂|部|院|所|中心|店|馆|站|社|行|会|处|室|局|办|坊|铺|有限合伙|合伙企业|个体工商户|个体户|工作室|经营部|门市部|分公司|事业部|事务所|医院|学校|幼儿园|合作社|企业|商社|贸易行|服务部)';
+    var companyRe = new RegExp('([\\u4e00-\\u9fff][\\u4e00-\\u9fff\\w（）()·\\-\\.]{2,25}' + csSuffix + ')');
+    var companyMatch = sellerText.match(companyRe);
+    if (companyMatch) sellerName = companyMatch[1].trim();
   }
 
   // Cleanup
@@ -2969,13 +3046,16 @@ function extractByCoordinates(ocrResult) {
 
   // Detect invoice type
   var invType = _detectInvoiceType(words, imgW, imgH);
+  // 专票/普票仅在增值税发票路径下判定（车票/通行费/非税各走自己的类型标记）
+  var vatSubtype = invType === 'vat' ? _detectVatSubtype(words, fullText) : '';
   var isTicket = invType === 'ticket';
   var isToll = invType === 'toll';
   var sellerName = textInfo.sellerName || '';
   var sellerCreditCode = textInfo.sellerCreditCode || '';
   var amountTax = 0, amountNoTax = 0, taxAmount = 0;
 
-  console.log('[坐标提取] 发票类型:', invType, '字数:', fullText.length, '词数:', words.length,
+  console.log('[坐标提取] 发票类型:', invType + (vatSubtype ? '/' + vatSubtype : ''),
+    '字数:', fullText.length, '词数:', words.length,
     '文本提取:', { invoiceNo: invoiceNo || '(空)', invoiceDate: invoiceDate || '(空)',
     buyerName: buyerName || '(空)', sellerName: sellerName || '(空)' });
 
@@ -3842,6 +3922,7 @@ function extractByCoordinates(ocrResult) {
            sellerName: sellerName, sellerCreditCode: sellerCreditCode,
            invoiceNo: invoiceNo, invoiceDate: invoiceDate,
            buyerName: buyerName, buyerCreditCode: buyerCreditCode,
+           invoiceType: vatSubtype,
            _ocrText: fullText, isTicket: false, isNonTax: false, isToll: isToll };
 }
 

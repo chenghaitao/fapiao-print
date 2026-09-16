@@ -102,6 +102,12 @@ function buildLayoutRequest(files, settings) {
         spec.pdfPath = fileObj._pdfPath;
         spec.pdfPageIdx = fileObj._pdfPageIdx >= 0 ? fileObj._pdfPageIdx : null;
       }
+      // 白边裁剪框（像素、原点左上，基于该文件渲染位图 ow × oh）。
+      // PDF 直通路径用它做矢量裁切——否则矢量直通会嵌入整页原件，
+      // 出现"预览裁了白边、打印没裁"。
+      if (fileObj.trimmedBox) {
+        spec.trimBox = [fileObj.trimmedBox.x, fileObj.trimmedBox.y, fileObj.trimmedBox.w, fileObj.trimmedBox.h];
+      }
       fileSpecs.push(spec);
     }
     return fileMap[key];
@@ -157,7 +163,8 @@ function getEffectiveRotation(fileObj, slotIdx, settings, layout) {
   var slot = layout.slots[slotIdx];
   if (settings.globalRotation === 'auto') {
     var isSlotL = slot.w > slot.h;
-    var isImgL = (fileObj.ow || 1) > (fileObj.oh || 1);
+    var dims = getObjDims(fileObj, settings);
+    var isImgL = dims.w > dims.h;
     return (isSlotL !== isImgL) ? (fileObj.rotation + 90) % 360 : fileObj.rotation;
   }
   return ((parseInt(settings.globalRotation) || 0) + (fileObj.rotation || 0)) % 360;
@@ -736,7 +743,8 @@ function fallbackPrint(files, s) {
         var slot = { w: slotW, h: slotH };
         if (s.globalRotation === 'auto') {
           var isSlotL = slotW > slotH;
-          var isImgL = (f.ow || 1) > (f.oh || 1);
+          var _htmlDims = getObjDims(f, s);
+          var isImgL = _htmlDims.w > _htmlDims.h;
           rot = (isSlotL !== isImgL) ? ((f.rotation || 0) + 90) % 360 : (f.rotation || 0);
         } else {
           rot = ((parseInt(s.globalRotation) || 0) + (f.rotation || 0)) % 360;
@@ -755,7 +763,10 @@ function fallbackPrint(files, s) {
         if (perScale !== 1) transforms += 'scale(' + perScale + ') ';
         if (rot) transforms += 'rotate(' + rot + 'deg) ';
         var transformStyle = transforms ? 'transform:' + transforms + ';' : '';
-        var slotAlignStyle = isReimb ? 'align-items:flex-start;justify-content:flex-start;' : '';
+        // 报销单模式：左上对齐；「裁剪白边」：垂直贴顶（水平仍居中）
+        var slotAlignStyle = isReimb
+          ? 'align-items:flex-start;justify-content:flex-start;'
+          : (s.trimWhite ? 'align-items:flex-start;' : '');
         html += '<div class="slot" style="left:' + x + 'mm;top:' + y + 'mm;width:' + slotW + 'mm;height:' + slotH + 'mm;' + slotAlignStyle + '"><img src="' + escHtml(src) + '" style="' + sizeStyle + transformStyle + '"></div>';
       }
     }

@@ -40,7 +40,13 @@ dist/
 .claude/
 .trae/
 portable-git.7z.exe
+
+# 测试样本（本地保留，不入库）
 sample/
+samples/
 sample.ofd
 sample_ofd_extracted/
 test-emf-vector/
+
+# 临时诊断页（下划线开头），避免误提交
+_*.html

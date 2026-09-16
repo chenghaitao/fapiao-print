@@ -1,6 +1,6 @@
 [package]
 name = "ticketchan"
-version = "2.6.3"
+version = "2.6.5"
 description = "发票酱"
 authors = ["ticketchan"]
 license = "MIT"
@@ -22,17 +22,15 @@ cc = "1"
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
 tauri-plugin-log = "2"
-tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 dirs = "5"
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "ico", "bmp", "tiff", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
 ab_glyph = "0.2"
-printpdf = { version = "0.9", features = ["images"] }
+printpdf = { version = "0.9", default-features = false, features = ["images"] }
 lopdf = "0.39"
 encoding_rs = "0.8"
 rayon = "1.10"
@@ -41,8 +39,8 @@ ocr-rs = { version = "2.4", optional = true }
 invoice-engine = { path = "invoice-engine" }
 flate2 = "1.1.9"
 tar = "0.4"
-zip = "2"
-reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+ureq = { version = "2", default-features = false, features = ["native-tls", "gzip", "proxy-from-env"] }
 libloading = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -59,7 +57,6 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Printing",
     "Win32_Storage_Xps",
-    "Win32_Storage_Xps_Printing",
     "Data_Pdf",
     "Storage",
     "Storage_Streams",

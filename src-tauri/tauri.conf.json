@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "发票酱",
-  "version": "2.6.3",
+  "version": "2.6.5",
   "identifier": "com.ticketchan.app",
   "build": {
     "frontendDist": "../src"
@@ -43,8 +43,7 @@
       "nsis": {
         "languages": [
           "SimpChinese"
-        ],
-        "installerIcon": "icons/icon.ico"
+        ]
       }
     }
   }

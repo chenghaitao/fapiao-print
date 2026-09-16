@@ -1594,7 +1594,10 @@ fn extract_pdf_text_from_doc(doc: &lopdf::Document, pdf_path: &str, page_idx: u3
         .ok_or_else(|| format!("PDF页面索引{}不存在", page_idx))?;
 
     // Get page dimensions (pt units)
-    let ((_x1, _y1, _x2, _y2), (page_w_pt, page_h_pt)) = get_page_effective_box(&doc, page_id)?;
+    // crop_x1/content_top：文本坐标到前端像素的换算基准 = 有效盒的左/顶边。
+    // 带 CropBox 的页面（如数电票只保留票面）有效盒高 ≠ MediaBox 高，
+    // 而 content stream 的坐标仍按完整页面书写 —— y 必须相对有效盒顶边（y2）换算。
+    let ((crop_x1, _y1, _x2, content_top), (page_w_pt, page_h_pt)) = get_page_effective_box(&doc, page_id)?;
     let scale = RENDER_DPI as f64 / 72.0; // pt → px
     let page_w_px = (page_w_pt as f64 * scale) as u32;
     let page_h_px = (page_h_pt as f64 * scale) as u32;
@@ -1962,10 +1965,15 @@ fn extract_pdf_text_from_doc(doc: &lopdf::Document, pdf_path: &str, page_idx: u3
         log::info!("PDF文本提取: 页面无文本操作(扫描件)，需OCR回退");
     }
 
-    // State tracking for text position
-    let mut cur_x: f64 = 0.0;
-    let mut cur_y: f64 = 0.0;
-    let mut line_start_x: f64 = 0.0; // x at start of current line (for Td offset)
+    // State tracking for text position.
+    // 文本位置 = CTM · Tm · (off_x, off_y)：Tm 是文本矩阵（可含翻转/旋转/缩放，
+    // 如数电票 PDF 用 `1 0 0 -1 0 0 Tm` 的顶左坐标系），off_* 是 Td/TJ 相对
+    // Tm 平移点的累计位移。此前忽略 Tm 线性部分，翻转坐标系 PDF 的坐标
+    // 全部落到页外、被钳成 y=0（整页并成一行、词序乱）。
+    let mut tm: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut off_x: f64 = 0.0;
+    let mut off_y: f64 = 0.0;
+    let mut line_start_off_x: f64 = 0.0; // x offset at start of current line (for T*)
     let mut font_size: f64 = 12.0;
     let mut leading: f64 = 0.0; // TL-set leading (0 = use font_size * 1.2)
     let mut current_font: Vec<u8> = Vec::new();
@@ -1981,9 +1989,10 @@ fn extract_pdf_text_from_doc(doc: &lopdf::Document, pdf_path: &str, page_idx: u3
     // Graphics state stack for q/Q
     #[derive(Clone)]
     struct GfxState {
-        x: f64,
-        y: f64,
-        line_start_x: f64,
+        tm: [f64; 6],
+        off_x: f64,
+        off_y: f64,
+        line_start_off_x: f64,
         font_size: f64,
         leading: f64,
         font_name: Vec<u8>,
@@ -1999,9 +2008,11 @@ fn extract_pdf_text_from_doc(doc: &lopdf::Document, pdf_path: &str, page_idx: u3
         match op.operator.as_str() {
             "BT" => {
                 in_text_block = true;
-                cur_x = 0.0;
-                cur_y = 0.0;
-                line_start_x = 0.0;
+                // PDF spec: BT resets the text matrix and line matrix to identity
+                tm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                off_x = 0.0;
+                off_y = 0.0;
+                line_start_off_x = 0.0;
                 leading = 0.0;
                 need_space_before = false;
             }
@@ -2012,16 +2023,17 @@ fn extract_pdf_text_from_doc(doc: &lopdf::Document, pdf_path: &str, page_idx: u3
             }
             "q" => {
                 state_stack.push(GfxState {
-                    x: cur_x, y: cur_y, line_start_x,
+                    tm, off_x, off_y, line_start_off_x,
                     font_size, leading, font_name: current_font.clone(),
                     ctm,
                 });
             }
             "Q" => {
                 if let Some(state) = state_stack.pop() {
-                    cur_x = state.x;
-                    cur_y = state.y;
-                    line_start_x = state.line_start_x;
+                    tm = state.tm;
+                    off_x = state.off_x;
+                    off_y = state.off_y;
+                    line_start_off_x = state.line_start_off_x;
                     font_size = state.font_size;
                     leading = state.leading;
                     current_font = state.font_name;
@@ -2070,35 +2082,32 @@ fn extract_pdf_text_from_doc(doc: &lopdf::Document, pdf_path: &str, page_idx: u3
                 }
             }
             "Tm" if op.operands.len() >= 6 && in_text_block => {
-                // Text matrix: a b c d e f Tm
-                // e = x position, f = y position (in PDF coordinate space, pt)
-                // Font size = vertical scale = d (or sqrt(a²+b²) for rotated text)
-                let d = match &op.operands[3] {
-                    Object::Real(r) => *r as f64, Object::Integer(i) => *i as f64, _ => 0.0
-                };
-                cur_x = match &op.operands[4] {
-                    Object::Real(r) => *r as f64, Object::Integer(i) => *i as f64, _ => 0.0
-                };
-                cur_y = match &op.operands[5] {
-                    Object::Real(r) => *r as f64, Object::Integer(i) => *i as f64, _ => 0.0
-                };
-                // Use vertical component d for font size (more reliable than a)
-                if d > 1.0 { font_size = d; }
-                // Tm sets a new absolute position — this becomes the line start
-                line_start_x = cur_x;
+                // Text matrix: a b c d e f Tm — full replacement, may flip/rotate/scale
+                // (e.g. `1 0 0 -1 0 0 Tm` = top-left origin, y-down text space)
+                for (i, o) in op.operands.iter().take(6).enumerate() {
+                    match o {
+                        Object::Real(r) => tm[i] = *r as f64,
+                        Object::Integer(n) => tm[i] = *n as f64,
+                        _ => {}
+                    }
+                }
+                // Use vertical scale d for font size (more reliable than a)
+                if tm[3] > 1.0 { font_size = tm[3]; }
+                off_x = 0.0;
+                off_y = 0.0;
+                line_start_off_x = 0.0;
             }
             "Td" | "TD" if op.operands.len() >= 2 && in_text_block => {
-                // Move to next line: tx ty Td
-                // PDF spec: offset from start of current line, not from cur_x
+                // Move to next line: tx ty Td — offset in text space (Tm applied at Tj)
                 let tx = match &op.operands[0] {
                     Object::Real(r) => *r as f64, Object::Integer(i) => *i as f64, _ => 0.0
                 };
                 let ty = match &op.operands[1] {
                     Object::Real(r) => *r as f64, Object::Integer(i) => *i as f64, _ => 0.0
                 };
-                cur_x = line_start_x + tx;
-                line_start_x = cur_x;
-                cur_y += ty;
+                off_x += tx;
+                off_y += ty;
+                line_start_off_x = off_x;
             }
             "TL" if op.operands.len() >= 1 && in_text_block => {
                 // Set text leading
@@ -2111,23 +2120,21 @@ fn extract_pdf_text_from_doc(doc: &lopdf::Document, pdf_path: &str, page_idx: u3
             "T*" if in_text_block => {
                 // Move to start of next line (leading offset)
                 let effective_leading = if leading > 0.0 { leading } else { font_size * 1.2 };
-                cur_y -= effective_leading;
-                cur_x = line_start_x; // Return to line start
+                off_y -= effective_leading;
+                off_x = line_start_off_x; // Return to line start
             }
             "Tj" if in_text_block => {
                 // Show text string
                 if let Some(obj) = op.operands.first() {
                     if let Some(decoded) = decode_text_object(obj, &lopdf_encodings, &tounicode_cmaps, &current_font, &font_encoding_names) {
                         if !decoded.is_empty() {
-                            // Apply CTM to get page coordinates
-                            let (px, py) = apply_ctm(&ctm, cur_x, cur_y);
-                            let word = make_word(&decoded, px, py, font_size, page_h_pt, scale);
+                            let word = make_word(&decoded, &ctm, &tm, off_x, off_y, font_size, content_top as f64, crop_x1 as f64, scale);
                             all_words.push(word);
                             if need_space_before { full_text_parts.push(" ".to_string()); }
                             full_text_parts.push(decoded.clone());
                             need_space_before = true;
                             // Advance x position by approximate text width
-                            cur_x += approximate_text_width(&decoded, font_size);
+                            off_x += approximate_text_width(&decoded, font_size);
                         }
                     }
                 }
@@ -2151,39 +2158,36 @@ fn extract_pdf_text_from_doc(doc: &lopdf::Document, pdf_path: &str, page_idx: u3
                                 let kern_f = *kern as f64;
                                 // Only flush on large negative kern (word break)
                                 if !text_buf.is_empty() && kern_f < KERN_WORD_BREAK {
-                                    let (px, py) = apply_ctm(&ctm, cur_x, cur_y);
-                                    let word = make_word(&text_buf, px, py, font_size, page_h_pt, scale);
+                                    let word = make_word(&text_buf, &ctm, &tm, off_x, off_y, font_size, content_top as f64, crop_x1 as f64, scale);
                                     all_words.push(word);
                                     if need_space_before { full_text_parts.push(" ".to_string()); }
                                     full_text_parts.push(text_buf.clone());
                                     need_space_before = true;
-                                    cur_x += approximate_text_width(&text_buf, font_size);
+                                    off_x += approximate_text_width(&text_buf, font_size);
                                     text_buf.clear();
                                 }
                                 // Apply kern offset
-                                cur_x += kern_f / 1000.0 * font_size;
+                                off_x += kern_f / 1000.0 * font_size;
                             }
                             Object::Real(kern) => {
                                 let kern_f = *kern as f64;
                                 if !text_buf.is_empty() && kern_f < KERN_WORD_BREAK {
-                                    let (px, py) = apply_ctm(&ctm, cur_x, cur_y);
-                                    let word = make_word(&text_buf, px, py, font_size, page_h_pt, scale);
+                                    let word = make_word(&text_buf, &ctm, &tm, off_x, off_y, font_size, content_top as f64, crop_x1 as f64, scale);
                                     all_words.push(word);
                                     if need_space_before { full_text_parts.push(" ".to_string()); }
                                     full_text_parts.push(text_buf.clone());
                                     need_space_before = true;
-                                    cur_x += approximate_text_width(&text_buf, font_size);
+                                    off_x += approximate_text_width(&text_buf, font_size);
                                     text_buf.clear();
                                 }
-                                cur_x += kern_f / 1000.0 * font_size;
+                                off_x += kern_f / 1000.0 * font_size;
                             }
                             _ => {}
                         }
                     }
                     // Flush remaining text
                     if !text_buf.is_empty() {
-                        let (px, py) = apply_ctm(&ctm, cur_x, cur_y);
-                        let word = make_word(&text_buf, px, py, font_size, page_h_pt, scale);
+                        let word = make_word(&text_buf, &ctm, &tm, off_x, off_y, font_size, content_top as f64, crop_x1 as f64, scale);
                         all_words.push(word);
                         if need_space_before { full_text_parts.push(" ".to_string()); }
                         full_text_parts.push(text_buf);
@@ -2221,14 +2225,20 @@ fn apply_ctm(ctm: &[f64; 6], x: f64, y: f64) -> (f64, f64) {
     (a * x + c * y + e, b * x + d * y + f)
 }
 
-fn make_word(text: &str, pdf_x: f64, pdf_y: f64, font_size: f64,
-             page_h_pt: f32, scale: f64) -> PdfTextWord {
+fn make_word(text: &str, ctm: &[f64; 6], tm: &[f64; 6], off_x: f64, off_y: f64,
+             font_size: f64, content_top: f64, crop_x1: f64, scale: f64) -> PdfTextWord {
+    // 文本位置 = CTM · Tm · (off_x, off_y)：Tm 先作用于文本空间位移
+    // （含顶左翻转等），CTM 再映射到页面坐标。
+    let tx_pt = tm[0] * off_x + tm[2] * off_y + tm[4];
+    let ty_pt = tm[1] * off_x + tm[3] * off_y + tm[5];
+    let (px, py) = apply_ctm(ctm, tx_pt, ty_pt);
     let w = approximate_text_width(text, font_size) * scale;
     let h = font_size * scale;
-    // Convert: frontend_y = (page_h - pdf_y - font_size) * scale
+    // Convert: frontend_y = (content_top - pdf_y - font_size) * scale
     // The y in PDF is the baseline; the top of the glyph is approximately at y + font_size
-    let fx = pdf_x * scale;
-    let fy = (page_h_pt as f64 - pdf_y - font_size) * scale;
+    // content_top = 有效盒顶边（CropBox 场景下 ≠ MediaBox 高，见调用处）
+    let fx = (px - crop_x1) * scale;
+    let fy = (content_top - py - font_size) * scale;
     PdfTextWord {
         text: text.to_string(),
         x: fx,
@@ -3324,79 +3334,108 @@ pub fn check_ocr_available() -> bool { false }
 // White Edge Trimming
 // =====================================================
 
-/// Trim white edges from an image.
-/// `threshold`: pixels where R, G, B are all >= threshold are considered "white".
-/// Returns the cropped image with 5px padding.
-pub fn trim_white_edges(img: &image::DynamicImage, threshold: u8) -> image::DynamicImage {
+/// 白边裁剪框：像素坐标，原点左上，[x, y, w, h]
+pub type TrimBox = [u32; 4];
+
+/// 左右方向（列）判定阈值：宽松 —— 发票右侧常有「下载次数：1」这类 250 上下的
+/// 浅灰细字（实测复现：245 阈值会把它们裁掉一小半），取 **253** 保护浅色小字。
+/// 电子发票白底是纯白 255，放宽无副作用。
+pub const WHITE_THRESHOLD: u8 = 253;
+
+/// 上下方向（行）判定阈值：严格 —— 只认**彩色/深色**内容（min 通道 < 245）。
+/// 页面顶/底的浅灰渐变、扫描阴影是 R=G=B≈252 的纯灰，min 通道仍是 252，
+/// 不会被误保留（否则上下白边裁不干净）；而红色印章 G/B 通道远低于 R，
+/// min 通道很低，照样被保留。
+pub const EDGE_THRESHOLD: u8 = 245;
+
+/// 一行/列至少这么多非白像素才算「有内容」，抑制照片/JPEG 的孤立浅色噪点
+pub const MIN_CONTENT_PIXELS: u32 = 2;
+
+/// 裁剪后向外保留的边距（px）默认值与上限。
+/// 默认 3px（@300dpi ≈ 0.25mm）—— 检测已按真实内容边界，pad 只需容忍抗锯齿。
+/// 上限 60px（≈5mm）：再大就失去"裁掉白边"的意义了；也为防止极端输入
+/// 让裁剪框反转（60px 远小于任何发票短边）。
+pub const TRIM_PAD_DEFAULT: u32 = 3;
+pub const TRIM_PAD_MAX: u32 = 60;
+
+/// 检测白边范围，返回裁剪框。
+/// `threshold`: 左右方向（列）判定用；上下方向（行）固定用 EDGE_THRESHOLD。
+/// `pad`: 向外保留的边距（px）—— 容忍内容边缘抗锯齿与坐标换算误差，
+///        由前端「留边」配置项提供（0–TRIM_PAD_MAX，clamp）。
+/// 整图全白 / 无有效内容时返回 None。
+pub fn trim_white_box(img: &image::DynamicImage, threshold: u8, pad: u32) -> Option<TrimBox> {
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     if w == 0 || h == 0 {
-        return img.clone();
+        return None;
     }
+    // 上下方向的判定阈值（严格，见 EDGE_THRESHOLD 注释）
+    let edge = EDGE_THRESHOLD.min(threshold);
 
-    // Find top
-    let mut top = 0u32;
-    'outer: for y in 0..h {
+    // 行「非白」像素计数（上下方向：只认彩色/深色，忽略浅灰渐变）
+    let mut row_soft = vec![0u32; h as usize];
+    for y in 0..h {
+        let mut ds = 0u32;
         for x in 0..w {
             let p = rgba.get_pixel(x, y);
-            if p[0] < threshold || p[1] < threshold || p[2] < threshold {
-                top = y;
-                break 'outer;
+            if p[0].min(p[1]).min(p[2]) < edge {
+                ds += 1;
             }
         }
+        row_soft[y as usize] = ds;
     }
+    let top = (0..h as usize).find(|&y| row_soft[y] >= MIN_CONTENT_PIXELS)? as u32;
+    let bottom = (0..h as usize).rev().find(|&y| row_soft[y] >= MIN_CONTENT_PIXELS)? as u32;
 
-    // Find bottom
-    let mut bottom = h - 1;
-    'outer2: for y in (0..h).rev() {
-        for x in 0..w {
+    // 列统计扫全高（0..h）：左右边界必须包含**所有**内容，不能限定在行检测的
+    // top..bottom 内 —— 否则位于该范围外的左右内容（如超出主体行范围的竖排
+    // 浅字）会被漏检，导致边界内缩、把内容裁掉。
+    let mut col_soft = vec![0u32; w as usize];
+    for x in 0..w {
+        let mut ds = 0u32;
+        for y in 0..h {
             let p = rgba.get_pixel(x, y);
-            if p[0] < threshold || p[1] < threshold || p[2] < threshold {
-                bottom = y;
-                break 'outer2;
+            // 左右方向用宽松阈值（保护「下载次数」这类浅色小字）
+            if p[0].min(p[1]).min(p[2]) < threshold {
+                ds += 1;
             }
         }
+        col_soft[x as usize] = ds;
     }
-
-    // Find left
-    let mut left = 0u32;
-    'outer3: for x in 0..w {
-        for y in top..=bottom {
-            let p = rgba.get_pixel(x, y);
-            if p[0] < threshold || p[1] < threshold || p[2] < threshold {
-                left = x;
-                break 'outer3;
-            }
-        }
-    }
-
-    // Find right
-    let mut right = w - 1;
-    'outer4: for x in (0..w).rev() {
-        for y in top..=bottom {
-            let p = rgba.get_pixel(x, y);
-            if p[0] < threshold || p[1] < threshold || p[2] < threshold {
-                right = x;
-                break 'outer4;
-            }
-        }
-    }
+    let left = (0..w as usize).find(|&x| col_soft[x] >= MIN_CONTENT_PIXELS)? as u32;
+    let right = (0..w as usize).rev().find(|&x| col_soft[x] >= MIN_CONTENT_PIXELS)? as u32;
 
     if top >= bottom || left >= right {
-        return img.clone();
+        return None;
     }
 
-    // Add 5px padding, clamp to image bounds
-    let p: u32 = 5;
-    let top    = top.saturating_sub(p);
-    let left   = left.saturating_sub(p);
-    let bottom = (bottom + p).min(h - 1);
-    let right  = (right + p).min(w - 1);
+    // 向外留边距再裁：容忍内容边缘的抗锯齿/尖角（如印章圆弧顶）与换算误差。
+    // 由前端「留边」配置项提供（默认 3px ≈ 0.25mm，上限 TRIM_PAD_MAX）。
+    let p = pad.min(TRIM_PAD_MAX);
+    let (p_l, p_t, p_r, p_b) = (p, p, p, p);
+    let top    = top.saturating_sub(p_t);
+    let left   = left.saturating_sub(p_l);
+    let bottom = (bottom + p_b).min(h - 1);
+    let right  = (right + p_r).min(w - 1);
 
-    let cw = right - left + 1;
-    let ch = bottom - top + 1;
-    let cropped = image::imageops::crop_imm(&rgba, left, top, cw, ch);
-    image::DynamicImage::from(cropped.to_image())
+    Some([left, top, right - left + 1, bottom - top + 1])
+}
+
+/// Trim white edges from an image.
+/// `threshold`: pixels where R, G, B are all >= threshold are considered "white".
+/// `pad`: 向外保留的边距（px，0–TRIM_PAD_MAX，前端「留边」配置项）
+/// Returns the cropped image plus its crop box
+/// (None when nothing was cropped — all-white image).
+/// 裁剪框供 PDF 直通路径做矢量裁切换算（见 trim_white_box）。
+pub fn trim_white_edges(img: &image::DynamicImage, threshold: u8, pad: u32) -> (image::DynamicImage, Option<TrimBox>) {
+    match trim_white_box(img, threshold, pad) {
+        Some([x, y, cw, ch]) => {
+            let rgba = img.to_rgba8();
+            let cropped = image::imageops::crop_imm(&rgba, x, y, cw, ch);
+            (image::DynamicImage::from(cropped.to_image()), Some([x, y, cw, ch]))
+        }
+        None => (img.clone(), None),
+    }
 }
 
 // =====================================================
@@ -3439,6 +3478,9 @@ pub struct RenderSettings {
     pub border_width: Option<f32>,
     pub border_color: Option<String>,
     pub trim_white: Option<bool>,
+    /// 裁剪后向外保留的边距（px，前端「留边」配置项；缺省 3，上限 60）
+    #[serde(default)]
+    pub trim_pad: Option<u32>,
     pub footer_text: Option<String>,
     pub footer_margin: f32,
     pub custom_fm: bool,
@@ -3492,6 +3534,10 @@ pub struct FileSpec {
     /// The frontend stores this as fileObj._pdfPageIdx.
     #[serde(default)]
     pub pdf_page_idx: Option<u32>,
+    /// 白边裁剪框 [x, y, w, h]，像素坐标、原点左上，基于该文件渲染出的位图（ow × oh）。
+    /// 仅在「裁剪白边」开启且检测到白边时由前端传入；PDF 直通路径用它做矢量裁切。
+    #[serde(default)]
+    pub trim_box: Option<TrimBox>,
 }
 
 /// A slot on a page — which file (if any) goes here, and its rotation.
@@ -4029,6 +4075,7 @@ fn decode_images(
     use rayon::prelude::*;
 
     let trim = settings.trim_white.unwrap_or(false);
+    let trim_pad = settings.trim_pad.unwrap_or(TRIM_PAD_DEFAULT).min(TRIM_PAD_MAX);
     let color_mode = settings.color_mode.clone();
 
     // Parallel decode — each file is independent
@@ -4112,8 +4159,9 @@ fn decode_images(
             }
 
             // Apply trim (global setting, not per-slot)
+            // 位图路径：裁剪直接烘焙进像素，不需要保留裁剪框
             if trim {
-                img = trim_white_edges(&img, 245);
+                img = trim_white_edges(&img, WHITE_THRESHOLD, trim_pad).0;
             }
 
             // Apply color mode (global setting, not per-slot)
@@ -4873,13 +4921,55 @@ fn merge_resource_dict(
     }
 }
 
+/// 把渲染位图的像素裁剪框换算成「旋转后显示坐标系」中的矩形（PDF 点，原点左下）。
+/// * `trim` — [x, y, w, h]，像素、原点左上，基于 `bmp_w × bmp_h` 的整页渲染位图
+/// * `eff_w` / `eff_h` — 页面旋转后的显示尺寸（PDF 点）
+///
+/// 返回 (x, y, w, h)；参数无效（空框 / 位图尺寸为 0）时返回 None。
+fn trim_box_to_crop_pt(
+    trim: TrimBox,
+    bmp_w: u32,
+    bmp_h: u32,
+    eff_w: f32,
+    eff_h: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let [x, y, cw_px, ch_px] = trim;
+    if bmp_w == 0 || bmp_h == 0 || cw_px == 0 || ch_px == 0 {
+        return None;
+    }
+    // 位图与页面显示尺寸应来自同一渲染，宽高比必须一致；
+    // 不一致说明位图并非该页的显示渲染（极端 /Rotate 等），换算不可信，退回整页避免错位。
+    let bmp_ratio = bmp_w as f32 / bmp_h as f32;
+    let eff_ratio = eff_w / eff_h;
+    if eff_ratio > 0.0 && ((bmp_ratio - eff_ratio) / eff_ratio).abs() > 0.02 {
+        log::warn!(
+            "trim_box_to_crop_pt: 位图宽高比 {:.4} 与页面显示宽高比 {:.4} 不一致，放弃矢量裁切",
+            bmp_ratio, eff_ratio
+        );
+        return None;
+    }
+    let sx = eff_w / bmp_w as f32;
+    let sy = eff_h / bmp_h as f32;
+    let cw = cw_px as f32 * sx;
+    let ch = ch_px as f32 * sy;
+    if cw <= 0.0 || ch <= 0.0 {
+        return None;
+    }
+    let cx = x as f32 * sx;
+    // 像素原点左上 → PDF 点原点左下
+    let cy = eff_h - (y + ch_px) as f32 * sy;
+    Some((cx, cy, cw, ch))
+}
+
 /// Extract a source PDF page as a Form XObject and register it in the output document.
-/// Returns (form_xobj_id, page_width_pt, page_height_pt).
+/// Returns (form_xobj_id, width_pt, height_pt) — 开启白边裁剪时返回裁剪后的尺寸。
 fn extract_page_as_form_xobject(
     source: &lopdf::Document,
     page_id: lopdf::ObjectId,
     mut output_doc: &mut lopdf::Document,
     id_map: &mut std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId>,
+    // 白边裁剪：(裁剪框像素, 位图宽px, 位图高px)。None = 嵌入整页。
+    trim: Option<(TrimBox, u32, u32)>,
 ) -> Result<(lopdf::ObjectId, f32, f32), String> {
     // 1. Get page content stream bytes (decompressed and concatenated)
     let content_bytes = source.get_page_content(page_id)
@@ -4901,6 +4991,21 @@ fn extract_page_as_form_xobject(
         (page_h_pt, page_w_pt)
     } else {
         (page_w_pt, page_h_pt)
+    };
+
+    // 3.5 白边裁剪：把渲染位图的像素裁剪框换算到「旋转后显示坐标系」（PDF 点，原点左下）。
+    // 位图是整页渲染的结果，尺寸 = effective 尺寸，故像素→点 用 effective/位图 比例。
+    let crop: Option<(f32, f32, f32, f32)> = trim.and_then(|(b, bmp_w, bmp_h)| {
+        let c = trim_box_to_crop_pt(b, bmp_w, bmp_h, effective_w, effective_h);
+        if let Some((cx, cy, cw, ch)) = c {
+            log::info!("extract_page_as_form_xobject: trim box={:?} bitmap={}x{} effective={:.1}x{:.1} → crop x={:.2} y={:.2} w={:.2} h={:.2}",
+                b, bmp_w, bmp_h, effective_w, effective_h, cx, cy, cw, ch);
+        }
+        c
+    });
+    let (bbox_w, bbox_h) = match crop {
+        Some((_, _, w, h)) => (w, h),
+        None => (effective_w, effective_h),
     };
 
     // 4. Build content stream with rotation + cropbox transforms prepended.
@@ -4940,6 +5045,19 @@ fn extract_page_as_form_xobject(
             format!("1 0 0 1 {:.4} {:.4} cm\n", -box_x1, -box_y1).as_bytes()
         );
     }
+
+    // 白边裁剪平移：把裁剪区左下角移到原点。
+    // 必须写在最后——cm 是左乘（CTM' = M × CTM），先写的先作用于点，
+    // 裁剪框取自旋转后的渲染位图，所以它要作用在旋转/CropBox 之后的显示坐标系里。
+    if let Some((cx, cy, _, _)) = crop {
+        prefix.extend_from_slice(
+            format!("1 0 0 1 {:.4} {:.4} cm\n", -cx, -cy).as_bytes()
+        );
+    }
+
+    // annotation 绘制需要复用同一套变换（/Rotate + CropBox + 裁剪平移）：
+    // prefix 的前两个字节是 "q\n"，其余即为纯变换指令
+    let prefix_transforms: Vec<u8> = prefix[2..].to_vec();
 
     // Close the graphics state after content
     let mut suffix = Vec::new();
@@ -5140,11 +5258,16 @@ fn extract_page_as_form_xobject(
                 let annot_name = format!("__Annot{}", annot_idx);
                 annot_xobjects.push((annot_name.clone().into_bytes(), ap_xobj_id));
 
-                // Drawing command: q <composed_matrix> /AnnotN Do Q
-                annot_draw_cmds.extend_from_slice(
-                    format!("q {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm /{} Do Q\n",
-                        cm_a, cm_b, cm_c, cm_d, cm_e, cm_f, annot_name).as_bytes()
-                );
+                // Drawing command: q <annot matrix> <prefix transforms> /AnnotN Do Q
+                // cm 是左乘累积（后写者在左 → 后作用于点）：先写 annot 的映射
+                // （AP 坐标 → 页面坐标），再写 prefix 变换，最终 CTM = prefix × annot
+                // —— AP 坐标先落到页面坐标，再经 /Rotate、CropBox 平移与白边裁剪
+                // 平移，和页面内容保持对齐。
+                let mut cmds = format!("q {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm ",
+                    cm_a, cm_b, cm_c, cm_d, cm_e, cm_f).into_bytes();
+                cmds.extend_from_slice(&prefix_transforms);
+                cmds.extend_from_slice(format!("/{} Do Q\n", annot_name).as_bytes());
+                annot_draw_cmds.extend_from_slice(&cmds);
 
                 log::info!("extract_page_as_form_xobject: annotation[{}] rect=[{:.1},{:.1},{:.1},{:.1}] bbox=[{:.1},{:.1},{:.1},{:.1}]",
                     annot_idx, rx1, ry1, rx2, ry2, bx1, by1, bx2, by2);
@@ -5162,6 +5285,8 @@ fn extract_page_as_form_xobject(
     // Annotation Rect coordinates are in the BBox coordinate system, so they
     // must be drawn AFTER the graphics state is restored — otherwise the CTM
     // scale would push the annotations far outside the BBox bounds.
+    // annotation 自带 prefix 变换 → 必须画在 Q 之后（CTM 已复位为 I），
+    // 否则 prefix 变换会被重复施加
     final_content.extend_from_slice(&suffix);
     final_content.extend_from_slice(&annot_draw_cmds);
 
@@ -5186,7 +5311,8 @@ fn extract_page_as_form_xobject(
         }
     }
 
-    // 7. Build Form XObject stream — BBox uses EFFECTIVE (post-rotation) dimensions.
+    // 7. Build Form XObject stream — BBox uses EFFECTIVE (post-rotation) dimensions,
+    // 或裁剪后的尺寸（白边裁剪时内容已被平移到原点，BBox 从 0 起）。
     let mut dict = lopdf::Dictionary::new();
     dict.set("Type", lopdf::Object::Name(b"XObject".to_vec()));
     dict.set("Subtype", lopdf::Object::Name(b"Form".to_vec()));
@@ -5194,8 +5320,8 @@ fn extract_page_as_form_xobject(
     dict.set("BBox", lopdf::Object::Array(vec![
         lopdf::Object::Real(0.0),
         lopdf::Object::Real(0.0),
-        lopdf::Object::Real(effective_w),
-        lopdf::Object::Real(effective_h),
+        lopdf::Object::Real(bbox_w),
+        lopdf::Object::Real(bbox_h),
     ]));
     dict.set("Resources", remapped_resources);
 
@@ -5208,7 +5334,7 @@ fn extract_page_as_form_xobject(
     let stream = lopdf::Stream::new(dict, final_content).with_compression(true);
     let xobj_id = output_doc.add_object(lopdf::Object::Stream(stream));
 
-    Ok((xobj_id, effective_w, effective_h))
+    Ok((xobj_id, bbox_w, bbox_h))
 }
 
 /// Per-slot adjustment data for passthrough rendering.
@@ -5284,14 +5410,17 @@ fn build_nup_content_stream(
 
         // Centered position in slot (bottom-left origin) based on visual dimensions.
         // 报销单模式：左上对齐（贴段内区域左上角）；常规模式：居中。
+        // 「裁剪白边」开启时垂直贴顶 —— 裁掉白边后内容居中会显出多余留白，
+        // 看起来像"白边没裁掉"；水平方向仍居中。
         let draw_w = vis_w * scale_x;
         let draw_h = vis_h * scale_y;
+        let top_align = settings.reimburse_mode || settings.trim_white.unwrap_or(false);
         let mut offset_x = slot.x_mm * MM_TO_PT;
-        let mut offset_y = if settings.reimburse_mode {
+        let mut offset_y = slot.y_mm * MM_TO_PT + if top_align {
             // bottom-up 坐标：顶部对齐 = slot 顶边 - 图像高度
-            slot.y_mm * MM_TO_PT + (slot_h_pt - draw_h)
+            slot_h_pt - draw_h
         } else {
-            slot.y_mm * MM_TO_PT + (slot_h_pt - draw_h) / 2.0
+            (slot_h_pt - draw_h) / 2.0
         };
         if !settings.reimburse_mode {
             offset_x += (slot_w_pt - draw_w) / 2.0;
@@ -5688,9 +5817,15 @@ fn generate_pdf_passthrough(
                     .copied()
                     .ok_or_else(|| format!("PDF页面{}不存在 (文件: {})", page_idx_in_pdf + 1, pdf_path))?;
 
-                // Extract as Form XObject (vector quality preserved)
+                // Extract as Form XObject (vector quality preserved).
+                // 白边裁剪开启时按前端传来的裁剪框做矢量裁切（整页 → 裁剪框）。
+                let trim = if request.settings.trim_white.unwrap_or(false) {
+                    file.trim_box.map(|b| (b, file.ow, file.oh))
+                } else {
+                    None
+                };
                 extract_page_as_form_xobject(
-                    source, source_page_id, &mut output_doc, id_map
+                    source, source_page_id, &mut output_doc, id_map, trim
                 )?
             } else {
                 // Image/OFD path → encode as FlateDecode (lossless) Image XObject
@@ -6483,4 +6618,42 @@ fn build_border_ops_lopdf(
     ops.push(Operation { operator: "Q".into(), operands: vec![] });
 
     Some(lopdf::content::Content { operations: ops })
+}
+
+
+
+#[cfg(test)]
+mod pdf_text_tests {
+    use super::*;
+
+    /// 数电票顶左坐标系：页面 cm 翻转缩放 + Tm 翻转 + Td 负 y 位移
+    /// （此前该场景 fy 为负被 max(0.0) 全部钳成 0，整页并成一行）
+    #[test]
+    fn test_make_word_top_left_coordinate_system() {
+        let ctm = [0.75, 0.0, 0.0, -0.75, 0.0, 842.0];
+        let tm = [1.0, 0.0, 0.0, -1.0, 0.0, 0.0];
+        let w = make_word("开", &ctm, &tm, 73.0, -511.0, 12.0, 842.0, 0.0, 4.1667);
+        // 文本空间点 = (73, 511)（Tm 翻转 y）→ device = (54.75, 458.75)
+        assert!((w.x - 54.75 * 4.1667).abs() < 0.1);
+        assert!((w.y - (842.0 - 458.75 - 12.0) * 4.1667).abs() < 1.0, "y={}", w.y);
+    }
+
+    /// 常规场景：Tm 全量定位（a=d=1，e/f 即位置），off 为零
+    #[test]
+    fn test_make_word_standard_translation_tm() {
+        let ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let tm = [1.0, 0.0, 0.0, 1.0, 100.0, 700.0];
+        let w = make_word("发", &ctm, &tm, 0.0, 0.0, 10.0, 842.0, 0.0, 1.0);
+        assert!((w.x - 100.0).abs() < 0.001);
+        assert!((w.y - 132.0).abs() < 0.001, "y={}", w.y);
+    }
+
+    /// CropBox 左侧裁剪：x 相对有效盒左边换算
+    #[test]
+    fn test_make_word_cropbox_offset() {
+        let ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let tm = [1.0, 0.0, 0.0, 1.0, 50.0, 700.0];
+        let w = make_word("票", &ctm, &tm, 0.0, 0.0, 10.0, 842.0, 30.0, 1.0);
+        assert!((w.x - 20.0).abs() < 0.001);
+    }
 }

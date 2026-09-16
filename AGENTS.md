@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- **版本**: v2.6.3（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json）
+- **版本**: v2.6.5（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json）
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架、无打包）
 - **双版本**: 轻量版 / OCR 版（PP-OCRv6）；Cargo.toml 定义 `ocr` feature，`lib.rs` 按 `#[cfg(feature = "ocr")]` 条件注册命令，OCR 构建用 `tauri.ocr.conf.json` 叠加配置（仅追加 bundle.resources）
 - **目录结构**:
@@ -141,7 +141,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **PDF 渲染双引擎**：首选 WinRT（`render_pdf_pages`，`check_winrt_pdf_available()` 启动检测）→ 失败回退 PDFium（`render_pdf_pages_pdfium`）。
 
-**筛选体系**（侧边栏，可折叠）：类型（发票/车票/通行费/财政 `S.typeFilter`）× 格式（PDF/OFD/图片/XML `S.formatFilter`）× 状态（全部/未打印/已打印/重复 `S.printedFilter`/`S.fileFilter`）三维正交；类型/格式切换即切换打印批次，`clearInvisibleChecks()` 清除不可见勾选（防筛选切换后残留勾选重复打印）。
+**筛选体系**（侧边栏，可折叠）：类型（专票/普票/车票/通行费/非税/其他 `S.typeFilter`）× 格式（PDF/OFD/图片/XML `S.formatFilter`）× 状态（全部/未打印/已打印/重复 `S.printedFilter`/`S.fileFilter`）三维正交；类型匹配与票种 chip 共用 `resolveInvoiceType` 单一真源（车票/通行费直判 `_isTicket`/`_isToll` 分类标记），「其他」= 不渲染票种 chip 的文件（未识别 + 无法归专普的粗粒度串），非税/专票/普票对 XML/OFD/PDF 文字层等非 OCR 来源同样生效；类型/格式切换即切换打印批次，`clearInvisibleChecks()` 清除不可见勾选（防筛选切换后残留勾选重复打印）。列表上方工具栏（`.file-header`）与筛选区（`.filter-section`）sticky 钉在滚动容器顶部，仅列表滚动。
 
 **文件列表双视图**：`S.fileView`（list/grid），`renderFileList()` grid 分支输出 `.file-card`；`updateFileItem()` 按视图增量更新。
 
@@ -161,6 +161,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **类型检测** `_detectInvoiceType()`（ocr.js）：ticket > toll > nontax > vat > ride > unknown。
 
+- 专票 / 普票：`_detectVatSubtype()`（仅 vat 路径判定）—— 票头标题区 `ny < 0.18` 优先、全文兜底；关键词 `普通发票|增值税普通|电子普通` → 普票、`专用发票|增值税专用` → 专票，**「普通」优先于「专用」**（票面其它位置的「专用」字样不致误判）；结果写回 `fileObj.invoiceType`（不覆盖已有结构化类型）
 - ticket：强标记（铁路电子客票/电子客票号）直判 + 弱信号 `_countTicketSignalGroups()` 13 组关键词 ≥2 组确认，防增值税票误判；`getTicketTypeLabel()` 细分标签
 - toll（通行费）：「通行费」强标记；「车牌号/车牌颜色+通行日期」弱标记双组确认；复用 VAT 提取链路（销售方=路桥公司），不走 ticket/nontax 早退分支；老式纸质票无价税合计时两段式金额兜底
 
@@ -176,7 +177,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 ### 导出与工具命令
 
-**汇总表**（侧边栏 📊）：14 字段按需勾选、双击编辑回写全 UI 同步、三金额合计行 sticky；`exportSummaryCsv()` UTF-8 BOM + CRLF 手写 CSV → `write_text_file`；数据源 `getCheckedFiles()`（不含 copies 展开）。内嵌批量重命名面板：3 预设模板 + 自定义字段（勾选顺序=文件名顺序）、`resolveNameConflicts()` 自动 `_2` 序号、`executeRename()` → `rename_file` 命令并同步 `S.files` 共享路径与 `_fileAdjMap`/`_notesMap` key；OFD 的 dedup key 排除 `_filePath`。
+**汇总表**（侧边栏 📊）：14 字段按需勾选、双击编辑回写全 UI 同步、三金额合计行 sticky；`exportSummaryCsv()` UTF-8 BOM + CRLF 手写 CSV → `write_text_file`；数据源 `getCheckedFiles()`（不含 copies 展开）。「发票类型」单一真源 `resolveInvoiceType(f)`（分类标记 通行费/车票/非税 → 结构化或 OCR 类型 → 兜底「发票」），`normalizeInvoiceType()` 归一为「专票 / 普票」短标签，列表徽章 / 复制发票信息 / 重命名 / CSV 共用同一口径；**禁止再写死「增值税发票」**（issue #35：普票全被显示成该串）。内嵌批量重命名面板：3 预设模板 + 自定义字段（勾选顺序=文件名顺序）、`resolveNameConflicts()` 自动 `_2` 序号、`executeRename()` → `rename_file` 命令并同步 `S.files` 共享路径与 `_fileAdjMap`/`_notesMap` key；OFD 的 dedup key 排除 `_filePath`。
 
 **文件命令**（均为 `async fn` + `spawn_blocking`）：`copy_file`、`rename_file`（同盘原子 rename，跨盘 copy+delete）。
 
@@ -226,6 +227,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - **EXIF**：`image` crate 不自动应用；6=90°CW、8=90°CCW、3=180°
 - **批量文字提取**：多 PDF 必须按 pdfPath 分组调 `extract_pdf_texts`；返回 `HashMap<u32, PdfTextResult>` keyed by pageIdx，前端按 `r._pdfPageIdx` 取结果
 - **旋转方向**：全链路约定见「旋转与适配语义」小节——最易错点是 PDF 矩阵方向与 CSS 相反、pdf-lib 绕锚点旋转
+- **ureq 的 TLS 后端必须显式注入**（v2.6.4 线上事故，issue #37①）：`features = ["native-tls"]` 只是让 native-tls 适配器可用，**不会**成为默认 TLS 后端。未启用 `tls`(rustls) feature 时 `default_tls_config()` 返回一个直接报错的桩，于是**全部 https 请求**都以 `cannot make HTTPS request because no TLS backend is configured` 失败（更新检查、PDFium / SumatraPDF 下载同时报废）。所有 http 请求一律经 `build_http_agent()` 建 agent，不要裸建 `ureq::AgentBuilder`
 
 ## 硬性规则速查
 
@@ -238,9 +240,10 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 5. `defaultQuickLayouts()` 取深拷贝；空列表按 `Array.isArray` 恢复；不迁移旧默认布局
 6. 占位（`_placeholder`）只占槽位：打印/统计/汇总/重命名/OCR 全部排除
 7. 自动去重只删 `no:` key，`sum:` 仅标记
-8. 类型/格式筛选切换后必须 `clearInvisibleChecks()`
+8. 类型/格式筛选切换后必须重算勾选集合（`selectFilteredOnly()` / `applyFilterSelection()`）
 9. `deepEqual` 缓存比较排除纯打印机参数（printerName/copies/duplex/collate）
 10. 桌面/web 双分支：识别（ocr.js ↔ js/pdf-text.js）与预览布局（layout.js ↔ js/layout.js）改动双向同步
+11. 新增 http 请求一律走 `build_http_agent()`；裸建 `ureq::AgentBuilder` 会丢 TLS 后端（见「关键踩坑」）
 
 ## Git 工作流
 

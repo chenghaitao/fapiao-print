@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 
 use windows::core::PCWSTR;
 use windows::Win32::Graphics::Gdi::*;
+// GDI 打印 thunk（StartDocW/EndDoc/StartPage 等）在 windows 0.58 中位于 Storage::Xps 模块
 use windows::Win32::Storage::Xps::*;
 
 type FPDF_DOCUMENT = *mut c_void;

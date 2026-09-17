@@ -1,5 +1,16 @@
 # 📋 更新日志
 
+## v2.6.6 — NSIS 图标固定与 GitHub Actions Node.js 24 适配
+
+_2026-09-17_
+
+### 🎨 优化
+
+- **NSIS 安装包固定使用项目图标**：显式指定 `src-tauri/icons/icon.ico`，避免后续同步配置时回退到默认安装包图标
+- **GitHub Actions 运行时升级**：将 `checkout`、`setup-node` 和 `upload-artifact` 升级到 Node.js 24 版本，消除 Node.js 20 弃用提示；项目构建使用的 Node.js 20 版本保持不变
+
+---
+
 ## v2.6.5 — 更新检查失败与尾部空槽点击修复
 
 _2026-09-16_

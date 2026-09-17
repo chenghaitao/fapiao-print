@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup UTF-8 encoding
         shell: pwsh
@@ -49,7 +49,7 @@ jobs:
           Write-Host "测试中文输出: 发票酱"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm
@@ -170,7 +170,7 @@ jobs:
       # 无论成功失败都留证据，失败时可直接下载 dist 排查
       - name: Upload build artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: 发票酱-dist
           path: dist/*

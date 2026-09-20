@@ -1066,25 +1066,56 @@ fn encode_raw_base64(bytes: &[u8], ext: &str) -> String {
 ///      turning faint gray text dark) — same LUT on all RGB channels
 ///   3. Mild unsharp mask (sigma 1.0, amount 0.6, threshold 8) sharpens blurry
 ///      edges without amplifying flat-area noise
-pub(crate) fn enhance_image(file_path: &str) -> Result<String, String> {
-    use base64::Engine;
-    use image::ImageEncoder;
+/// 增强参数：手动「文本增强」与打印时自动增强共用同一套核心（单一真源）。
+/// 默认值与历史手动增强完全一致（γ1.4 / 锐化 60% / 阈值 8 / 质量 92）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnhanceParams {
+    /// Levels stretch 后施加的伽马（>1 压暗中间调，浅灰字转深）
+    pub gamma: f32,
+    /// USM 锐化强度（百分比）
+    pub amount_pct: i32,
+    /// USM 阈值——低于该差异的平坦区噪声不动
+    pub threshold: i32,
+    /// JPEG 编码质量（1-100）
+    pub quality: u8,
+}
 
-    let bytes = std::fs::read(file_path)
-        .map_err(|e| format!("读取文件失败: {}", e))?;
-    let img = image::load_from_memory(&bytes)
-        .map_err(|e| format!("图片解码失败: {}", e))?;
+impl Default for EnhanceParams {
+    fn default() -> Self {
+        Self { gamma: 1.4, amount_pct: 60, threshold: 8, quality: 92 }
+    }
+}
 
-    // Bake EXIF orientation so enhanced output displays identically to source
-    // (browsers auto-rotate by EXIF; our JPEG output carries no EXIF tag).
-    let orient = if is_jpeg_bytes(&bytes) { read_exif_orientation(&bytes) } else { 1 };
-    let img = if orient != 1 { apply_exif_orientation(img, orient) } else { img };
+impl EnhanceParams {
+    /// 由前端可选覆盖项构建，缺省回退默认值；越界值 clamp 而非拒绝——
+    /// 一个坏的滑块值绝不能废掉整个打印任务。
+    pub fn from_settings(
+        gamma: Option<f32>,
+        amount: Option<f32>,
+        threshold: Option<f32>,
+        quality: Option<f32>,
+    ) -> Self {
+        let d = Self::default();
+        Self {
+            // 低于 1.0 图像发白，高于 3.0 压成近二值并毁掉红章
+            gamma: gamma.unwrap_or(d.gamma).clamp(0.5, 3.0),
+            amount_pct: amount.unwrap_or(d.amount_pct as f32).clamp(0.0, 200.0) as i32,
+            threshold: threshold.unwrap_or(d.threshold as f32).clamp(0.0, 64.0) as i32,
+            quality: quality.unwrap_or(d.quality as f32).clamp(50.0, 100.0) as u8,
+        }
+    }
+}
 
-    let mut rgb = img.to_rgb8();
+/// 就地增强核心（手动文本增强与打印时自动增强共用）。
+/// 算法（逐像素 LUT，保持色相 —— 红章保红）：
+///   1. 亮度直方图 → 1%/99% 分位裁剪点
+///   2. Levels 拉伸 [lo, hi] → [0,255] + gamma（同一 LUT 作用于 RGB 三通道）
+///   3. 轻度 USM 锐化（不放大平坦区噪声）
+pub(crate) fn enhance_rgb_inplace(rgb: &mut image::RgbImage, p: &EnhanceParams) {
     let (w, h) = rgb.dimensions();
     let total = (w as u64 * h as u64) as usize;
     if total == 0 {
-        return Err("图片尺寸无效".to_string());
+        return;
     }
 
     // 1. Luminance histogram (Rec.601 integer approximation)
@@ -1113,11 +1144,10 @@ pub(crate) fn enhance_image(file_path: &str) -> Result<String, String> {
     //    keep identity to avoid noise amplification.
     let mut lut = [0u8; 256];
     if hi > lo + 10 {
-        let gamma = 1.4f32;
         let span = (hi - lo) as f32;
         for (i, v) in lut.iter_mut().enumerate() {
             let t = ((i as f32 - lo as f32) / span).clamp(0.0, 1.0);
-            *v = (255.0 * t.powf(gamma)).round() as u8;
+            *v = (255.0 * t.powf(p.gamma)).round() as u8;
         }
     } else {
         for (i, v) in lut.iter_mut().enumerate() {
@@ -1131,20 +1161,66 @@ pub(crate) fn enhance_image(file_path: &str) -> Result<String, String> {
         px[2] = lut[px[2] as usize];
     }
 
-    // 4. Unsharp mask: out = orig + amount * (orig - blur), gated by threshold
-    let blurred = image::imageops::blur(&rgb, 1.0);
-    const AMOUNT_PCT: i32 = 60;
-    const THRESHOLD: i32 = 8;
+    // 4. Unsharp mask: out = orig + amount * (orig - blur), gated by threshold.
+    //    amount_pct == 0 means "levels only" — skip the (costly) blur entirely.
+    if p.amount_pct <= 0 {
+        return;
+    }
+    let blurred = image::imageops::blur(&*rgb, 1.0);
     for (px, bp) in rgb.pixels_mut().zip(blurred.pixels()) {
         for c in 0..3 {
             let diff = px[c] as i32 - bp[c] as i32;
-            if diff.abs() > THRESHOLD {
-                px[c] = (px[c] as i32 + diff * AMOUNT_PCT / 100).clamp(0, 255) as u8;
+            if diff.abs() > p.threshold {
+                px[c] = (px[c] as i32 + diff * p.amount_pct / 100).clamp(0, 255) as u8;
             }
         }
     }
+}
 
-    // 5. Encode JPEG q92 (no EXIF — orientation already baked into pixels)
+/// 统一像素类型：16 位 PNG / 32F 等高精度图 JPEG 编码器不支持，
+/// 不归一会在编码时不必要地降级或失败。低精度格式原样返回（零拷贝）。
+fn normalize_for_jpeg(img: image::DynamicImage) -> image::DynamicImage {
+    match img {
+        image::DynamicImage::ImageRgb8(_) | image::DynamicImage::ImageLuma8(_) => img,
+        image::DynamicImage::ImageRgba8(_) | image::DynamicImage::ImageLumaA8(_) => img,
+        image::DynamicImage::ImageRgb16(_) => image::DynamicImage::ImageRgb8(img.to_rgb8()),
+        image::DynamicImage::ImageRgba16(_) => image::DynamicImage::ImageRgba8(img.to_rgba8()),
+        image::DynamicImage::ImageLuma16(_) => image::DynamicImage::ImageLuma8(img.to_luma8()),
+        image::DynamicImage::ImageLumaA16(_) => image::DynamicImage::ImageLumaA8(img.to_luma_alpha8()),
+        image::DynamicImage::ImageRgb32F(_) => image::DynamicImage::ImageRgb8(img.to_rgb8()),
+        image::DynamicImage::ImageRgba32F(_) => image::DynamicImage::ImageRgba8(img.to_rgba8()),
+        _ => image::DynamicImage::ImageRgb8(img.to_rgb8()),
+    }
+}
+
+/// Enhance a faint/blurry invoice image (levels stretch + gamma + unsharp mask).
+/// Reads the original file at FULL resolution so print clarity is preserved —
+/// the preview thumbnail is never used as enhancement source.
+/// Returns enhanced JPEG data URL with EXIF orientation baked into pixels.
+pub(crate) fn enhance_image(file_path: &str) -> Result<String, String> {
+    use base64::Engine;
+    use image::ImageEncoder;
+
+    let bytes = std::fs::read(file_path)
+        .map_err(|e| format!("读取文件失败: {}", e))?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("图片解码失败: {}", e))?;
+
+    // Bake EXIF orientation so enhanced output displays identically to source
+    // (browsers auto-rotate by EXIF; our JPEG output carries no EXIF tag).
+    let orient = if is_jpeg_bytes(&bytes) { read_exif_orientation(&bytes) } else { 1 };
+    let img = if orient != 1 { apply_exif_orientation(img, orient) } else { img };
+
+    let mut rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return Err("图片尺寸无效".to_string());
+    }
+
+    // 与打印时自动增强共用同一核心算法（默认参数，保持历史行为一致）
+    enhance_rgb_inplace(&mut rgb, &EnhanceParams::default());
+
+    // Encode JPEG q92 (no EXIF — orientation already baked into pixels)
     let mut buf: Vec<u8> = Vec::new();
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
     encoder
@@ -3490,6 +3566,63 @@ pub struct RenderSettings {
     /// 分段高度（mm），默认 120
     #[serde(default)]
     pub reimburse_height: Option<f32>,
+    /// 是否启用粘贴单模式
+    #[serde(default)]
+    pub paste_mode: bool,
+    /// 上边距（mm）＝ 装订区高度，默认 20.8（2.08cm）
+    #[serde(default)]
+    pub paste_top: Option<f32>,
+    /// 下边距（mm），默认 4.1（0.41cm）
+    #[serde(default)]
+    pub paste_bottom: Option<f32>,
+    /// 左边距（mm），默认 4.1
+    #[serde(default)]
+    pub paste_left: Option<f32>,
+    /// 右边距（mm），默认 4.1
+    #[serde(default)]
+    pub paste_right: Option<f32>,
+    /// 是否绘制装订线横线
+    #[serde(default)]
+    pub paste_bind_line: Option<bool>,
+    /// 装订线文字（默认「装 订 线」）
+    #[serde(default)]
+    pub paste_bind_text: Option<String>,
+    /// 装订线文字字号（mm），默认 4
+    #[serde(default)]
+    pub paste_bind_size: Option<f32>,
+    /// 是否绘制右下角签字栏
+    #[serde(default)]
+    pub paste_show_sig: Option<bool>,
+    /// 签字栏列名，逗号分隔（默认「票据张数,金额,报销人」）
+    #[serde(default)]
+    pub paste_sig_cols: Option<String>,
+    /// 签字栏表格总宽（mm），默认 80
+    #[serde(default)]
+    pub paste_sig_width: Option<f32>,
+    /// 签字栏表头行高（mm），默认 8
+    #[serde(default)]
+    pub paste_sig_row_h: Option<f32>,
+    /// 签字栏填写行高（mm），默认 14
+    #[serde(default)]
+    pub paste_sig_body_h: Option<f32>,
+    /// 签字栏与票据区之间的间距（mm），默认 2
+    #[serde(default)]
+    pub paste_sig_gap: Option<f32>,
+    /// 打印时自动增强低清晰度位图源（清晰度优化，issue #39）
+    #[serde(default)]
+    pub auto_enhance: bool,
+    /// 自动增强 DPI 阈值：折算打印 DPI 低于该值的位图才增强（默认 250）
+    #[serde(default)]
+    pub enhance_min_dpi: Option<f32>,
+    /// 增强参数（与手动文本增强共用 EnhanceParams，前端滑块可调）
+    #[serde(default)]
+    pub enhance_gamma: Option<f32>,
+    #[serde(default)]
+    pub enhance_amount: Option<f32>,
+    #[serde(default)]
+    pub enhance_threshold: Option<f32>,
+    #[serde(default)]
+    pub enhance_quality: Option<f32>,
     #[serde(default)]
     pub copies: u32,
     #[serde(default)]
@@ -3585,10 +3718,11 @@ struct LayoutSlotMm {
 fn calculate_layout_mm(settings: &RenderSettings) -> (Vec<LayoutSlotMm>, f32, f32) {
     let pw = settings.paper_w;
     let ph = settings.paper_h;
-    let mt = settings.margin_top;
-    let mb = settings.margin_bottom;
-    let ml = settings.margin_left;
-    let mr = settings.margin_right;
+    // 粘贴单模式：改用独立边距（上边距 = 装订区高度），与 JS getSettings() 口径一致
+    let mt = if settings.paste_mode { settings.paste_top.unwrap_or(20.8) } else { settings.margin_top };
+    let mb = if settings.paste_mode { settings.paste_bottom.unwrap_or(4.1) } else { settings.margin_bottom };
+    let ml = if settings.paste_mode { settings.paste_left.unwrap_or(4.1) } else { settings.margin_left };
+    let mr = if settings.paste_mode { settings.paste_right.unwrap_or(4.1) } else { settings.margin_right };
     let gh = settings.gap_h;
     let gv = settings.gap_v;
     let cols = settings.cols as f32;
@@ -3623,15 +3757,25 @@ fn calculate_layout_mm(settings: &RenderSettings) -> (Vec<LayoutSlotMm>, f32, f3
     let line_count = (if settings.page_num || settings.print_date { 1 } else { 0 })
         + (if settings.footer_text.as_ref().map_or(false, |t| !t.is_empty()) { 1 } else { 0 });
     let auto_fm_mm = 3.0 + line_count as f32 * 5.0;
-    let effective_fm = if has_footer {
+    let footer_fm = if has_footer {
         if settings.custom_fm { settings.footer_margin } else { auto_fm_mm }
     } else {
         0.0
     };
+    // 粘贴单：底部为右下角签字栏预留整条带（表头行 + 填写行 + 与票据区间距）。
+    // 签字栏底边落在下边距处，故此处不含 mb —— 与 layout.js calculateLayout 口径一致。
+    let sig_fm = if settings.paste_mode && settings.paste_show_sig.unwrap_or(true) {
+        settings.paste_sig_row_h.unwrap_or(8.0)
+            + settings.paste_sig_body_h.unwrap_or(14.0)
+            + settings.paste_sig_gap.unwrap_or(2.0)
+    } else {
+        0.0
+    };
+    let effective_fm = footer_fm + sig_fm;
     let sw = (pw - cols * (ml + mr) - (cols - 1.0) * gh) / cols;
     let sh = (ph - rows * (mt + mb) - (rows - 1.0) * gv - effective_fm) / rows;
 
-    log::info!("calculate_layout_mm [v2-fm-independent]: pw={pw} ph={ph} mt={mt} mb={mb} effective_fm={effective_fm} ml={ml} mr={mr} gh={gh} gv={gv} rows={rows} cols={cols} sw={sw} sh={sh}");
+    log::info!("calculate_layout_mm [v2-fm-independent]: pw={pw} ph={ph} mt={mt} mb={mb} effective_fm={effective_fm} (footer={footer_fm} sig={sig_fm}) ml={ml} mr={mr} gh={gh} gv={gv} rows={rows} cols={cols} sw={sw} sh={sh}");
 
     let mut slots = Vec::new();
     for r in 0..settings.rows as usize {
@@ -3646,6 +3790,226 @@ fn calculate_layout_mm(settings: &RenderSettings) -> (Vec<LayoutSlotMm>, f32, f3
     }
 
     (slots, pw, ph)
+}
+
+// =====================================================
+// 清晰度体检（issue #39）：只读文件头算 DPI，毫秒级
+// =====================================================
+/// 打印清晰度判定阈值：低位图折算打印 DPI 低于该值视为会糊
+pub const CLARITY_MIN_DPI: f32 = 250.0;
+
+/// 单个源文件的清晰度审计结果（index 与请求文件顺序一致）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClarityInfo {
+    pub index: usize,
+    /// "vector" = 分辨率无关（电子发票文字层）；"raster" = 像素位图；
+    /// "empty" = 无可绘制内容；"unknown" = 无法读取
+    pub kind: String,
+    pub src_w: u32,
+    pub src_h: u32,
+    /// contain 适配进槽位后的折算打印 DPI；vector/unknown 时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_dpi: Option<f32>,
+    /// 位图源折算 DPI 低于阈值时为 true（打印会糊）
+    pub low: bool,
+}
+
+/// 位图源 contain 进槽位后的折算打印 DPI。
+/// 取两轴较差者（contain 缩放止于先触边的一轴）。
+pub(crate) fn effective_dpi_px(src_w: u32, src_h: u32, slot_mm: (f32, f32)) -> f32 {
+    if slot_mm.0 <= 0.0 || slot_mm.1 <= 0.0 {
+        return f32::INFINITY;
+    }
+    let dpi_w = src_w as f32 / (slot_mm.0 / 25.4);
+    let dpi_h = src_h as f32 / (slot_mm.1 / 25.4);
+    dpi_w.min(dpi_h)
+}
+
+/// 槽位物理尺寸（mm）。与 JS calculateLayout / Rust calculate_layout_mm 的
+/// 几何公式保持一致，保证审计口径 = 发票实际放进去的槽。
+pub(crate) fn slot_size_mm(settings: &RenderSettings) -> (f32, f32) {
+    // 报销单分段：单列、段高固定，mt/mb 为段内安全边距
+    if settings.reimburse_mode {
+        let seg = settings.reimburse_height.unwrap_or(120.0).max(10.0);
+        let sw = settings.paper_w - settings.margin_left - settings.margin_right;
+        let sh = seg - settings.margin_top - settings.margin_bottom;
+        return (sw.max(1.0), sh.max(1.0));
+    }
+    let cols = settings.cols.max(1) as f32;
+    let rows = settings.rows.max(1) as f32;
+    // 粘贴单模式使用独立边距（与 calculate_layout_mm 逐字对齐）
+    let (mt, mb, ml, mr) = if settings.paste_mode {
+        (
+            settings.paste_top.unwrap_or(20.8),
+            settings.paste_bottom.unwrap_or(4.1),
+            settings.paste_left.unwrap_or(4.1),
+            settings.paste_right.unwrap_or(4.1),
+        )
+    } else {
+        (
+            settings.margin_top,
+            settings.margin_bottom,
+            settings.margin_left,
+            settings.margin_right,
+        )
+    };
+    let has_footer = settings.page_num || settings.print_date
+        || settings.footer_text.as_ref().map_or(false, |t| !t.is_empty());
+    let line_count = (if settings.page_num || settings.print_date { 1 } else { 0 })
+        + (if settings.footer_text.as_ref().map_or(false, |t| !t.is_empty()) { 1 } else { 0 });
+    let auto_fm = 3.0 + line_count as f32 * 5.0;
+    let effective_fm = if has_footer {
+        if settings.custom_fm { settings.footer_margin } else { auto_fm }
+    } else {
+        0.0
+    };
+    // 签字栏占用底部保留带，槽位相应变矮
+    let sig_fm = if settings.paste_mode && settings.paste_show_sig.unwrap_or(true) {
+        settings.paste_sig_row_h.unwrap_or(8.0)
+            + settings.paste_sig_body_h.unwrap_or(14.0)
+            + settings.paste_sig_gap.unwrap_or(2.0)
+    } else {
+        0.0
+    };
+    let effective_fm = effective_fm + sig_fm;
+    let sw = (settings.paper_w - cols * (ml + mr) - (cols - 1.0) * settings.gap_h) / cols;
+    let sh = (settings.paper_h - rows * (mt + mb) - (rows - 1.0) * settings.gap_v - effective_fm) / rows;
+    (sw.max(1.0), sh.max(1.0))
+}
+
+/// PDF 页面来源判定：有文字层 = 矢量电子发票（与分辨率无关）；
+/// 否则取内嵌最大位图像素尺寸。
+fn audit_pdf_source(path: &str, page_idx: Option<u32>) -> (String, u32, u32) {
+    let unknown = ("unknown".to_string(), 0u32, 0u32);
+    let Ok(doc) = lopdf::Document::load(path) else {
+        return unknown;
+    };
+    let pages = doc.get_pages();
+    let Some(page_id) = page_idx.and_then(|i| pages.get(&(i + 1)).copied()) else {
+        return unknown;
+    };
+    let Ok(content) = doc.get_page_content(page_id) else {
+        return unknown;
+    };
+    if content.windows(2).any(|w| w == b"Tj" || w == b"TJ") {
+        return ("vector".to_string(), 0, 0);
+    }
+    if let Some((w, h)) = pdf_page_biggest_image(&doc, page_id) {
+        return ("raster".to_string(), w, h);
+    }
+    ("empty".to_string(), 0, 0)
+}
+
+/// PDF 页面上按像素面积最大的 Image XObject 尺寸。
+fn pdf_page_biggest_image(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<(u32, u32)> {
+    let resolve = |obj: &lopdf::Object| -> Option<lopdf::Object> {
+        match obj {
+            lopdf::Object::Dictionary(_) => Some(obj.clone()),
+            lopdf::Object::Reference(id) => doc.get_object(*id).ok().cloned(),
+            _ => None,
+        }
+    };
+    let page = doc.get_object(page_id).ok()?.as_dict().ok()?;
+    let res = resolve(page.get(b"Resources").ok()?)?;
+    let res_dict = res.as_dict().ok()?;
+    let xobj = resolve(res_dict.get(b"XObject").ok()?)?;
+    let xobj_dict = xobj.as_dict().ok()?;
+
+    let mut best: Option<(u32, u32)> = None;
+    for (_, v) in xobj_dict.iter() {
+        let id = match v {
+            lopdf::Object::Reference(r) => *r,
+            _ => continue,
+        };
+        let Ok(obj) = doc.get_object(id) else { continue };
+        let dict = match &obj {
+            lopdf::Object::Stream(s) => &s.dict,
+            lopdf::Object::Dictionary(d) => d,
+            _ => continue,
+        };
+        let Ok(w) = dict.get(b"Width").and_then(|o| o.as_i64()) else { continue };
+        let Ok(h) = dict.get(b"Height").and_then(|o| o.as_i64()) else { continue };
+        let area = w * h;
+        if best.map_or(true, |(bw, bh)| area > bw as i64 * bh as i64) {
+            best = Some((w as u32, h as u32));
+        }
+    }
+    best
+}
+
+/// 图片/OFD 来源的像素尺寸 —— 只读文件头 / data URL，不解码像素。
+fn audit_image_dims(f: &FileSpec) -> Option<(u32, u32)> {
+    if let Some(path) = &f.file_path {
+        if let Ok(dims) = image::image_dimensions(path) {
+            return Some(dims);
+        }
+    }
+    if !f.data_url.is_empty() {
+        if let Ok(bytes) = decode_base64_to_bytes(&f.data_url) {
+            if let Some((w, h, _)) = parse_jpeg_info(&bytes) {
+                return Some((w, h));
+            }
+            if bytes.len() > 24 && bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+                let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+                return Some((w, h));
+            }
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                return Some((img.width(), img.height()));
+            }
+        }
+    }
+    None
+}
+
+/// 逐源计算折算打印 DPI：回答「哪些发票打出来会糊」。
+/// 矢量电子发票标记 vector 且不判 low（与分辨率无关，打了才清晰）。
+pub fn audit_clarity(request: &LayoutRenderRequest) -> Vec<ClarityInfo> {
+    let slot_mm = slot_size_mm(&request.settings);
+    // 与打印时自动增强共用同一阈值（前端滑块可调）
+    let min_dpi = request.settings.enhance_min_dpi.unwrap_or(CLARITY_MIN_DPI).clamp(50.0, 600.0);
+
+    request.files.iter().enumerate().map(|(i, f)| {
+        if let Some(pdf_path) = &f.pdf_path {
+            let (kind, w, h) = audit_pdf_source(pdf_path, f.pdf_page_idx);
+            let dpi = if w > 0 && h > 0 {
+                Some(effective_dpi_px(w, h, slot_mm))
+            } else {
+                None
+            };
+            let low = kind == "raster" && dpi.map_or(false, |d| d < min_dpi);
+            return ClarityInfo {
+                index: i,
+                kind,
+                src_w: w,
+                src_h: h,
+                effective_dpi: dpi,
+                low,
+            };
+        }
+        match audit_image_dims(f) {
+            Some((w, h)) => {
+                let dpi = effective_dpi_px(w, h, slot_mm);
+                ClarityInfo {
+                    index: i,
+                    kind: "raster".to_string(),
+                    src_w: w,
+                    src_h: h,
+                    effective_dpi: Some(dpi),
+                    low: dpi < min_dpi,
+                }
+            }
+            None => ClarityInfo {
+                index: i,
+                kind: "unknown".to_string(),
+                src_w: 0,
+                src_h: 0,
+                effective_dpi: None,
+                low: false,
+            },
+        }
+    }).collect()
 }
 
 /// Convert days since 1970-01-01 to (year, month, day).
@@ -4071,12 +4435,22 @@ struct CachedXobj {
 fn decode_images(
     files: &[FileSpec],
     settings: &RenderSettings,
+    slot_mm: (f32, f32),
 ) -> Vec<Option<ImageSource>> {
     use rayon::prelude::*;
 
     let trim = settings.trim_white.unwrap_or(false);
     let trim_pad = settings.trim_pad.unwrap_or(TRIM_PAD_DEFAULT).min(TRIM_PAD_MAX);
     let color_mode = settings.color_mode.clone();
+    // 清晰度优化：打印时自动增强低有效 DPI 的位图源（issue #39）
+    let auto_enhance = settings.auto_enhance;
+    let min_dpi = settings.enhance_min_dpi.unwrap_or(CLARITY_MIN_DPI).clamp(50.0, 600.0);
+    let enhance_params = EnhanceParams::from_settings(
+        settings.enhance_gamma,
+        settings.enhance_amount,
+        settings.enhance_threshold,
+        settings.enhance_quality,
+    );
 
     // Parallel decode — each file is independent
     let decoded: Vec<Option<ImageSource>> = files
@@ -4124,10 +4498,30 @@ fn decode_images(
             };
             let has_exif_rotation = exif_orientation != 1;
 
+            // ---- 清晰度优化：判定是否需要自动增强 ----
+            // PDF 页走矢量直通，与分辨率无关，永不增强。
+            let is_pdf_page = file_spec.pdf_path.is_some();
+            let want_enhance = auto_enhance && !is_pdf_page;
+
+            // JPEG 可从头部读出尺寸而不解码；读不到时保守地放行直通 ——
+            // 把一张本来清晰的 JPEG 重编码一遍只会损失质量。
+            let jpeg_needs_enhance = match (want_enhance, parse_jpeg_info(&bytes)) {
+                (true, Some((w, h, _))) => {
+                    let dpi = effective_dpi_px(w, h, slot_mm);
+                    log::info!(
+                        "clarity: jpeg {}x{} → {:.0} DPI (slot {:.1}x{:.1}mm, min {:.0})",
+                        w, h, dpi, slot_mm.0, slot_mm.1, min_dpi
+                    );
+                    dpi < min_dpi
+                }
+                _ => false,
+            };
+
             let can_passthrough = is_jpeg_bytes(&bytes)
                 && !trim
                 && !has_exif_rotation
-                && (color_mode == "color" || color_mode.is_empty());
+                && (color_mode == "color" || color_mode.is_empty())
+                && !jpeg_needs_enhance;
 
             if can_passthrough {
                 if let Some((w, h, nc)) = parse_jpeg_info(&bytes) {
@@ -4162,6 +4556,22 @@ fn decode_images(
             // 位图路径：裁剪直接烘焙进像素，不需要保留裁剪框
             if trim {
                 img = trim_white_edges(&img, WHITE_THRESHOLD, trim_pad).0;
+            }
+
+            // 清晰度优化：非 JPEG 位图解码后才有尺寸，此时按实际有效 DPI 增强。
+            // 必须在 apply_color_mode 之前 —— 色阶拉伸依据原始色调直方图，
+            // 先转灰度会破坏红章与通道间的相对关系。
+            if want_enhance {
+                let dpi = effective_dpi_px(img.width(), img.height(), slot_mm);
+                if dpi < min_dpi {
+                    log::info!(
+                        "clarity: raster {}x{} → {:.0} DPI < {:.0}, auto-enhancing",
+                        img.width(), img.height(), dpi, min_dpi
+                    );
+                    let mut rgb = normalize_for_jpeg(img).to_rgb8();
+                    enhance_rgb_inplace(&mut rgb, &enhance_params);
+                    img = image::DynamicImage::ImageRgb8(rgb);
+                }
             }
 
             // Apply color mode (global setting, not per-slot)
@@ -4455,7 +4865,8 @@ pub fn generate_pdf_from_layout(
     let needs_text = request.settings.page_num
         || request.settings.print_date
         || request.settings.footer_text.as_ref().map_or(false, |t| !t.is_empty())
-        || (request.settings.watermark && request.settings.watermark_text.as_ref().map_or(false, |t| !t.is_empty()));
+        || (request.settings.watermark && request.settings.watermark_text.as_ref().map_or(false, |t| !t.is_empty()))
+        || request.settings.paste_mode;
     let font_warning = if needs_text && !std::path::Path::new("C:\\Windows\\Fonts\\simhei.ttf").exists() {
         Some("系统缺少中文字体(simhei.ttf)，页脚/水印/页码将不显示".to_string())
     } else {
@@ -4468,7 +4879,7 @@ pub fn generate_pdf_from_layout(
     if let Some(ref cb) = &on_progress {
         cb("decode", 0, total_files);
     }
-    let sources = decode_images(&request.files, &request.settings);
+    let sources = decode_images(&request.files, &request.settings, slot_size_mm(&request.settings));
     if let Some(ref cb) = &on_progress {
         cb("decode", total_files, total_files);
     }
@@ -4568,6 +4979,55 @@ pub fn generate_pdf_from_layout(
             }
         } else {
             log::warn!("printpdf fallback: page {} render_text_overlay returned None", i);
+        }
+
+        // 粘贴单：装订线 + 右下角签字栏
+        if let Some(geom) = paste_sheet_geom(&request.settings, pw * MM_TO_PT, ph * MM_TO_PT) {
+            ops.extend(build_paste_sheet_ops_printpdf(&geom));
+            let px_per_mm = RENDER_DPI as f32 / 25.4;
+            let push_text_png = |doc: &mut printpdf::PdfDocument, ops: &mut Vec<printpdf::Op>, png: &[u8], x_pt: f32, y_pt: f32| {
+                let mut warnings = Vec::new();
+                if let Ok(raw_img) = printpdf::RawImage::decode_from_bytes(png, &mut warnings) {
+                    let img_w_pt = raw_img.width as f32 * 72.0 / RENDER_DPI as f32;
+                    let img_h_pt = raw_img.height as f32 * 72.0 / RENDER_DPI as f32;
+                    let xobj_id = doc.add_image(&raw_img);
+                    ops.push(printpdf::Op::SaveGraphicsState);
+                    ops.push(printpdf::Op::UseXobject {
+                        id: xobj_id,
+                        transform: printpdf::XObjectTransform {
+                            translate_x: Some(printpdf::Pt(x_pt)),
+                            translate_y: Some(printpdf::Pt(y_pt)),
+                            scale_x: Some(img_w_pt),
+                            scale_y: Some(img_h_pt),
+                            dpi: Some(RENDER_DPI as f32),
+                            rotate: None,
+                        },
+                    });
+                    ops.push(printpdf::Op::RestoreGraphicsState);
+                } else {
+                    log::warn!("printpdf fallback: page {} paste-sheet PNG decode failed", i);
+                }
+            };
+            if let (Some(bt), Some(y)) = (geom.bind_text.as_deref(), geom.bind_y) {
+                if !bt.trim().is_empty() {
+                    let width_px = (pw * px_per_mm) as u32;
+                    if let Some((png, w, _h)) = render_cells_overlay(
+                        &text_font, &[bt.to_string()], width_px, geom.bind_size_mm, [51u8, 65u8, 85u8, 255u8],
+                    ) {
+                        let w_pt = w as f32 * 72.0 / RENDER_DPI as f32;
+                        push_text_png(&mut doc, &mut ops, &png, (pw * MM_TO_PT - w_pt) / 2.0, y + 1.2 * MM_TO_PT);
+                    }
+                }
+            }
+            if let Some(t) = &geom.sig {
+                let width_px = ((t.x1 - t.x0) / MM_TO_PT * px_per_mm) as u32;
+                if let Some((png, _w, h)) = render_cells_overlay(
+                    &text_font, &t.labels, width_px, 3.5, [51u8, 65u8, 85u8, 255u8],
+                ) {
+                    let h_pt = h as f32 * 72.0 / RENDER_DPI as f32;
+                    push_text_png(&mut doc, &mut ops, &png, t.x0, t.mid_y + ((t.y1 - t.mid_y) - h_pt) / 2.0);
+                }
+            }
         }
 
         // Skip empty pages — avoid generating blank PDF pages when
@@ -5410,11 +5870,15 @@ fn build_nup_content_stream(
 
         // Centered position in slot (bottom-left origin) based on visual dimensions.
         // 报销单模式：左上对齐（贴段内区域左上角）；常规模式：居中。
-        // 「裁剪白边」开启时垂直贴顶 —— 裁掉白边后内容居中会显出多余留白，
-        // 看起来像"白边没裁掉"；水平方向仍居中。
+        // 「裁剪白边」开启时垂直贴顶 —— 但只对 90°/270° 旋转生效：
+        // 与前端预览（layout.js `wrapTop = visH/2 - containedH/2`，未旋转时
+        // containedH == visH，公式恒为 0 即居中）及 printpdf 回退路径（build_page_ops
+        // 仅 reimburse_mode 顶对齐）保持一致。issue #38：#38 未旋转超长截图 +
+        // 裁剪白边 + 放大时，旧逻辑强制顶对齐导致打印显示截图顶部 UI 而预览显示中部。
         let draw_w = vis_w * scale_x;
         let draw_h = vis_h * scale_y;
-        let top_align = settings.reimburse_mode || settings.trim_white.unwrap_or(false);
+        let is_rot90 = rot == 90 || rot == 270;
+        let top_align = settings.reimburse_mode || (settings.trim_white.unwrap_or(false) && is_rot90);
         let mut offset_x = slot.x_mm * MM_TO_PT;
         let mut offset_y = slot.y_mm * MM_TO_PT + if top_align {
             // bottom-up 坐标：顶部对齐 = slot 顶边 - 图像高度
@@ -5531,42 +5995,57 @@ fn image_to_lopdf_xobject(
     source: &ImageSource,
     rotation: i32,
     output_doc: &mut lopdf::Document,
+    // 白边裁剪：(裁剪框像素, 位图基准宽, 位图基准高)。None = 嵌入整图。
+    // 框坐标基于「位图基准」位图；解码尺寸与基准不一致时按比例缩放（图片
+    // 场景前端已换算到原图坐标，此处缩放主要兜底 EXIF 等偏差）。
+    trim: Option<(TrimBox, u32, u32)>,
 ) -> Result<(lopdf::ObjectId, f32, f32), String> {
     let rot = ((rotation % 360) + 360) % 360;
 
     match source {
-        ImageSource::JpegPassthrough { raw_bytes, width, height, num_components } => {
-            if rot == 0 {
-                // No rotation: embed raw JPEG bytes directly (zero re-encoding)
-                let nc = *num_components;
-                let w_pt = *width as f32 * 72.0 / RENDER_DPI as f32;
-                let h_pt = *height as f32 * 72.0 / RENDER_DPI as f32;
-                let xobj_id = build_lopdf_jpeg_xobject(output_doc, raw_bytes, *width, *height, nc);
-                Ok((xobj_id, w_pt, h_pt))
-            } else {
-                // Any rotation (90°/180°/270°): decode → rotate → re-encode
-                let img = image::load_from_memory(raw_bytes)
-                    .map_err(|e| format!("JPEG解码失败: {}", e))?;
-                let rotated = match rot {
-                    90  => img.rotate90(),
-                    180 => img.rotate180(),
-                    270 => img.rotate270(),
-                    _   => img,
-                };
-                let (w, h) = (rotated.width(), rotated.height());
-                let jpeg_bytes = encode_image_to_jpeg_bytes(&rotated)?;
-                let w_pt = w as f32 * 72.0 / RENDER_DPI as f32;
-                let h_pt = h as f32 * 72.0 / RENDER_DPI as f32;
-                let xobj_id = build_lopdf_jpeg_xobject(output_doc, &jpeg_bytes, w, h, 3);
-                Ok((xobj_id, w_pt, h_pt))
-            }
+        ImageSource::JpegPassthrough { raw_bytes, width, height, num_components } if trim.is_none() && rot == 0 => {
+            // No rotation & no crop: embed raw JPEG bytes directly (zero re-encoding)
+            let nc = *num_components;
+            let w_pt = *width as f32 * 72.0 / RENDER_DPI as f32;
+            let h_pt = *height as f32 * 72.0 / RENDER_DPI as f32;
+            let xobj_id = build_lopdf_jpeg_xobject(output_doc, raw_bytes, *width, *height, nc);
+            Ok((xobj_id, w_pt, h_pt))
         }
-        ImageSource::Decoded(img) => {
+        _ => {
+            // Decode source into a DynamicImage first (needed for crop/rotation)
+            let img = match source {
+                ImageSource::JpegPassthrough { raw_bytes, .. } => image::load_from_memory(raw_bytes)
+                    .map_err(|e| format!("JPEG解码失败: {}", e))?,
+                ImageSource::Decoded(img) => img.clone(),
+            };
+            // Apply crop box (scaled from the reference bitmap to actual decoded size)
+            use image::GenericImageView;
+            let cropped = if let Some(([bx, by, bkw, bkh], bmp_w, bmp_h)) = trim {
+                let (dw, dh) = img.dimensions();
+                if bkw > 0 && bkh > 0 && bmp_w > 0 && bmp_h > 0 {
+                    let sx = dw as f32 / bmp_w as f32;
+                    let sy = dh as f32 / bmp_h as f32;
+                    let max_x = dw.saturating_sub(1) as f32;
+                    let max_y = dh.saturating_sub(1) as f32;
+                    let cx = (bx as f32 * sx).round().clamp(0.0, max_x) as u32;
+                    let cy = (by as f32 * sy).round().clamp(0.0, max_y) as u32;
+                    let max_cw = (dw.saturating_sub(cx)) as f32;
+                    let max_ch = (dh.saturating_sub(cy)) as f32;
+                    let cw = (bkw as f32 * sx).round().clamp(1.0, max_cw) as u32;
+                    let ch = (bkh as f32 * sy).round().clamp(1.0, max_ch) as u32;
+                    let img = image::imageops::crop_imm(&img, cx, cy, cw, ch).to_image();
+                    image::DynamicImage::from(img)
+                } else {
+                    img.clone()
+                }
+            } else {
+                img.clone()
+            };
             let rotated = match rot {
-                90  => img.rotate90(),
-                180 => img.rotate180(),
-                270 => img.rotate270(),
-                _   => img.clone(),
+                90  => cropped.rotate90(),
+                180 => cropped.rotate180(),
+                270 => cropped.rotate270(),
+                _   => cropped,
             };
             let (w, h) = (rotated.width(), rotated.height());
             let jpeg_bytes = encode_image_to_jpeg_bytes(&rotated)?;
@@ -5743,7 +6222,8 @@ fn generate_pdf_passthrough(
         || request.settings.print_date
         || request.settings.footer_text.as_ref().map_or(false, |t| !t.is_empty())
         || request.settings.number
-        || (request.settings.watermark && request.settings.watermark_text.as_ref().map_or(false, |t| !t.is_empty()));
+        || (request.settings.watermark && request.settings.watermark_text.as_ref().map_or(false, |t| !t.is_empty()))
+        || request.settings.paste_mode;
     let text_font = if needs_text_font {
         load_system_font()
     } else {
@@ -5838,7 +6318,13 @@ fn generate_pdf_passthrough(
                         continue;
                     }
                 };
-                match image_to_lopdf_xobject(source, slot.rotation, &mut output_doc) {
+                // 白边裁剪：图片按裁剪框裁切（原图坐标由前端换算，此处缩放兜底）。
+                let trim = if request.settings.trim_white.unwrap_or(false) {
+                    file.trim_box.map(|b| (b, file.ow, file.oh))
+                } else {
+                    None
+                };
+                match image_to_lopdf_xobject(source, slot.rotation, &mut output_doc, trim) {
                     Ok(result) => result,
                     Err(e) => {
                         log::warn!("lopdf hybrid: image slot {} encode failed: {}, skipping", file_idx, e);
@@ -6228,6 +6714,65 @@ fn generate_pdf_passthrough(
             }
         }
 
+        // 粘贴单：装订线 + 右下角签字栏（矢量线 + 文字 PNG 叠加）
+        if let Some(geom) = paste_sheet_geom(&request.settings, pw_pt, ph_pt) {
+            if let Some(sheet_ops) = build_paste_sheet_ops_lopdf(&geom) {
+                if !content_bytes.is_empty() {
+                    content_bytes.push(b'\n');
+                }
+                match sheet_ops.encode() {
+                    Ok(bytes) => {
+                        content_bytes.extend_from_slice(&bytes);
+                        log::info!("lopdf hybrid: page {} paste-sheet lines added", page_idx);
+                    }
+                    Err(e) => log::warn!("lopdf hybrid: page {} paste-sheet encode failed: {}", page_idx, e),
+                }
+            }
+            // 装订线文字：整页宽一条，水平居中
+            if let Some(bt) = geom.bind_text.as_deref().filter(|t| !t.trim().is_empty()) {
+                if let Some(y) = geom.bind_y {
+                    let width_px = (pw_pt / MM_TO_PT * (RENDER_DPI as f32 / 25.4)) as u32;
+                    if let Some((png, w, h)) = render_cells_overlay(
+                        &text_font,
+                        &[bt.to_string()],
+                        width_px,
+                        geom.bind_size_mm,
+                        [51u8, 65u8, 85u8, 255u8],
+                    ) {
+                        let w_pt = w as f32 * 72.0 / RENDER_DPI as f32;
+                        let h_pt = h as f32 * 72.0 / RENDER_DPI as f32;
+                        // 底边贴住装订线，留 1.2mm 间隙
+                        append_png_xobject_lopdf(
+                            &mut output_doc, &mut content_bytes, &mut xobj_names,
+                            &format!("PasteBind{}", page_idx), &png,
+                            (pw_pt - w_pt) / 2.0, y + 1.2 * MM_TO_PT, w_pt, h_pt,
+                        );
+                    }
+                }
+            }
+            // 签字栏表头文字：表格宽一条，按列居中
+            if let Some(t) = &geom.sig {
+                let width_px = ((t.x1 - t.x0) / MM_TO_PT * (RENDER_DPI as f32 / 25.4)) as u32;
+                if let Some((png, w, h)) = render_cells_overlay(
+                    &text_font,
+                    &t.labels,
+                    width_px,
+                    3.5, // 表头字号固定 3.5mm，与装订线文字字号互不影响
+                    [51u8, 65u8, 85u8, 255u8],
+                ) {
+                    let w_pt = w as f32 * 72.0 / RENDER_DPI as f32;
+                    let h_pt = h as f32 * 72.0 / RENDER_DPI as f32;
+                    // 表头行内垂直居中
+                    let y_pt = t.mid_y + ((t.y1 - t.mid_y) - h_pt) / 2.0;
+                    append_png_xobject_lopdf(
+                        &mut output_doc, &mut content_bytes, &mut xobj_names,
+                        &format!("PasteSig{}", page_idx), &png,
+                        t.x0, y_pt, w_pt, h_pt,
+                    );
+                }
+            }
+        }
+
         // Add slot borders if enabled
         if request.settings.border {
             if let Some(border_ops) = build_border_ops_lopdf(&slot_positions, &slot_adjustments, &page_form_xobjs, &request.settings) {
@@ -6318,6 +6863,326 @@ fn generate_pdf_passthrough(
     }
 
     Ok(())
+}
+
+// =====================================================
+// 粘贴单模式：装订线 + 右下角签字栏（只画线，数据留空手写）
+// =====================================================
+
+/// 签字栏表格几何（bottom-up pt）
+struct PasteSigTable {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    /// 表头行与填写行的分隔线 y
+    mid_y: f32,
+    /// 列分隔线 x（不含左右边框）
+    col_edges: Vec<f32>,
+    /// 表头列名
+    labels: Vec<String>,
+}
+
+/// 粘贴单整页几何（bottom-up pt）
+struct PasteSheetGeom {
+    page_w: f32,
+    /// 装订线横线的 y（None = 不画线）
+    bind_y: Option<f32>,
+    bind_text: Option<String>,
+    bind_size_mm: f32,
+    sig: Option<PasteSigTable>,
+}
+
+/// 逗号/中文逗号切分列名
+fn paste_split_labels(raw: &str) -> Vec<String> {
+    raw.split(|c| c == ',' || c == '，')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 由设置推导粘贴单几何；未启用或两个元素都关闭时返回 None。
+/// 边距口径与 calculate_layout_mm / JS getSettings() 完全一致：
+/// 上边距 = 装订区高度（装订线即画在该处），签字栏贴右下边距。
+fn paste_sheet_geom(settings: &RenderSettings, pw_pt: f32, ph_pt: f32) -> Option<PasteSheetGeom> {
+    if !settings.paste_mode {
+        return None;
+    }
+    let top_mm = settings.paste_top.unwrap_or(20.8);
+    let bot_mm = settings.paste_bottom.unwrap_or(4.1);
+    let right_mm = settings.paste_right.unwrap_or(4.1);
+
+    let bind_y = if settings.paste_bind_line.unwrap_or(true) {
+        Some(((ph_pt / MM_TO_PT) - top_mm).max(0.0) * MM_TO_PT)
+    } else {
+        None
+    };
+    let bind_text = Some(
+        settings.paste_bind_text.clone().unwrap_or_else(|| "装 订 线".to_string()),
+    );
+    let bind_size_mm = settings.paste_bind_size.unwrap_or(4.0);
+
+    let sig = if settings.paste_show_sig.unwrap_or(true) {
+        let labels = paste_split_labels(
+            settings.paste_sig_cols.as_deref().unwrap_or("票据张数,金额,报销人"),
+        );
+        if labels.is_empty() {
+            None
+        } else {
+            let x1 = pw_pt - right_mm * MM_TO_PT;
+            let x0 = (x1 - settings.paste_sig_width.unwrap_or(80.0) * MM_TO_PT).max(0.0);
+            let y0 = bot_mm * MM_TO_PT;
+            let mid_y = y0 + settings.paste_sig_body_h.unwrap_or(14.0) * MM_TO_PT;
+            let y1 = mid_y + settings.paste_sig_row_h.unwrap_or(8.0) * MM_TO_PT;
+            let col_w = (x1 - x0) / labels.len() as f32;
+            let mut col_edges = Vec::new();
+            for i in 1..labels.len() {
+                col_edges.push(x0 + col_w * i as f32);
+            }
+            Some(PasteSigTable { x0, y0, x1, y1, mid_y, col_edges, labels })
+        }
+    } else {
+        None
+    };
+
+    if bind_y.is_none() && sig.is_none() {
+        return None;
+    }
+    log::info!(
+        "paste_sheet_geom: pw_pt={pw_pt:.1} ph_pt={ph_pt:.1} bind_y={bind_y:?} sig_width={:?}",
+        sig.as_ref().map(|t| t.x1 - t.x0)
+    );
+    Some(PasteSheetGeom { page_w: pw_pt, bind_y, bind_text, bind_size_mm, sig })
+}
+
+/// 粘贴单矢量线（lopdf 路径）：装订线横线 + 签字栏表格框线。
+fn build_paste_sheet_ops_lopdf(geom: &PasteSheetGeom) -> Option<lopdf::content::Content> {
+    use lopdf::content::Operation;
+    use lopdf::Object;
+
+    let mut ops = Vec::new();
+    ops.push(Operation { operator: "q".into(), operands: vec![] });
+    // 0.75pt 实线，深灰（#334155 ≈ 0.2 灰）
+    ops.push(Operation { operator: "w".into(), operands: vec![Object::Real(0.75)] });
+    ops.push(Operation { operator: "G".into(), operands: vec![Object::Real(0.2)] });
+
+    if let Some(y) = geom.bind_y {
+        // 装订线：横贯整页
+        ops.push(Operation { operator: "m".into(), operands: vec![Object::Real(0.0), Object::Real(y)] });
+        ops.push(Operation { operator: "l".into(), operands: vec![Object::Real(geom.page_w), Object::Real(y)] });
+        ops.push(Operation { operator: "S".into(), operands: vec![] });
+    }
+
+    if let Some(t) = &geom.sig {
+        // 外框
+        ops.push(Operation { operator: "re".into(), operands: vec![
+            Object::Real(t.x0), Object::Real(t.y0),
+            Object::Real(t.x1 - t.x0), Object::Real(t.y1 - t.y0),
+        ]});
+        ops.push(Operation { operator: "S".into(), operands: vec![] });
+        // 列分隔线
+        for x in &t.col_edges {
+            ops.push(Operation { operator: "m".into(), operands: vec![Object::Real(*x), Object::Real(t.y0)] });
+            ops.push(Operation { operator: "l".into(), operands: vec![Object::Real(*x), Object::Real(t.y1)] });
+            ops.push(Operation { operator: "S".into(), operands: vec![] });
+        }
+        // 表头/填写行分隔线
+        ops.push(Operation { operator: "m".into(), operands: vec![Object::Real(t.x0), Object::Real(t.mid_y)] });
+        ops.push(Operation { operator: "l".into(), operands: vec![Object::Real(t.x1), Object::Real(t.mid_y)] });
+        ops.push(Operation { operator: "S".into(), operands: vec![] });
+    }
+
+    ops.push(Operation { operator: "Q".into(), operands: vec![] });
+    Some(lopdf::content::Content { operations: ops })
+}
+
+/// 粘贴单矢量线（printpdf 回退路径）——同一套几何，用 Unknown 原样下发 PDF 算子。
+fn build_paste_sheet_ops_printpdf(geom: &PasteSheetGeom) -> Vec<printpdf::Op> {
+    use printpdf::DictItem as DI;
+    let mut ops = Vec::new();
+    let raw = |key: &str, value: Vec<DI>| printpdf::Op::Unknown { key: key.into(), value };
+
+    ops.push(printpdf::Op::SaveGraphicsState);
+    ops.push(raw("w", vec![DI::Real(0.75)]));
+    ops.push(raw("G", vec![DI::Real(0.2)]));
+
+    if let Some(y) = geom.bind_y {
+        ops.push(raw("m", vec![DI::Real(0.0), DI::Real(y)]));
+        ops.push(raw("l", vec![DI::Real(geom.page_w), DI::Real(y)]));
+        ops.push(raw("S", vec![]));
+    }
+    if let Some(t) = &geom.sig {
+        ops.push(raw("re", vec![
+            DI::Real(t.x0), DI::Real(t.y0), DI::Real(t.x1 - t.x0), DI::Real(t.y1 - t.y0),
+        ]));
+        ops.push(raw("S", vec![]));
+        for x in &t.col_edges {
+            ops.push(raw("m", vec![DI::Real(*x), DI::Real(t.y0)]));
+            ops.push(raw("l", vec![DI::Real(*x), DI::Real(t.y1)]));
+            ops.push(raw("S", vec![]));
+        }
+        ops.push(raw("m", vec![DI::Real(t.x0), DI::Real(t.mid_y)]));
+        ops.push(raw("l", vec![DI::Real(t.x1), DI::Real(t.mid_y)]));
+        ops.push(raw("S", vec![]));
+    }
+    ops.push(printpdf::Op::RestoreGraphicsState);
+    ops
+}
+
+/// 把若干「等宽单元格内的居中文字」渲染成一条透明底 PNG。
+/// 一个函数同时服务装订线文字（cells 长度 1、宽度=页宽）与签字栏表头（cells=列名）。
+/// 返回 (png_bytes, width_px, height_px)。
+fn render_cells_overlay(
+    font: &Option<ab_glyph::FontArc>,
+    cells: &[String],
+    total_width_px: u32,
+    font_size_mm: f32,
+    color: [u8; 4],
+) -> Option<(Vec<u8>, u32, u32)> {
+    if cells.is_empty() || total_width_px == 0 {
+        return None;
+    }
+    let font = match font {
+        Some(f) => f,
+        None => {
+            log::warn!("render_cells_overlay: no font available, skipping");
+            return None;
+        }
+    };
+
+    let px_per_mm = RENDER_DPI as f32 / 25.4;
+    let font_size = (font_size_mm * px_per_mm).max(1.0);
+    // 与 render_text_overlay 一致：基线在 font_size 处，整幅高 = 1.54 × font_size
+    let img_width = total_width_px.max(1);
+    let img_height = (font_size * 1.54).ceil() as u32;
+
+    let mut img = image::RgbaImage::new(img_width, img_height);
+    let scaled_font = font.as_scaled(font_size);
+    let n = cells.len() as f32;
+    let col_w = img_width as f32 / n;
+
+    let measure = |text: &str| -> f32 {
+        text.chars().map(|c| scaled_font.h_advance(font.glyph_id(c))).sum()
+    };
+
+    for (i, text) in cells.iter().enumerate() {
+        if text.is_empty() {
+            continue;
+        }
+        let cx = col_w * (i as f32 + 0.5);
+        let mut x = cx - measure(text) / 2.0;
+        let baseline = font_size;
+        for c in text.chars() {
+            let glyph_id = font.glyph_id(c);
+            let glyph = Glyph {
+                id: glyph_id,
+                scale: font_size.into(),
+                position: ab_glyph::point(x, baseline),
+            };
+            if let Some(q) = font.outline_glyph(glyph) {
+                let bb = q.px_bounds();
+                let (x_draw, y_draw) = (bb.min.x, bb.min.y);
+                q.draw(|gx, gy, v| {
+                    let px = (x_draw + gx as f32) as i32;
+                    let py = (y_draw + gy as f32) as i32;
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                        let alpha = (v * color[3] as f32) as u8;
+                        let pixel = img.get_pixel_mut(px as u32, py as u32);
+                        if alpha > pixel[3] {
+                            *pixel = image::Rgba([color[0], color[1], color[2], alpha]);
+                        }
+                    }
+                });
+            }
+            x += scaled_font.h_advance(glyph_id);
+        }
+    }
+
+    let mut png_buf = Vec::new();
+    match img.write_to(&mut std::io::Cursor::new(&mut png_buf), image::ImageFormat::Png) {
+        Ok(()) => Some((png_buf, img_width, img_height)),
+        Err(e) => {
+            log::error!("render_cells_overlay: PNG encode failed: {}", e);
+            None
+        }
+    }
+}
+
+/// 把一条透明底 PNG 作为 Image XObject 追加到 lopdf content stream。
+/// 与页脚 overlay 的嵌入方式一致（SMask 透明 + cm/Do/Q）。
+fn append_png_xobject_lopdf(
+    doc: &mut lopdf::Document,
+    content_bytes: &mut Vec<u8>,
+    xobj_names: &mut Vec<(Vec<u8>, lopdf::ObjectId)>,
+    name: &str,
+    png_bytes: &[u8],
+    x_pt: f32,
+    y_pt: f32,
+    w_pt: f32,
+    h_pt: f32,
+) -> bool {
+    let rgba_img = match image::load_from_memory(png_bytes) {
+        Ok(i) => i.to_rgba8(),
+        Err(e) => {
+            log::warn!("append_png_xobject_lopdf: decode failed: {}", e);
+            return false;
+        }
+    };
+    let (w, h) = rgba_img.dimensions();
+    let alpha_bytes: Vec<u8> = rgba_img.pixels().map(|p| p[3]).collect();
+    let rgb_bytes: Vec<u8> = rgba_img.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
+
+    let smask_dict = lopdf::Dictionary::from_iter(vec![
+        ("Type", lopdf::Object::Name(b"XObject".to_vec())),
+        ("Subtype", lopdf::Object::Name(b"Image".to_vec())),
+        ("Width", lopdf::Object::Integer(w as i64)),
+        ("Height", lopdf::Object::Integer(h as i64)),
+        ("ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec())),
+        ("BitsPerComponent", lopdf::Object::Integer(8)),
+    ]);
+    let smask_id = doc.add_object(lopdf::Stream::new(smask_dict, alpha_bytes).with_compression(true));
+
+    let img_dict = lopdf::Dictionary::from_iter(vec![
+        ("Type", lopdf::Object::Name(b"XObject".to_vec())),
+        ("Subtype", lopdf::Object::Name(b"Image".to_vec())),
+        ("Width", lopdf::Object::Integer(w as i64)),
+        ("Height", lopdf::Object::Integer(h as i64)),
+        ("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec())),
+        ("BitsPerComponent", lopdf::Object::Integer(8)),
+        ("SMask", lopdf::Object::Reference(smask_id)),
+    ]);
+    let xobj_id = doc.add_object(lopdf::Stream::new(img_dict, rgb_bytes).with_compression(true));
+
+    use lopdf::content::Operation;
+    let nm = name.as_bytes().to_vec();
+    let ops = vec![
+        Operation { operator: "q".into(), operands: vec![] },
+        Operation { operator: "cm".into(), operands: vec![
+            lopdf::Object::Real(w_pt),
+            lopdf::Object::Real(0.0),
+            lopdf::Object::Real(0.0),
+            lopdf::Object::Real(h_pt),
+            lopdf::Object::Real(x_pt),
+            lopdf::Object::Real(y_pt),
+        ]},
+        Operation { operator: "Do".into(), operands: vec![lopdf::Object::Name(nm.clone())] },
+        Operation { operator: "Q".into(), operands: vec![] },
+    ];
+    let content = lopdf::content::Content { operations: ops };
+    match content.encode() {
+        Ok(bytes) => {
+            if !content_bytes.is_empty() {
+                content_bytes.push(b'\n');
+            }
+            content_bytes.extend_from_slice(&bytes);
+            xobj_names.push((nm, xobj_id));
+            true
+        }
+        Err(e) => {
+            log::warn!("append_png_xobject_lopdf: encode failed: {}", e);
+            false
+        }
+    }
 }
 
 /// Build PDF operations for reimburse-mode cut lines: horizontal dashed lines

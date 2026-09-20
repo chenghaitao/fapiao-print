@@ -128,6 +128,28 @@
           <div id="reimburseOpts" style="display:none">
             <div class="row"><label class="lbl">分段高度</label><div class="ctrl"><input type="number" id="reimburseHeight" value="120" min="50" max="297" step="1" style="width:64px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:12px">mm，发票左上对齐，段底打印裁切线</span></div></div>
           </div>
+          <div class="trow" style="margin-top:6px"><label class="tlbl">粘贴单模式</label><button class="tgl" id="togglePasteMode" onclick="toggleFeature('pasteMode',this)"></button></div>
+          <div id="pasteOpts" style="display:none">
+            <div style="margin:2px 0 8px 0">
+              <button class="btn btn-sm" style="width:100%" onclick="applyPastePreset()">↩ 恢复标准边距（2.08 / 0.41cm）</button>
+            </div>
+            <div class="row"><label class="lbl">上mm</label><div class="ctrl"><input type="number" id="pasteTop" value="20.8" min="0" max="60" step="0.1" style="width:60px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:11px">＝2.08cm</span></div></div>
+            <div class="row"><label class="lbl">下mm</label><div class="ctrl"><input type="number" id="pasteBottom" value="4.1" min="0" max="60" step="0.1" style="width:60px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:11px">＝0.41cm</span></div></div>
+            <div class="row"><label class="lbl">左mm</label><div class="ctrl"><input type="number" id="pasteLeft" value="4.1" min="0" max="60" step="0.1" style="width:60px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:11px">＝0.41cm</span></div></div>
+            <div class="row"><label class="lbl">右mm</label><div class="ctrl"><input type="number" id="pasteRight" value="4.1" min="0" max="60" step="0.1" style="width:60px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:11px">＝0.41cm</span></div></div>
+            <div class="trow" style="margin-top:8px"><label class="tlbl">装订线横线</label><button class="tgl on" id="togglePasteBindLine" onclick="toggleFeature('pasteBindLine',this)"></button></div>
+            <div class="row"><label class="lbl">装订线文字</label><div class="ctrl"><input type="text" id="pasteBindText" value="装 订 线" onchange="updatePreview()"></div></div>
+            <div class="row"><label class="lbl">字号mm</label><div class="rr ctrl"><input type="range" id="pasteBindSize" min="2" max="10" step="0.5" value="4" oninput="syncSlider(this,'pasteBindSizeN');updatePreview()"><input type="number" id="pasteBindSizeN" min="2" max="10" step="0.5" value="4" onchange="syncRange(this,'pasteBindSize');updatePreview()"></div></div>
+            <div class="trow" style="margin-top:8px"><label class="tlbl">右下角签字栏</label><button class="tgl on" id="togglePasteSig" onclick="toggleFeature('pasteShowSig',this)"></button></div>
+            <div id="pasteSigOpts">
+              <div class="row"><label class="lbl">列名</label><div class="ctrl"><input type="text" id="pasteSigCols" value="票据张数,金额,报销人" placeholder="逗号分隔" onchange="updatePreview()"></div></div>
+              <div class="row"><label class="lbl">表格宽</label><div class="ctrl"><input type="number" id="pasteSigWidth" value="80" min="30" max="200" step="1" style="width:64px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:12px">mm</span></div></div>
+              <div class="row"><label class="lbl">表头行高</label><div class="ctrl"><input type="number" id="pasteSigRowH" value="8" min="4" max="30" step="0.5" style="width:64px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:12px">mm</span></div></div>
+              <div class="row"><label class="lbl">填写行高</label><div class="ctrl"><input type="number" id="pasteSigBodyH" value="14" min="4" max="60" step="0.5" style="width:64px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:12px">mm</span></div></div>
+              <div class="row"><label class="lbl">区间距</label><div class="ctrl"><input type="number" id="pasteSigGap" value="2" min="0" max="20" step="0.5" style="width:64px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:12px">mm</span></div></div>
+            </div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">票据只排版在装订线下方、签字栏上方；上边距即装订区高度。本模式使用独立边距，排版页的「边距」与页脚（页码/日期/自定义页脚）不生效。签字栏留空，打印后手写。</div>
+          </div>
         </div>
         <div class="sec" id="quickLayoutSec">
           <div class="sec-title">⚡ 快捷布局</div>
@@ -203,7 +225,7 @@
             <div class="adj-empty" id="adjEmpty">点击预览中的发票进行选中</div>
             <div id="adjContent" style="display:none">
               <span class="adj-file-name" id="adjFileName"></span>
-              <div class="row"><label class="lbl">缩放</label><div class="rr ctrl"><input type="range" id="adjScale" min="20" max="300" value="100" oninput="syncSlider(this,'adjScaleN');onAdjScaleChange()"><input type="number" id="adjScaleN" min="20" max="300" value="100" onchange="syncRange(this,'adjScale');onAdjScaleChange()"></div></div>
+              <div class="row"><label class="lbl">缩放</label><div class="rr ctrl"><input type="range" id="adjScale" min="20" max="500" value="100" oninput="syncSlider(this,'adjScaleN');onAdjScaleChange()"><input type="number" id="adjScaleN" min="20" max="500" value="100" onchange="syncRange(this,'adjScale');onAdjScaleChange()"></div></div>
               <div class="row"><label class="lbl">X偏移</label><div class="rr ctrl"><input type="range" id="adjOffX" min="-150" max="150" value="0" step="0.5" oninput="syncSlider(this,'adjOffXN');onAdjOffsetChange()"><input type="number" id="adjOffXN" min="-150" max="150" value="0" step="0.5" onchange="syncRange(this,'adjOffX');onAdjOffsetChange()"></div></div>
               <div class="row"><label class="lbl">Y偏移</label><div class="rr ctrl"><input type="range" id="adjOffY" min="-150" max="150" value="0" step="0.5" oninput="syncSlider(this,'adjOffYN');onAdjOffsetChange()"><input type="number" id="adjOffYN" min="-150" max="150" value="0" step="0.5" onchange="syncRange(this,'adjOffY');onAdjOffsetChange()"></div></div>
               <div style="display:flex;gap:6px;margin-top:6px">
@@ -290,6 +312,20 @@
           <div class="sec-title">📝 PDF 文字提取</div>
           <div class="trow"><label class="tlbl">自动提取</label><button class="tgl on" id="togglePdfText" onclick="togglePref('pdfTextEnabled',this)"></button></div>
           <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">开启后从 PDF 文字层提取发票字段（销售方、金额等），无需 OCR。对扫描件/图片 PDF 无效。默认关闭以提高加载速度；需要结构化字段时再开启。</div>
+        </div>
+        <div class="sec">
+          <div class="sec-title">🔍 清晰度优化</div>
+          <div class="trow"><label class="tlbl">打印时自动增强</label><button class="tgl" id="toggleAutoEnhance" onclick="toggleFeature('autoEnhance',this)"></button></div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.4">开启后打印 / 保存 PDF 时，折算 DPI 低于阈值的图片自动加深文字并锐化（矢量电子发票不受影响）。</div>
+          <div id="enhanceOpts" style="display:none;margin-top:8px">
+            <div class="row"><label class="lbl">触发阈值</label><div class="rr ctrl"><input type="range" id="enhanceMinDpi" min="100" max="400" step="10" value="250" oninput="syncSlider(this,'enhanceMinDpiN');saveSettings()"><input type="number" id="enhanceMinDpiN" min="100" max="400" step="10" value="250" style="width:52px" onchange="syncRange(this,'enhanceMinDpi');saveSettings()"></div></div>
+            <div class="row"><label class="lbl">加深 γ</label><div class="rr ctrl"><input type="range" id="enhanceGamma" min="0.8" max="2.5" step="0.1" value="1.4" oninput="syncSlider(this,'enhanceGammaN');saveSettings()"><input type="number" id="enhanceGammaN" min="0.8" max="2.5" step="0.1" value="1.4" style="width:52px" onchange="syncRange(this,'enhanceGamma');saveSettings()"></div></div>
+            <div class="row"><label class="lbl">锐化%</label><div class="rr ctrl"><input type="range" id="enhanceAmount" min="0" max="150" step="5" value="60" oninput="syncSlider(this,'enhanceAmountN');saveSettings()"><input type="number" id="enhanceAmountN" min="0" max="150" step="5" value="60" style="width:52px" onchange="syncRange(this,'enhanceAmount');saveSettings()"></div></div>
+            <div class="row"><label class="lbl">输出质量</label><div class="rr ctrl"><input type="range" id="enhanceQuality" min="70" max="100" step="1" value="90" oninput="syncSlider(this,'enhanceQualityN');saveSettings()"><input type="number" id="enhanceQualityN" min="70" max="100" step="1" value="90" style="width:52px" onchange="syncRange(this,'enhanceQuality');saveSettings()"></div></div>
+          </div>
+          <button class="btn btn-sm" style="width:100%;margin-top:8px" onclick="runClarityAudit()" title="只读文件头算出每张发票折算后的实际打印 DPI，不解码像素">🔍 检查清晰度</button>
+          <div id="claritySummary" style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4"></div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">只对像素不足的扫描件 / 截图生效：折算打印 DPI 低于阈值的发票会在列表打 ⚠ 徽章提示（打印会偏糊）。</div>
         </div>
         <div class="sec">
           <div class="sec-title">✅ 发票查验</div>

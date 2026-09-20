@@ -29,7 +29,6 @@ log = "0.4"
 dirs = "5"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
-imageproc = "0.25"
 ab_glyph = "0.2"
 printpdf = { version = "0.9", default-features = false, features = ["images"] }
 lopdf = "0.39"

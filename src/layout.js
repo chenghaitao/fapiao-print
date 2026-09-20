@@ -684,7 +684,7 @@ function onSlotMouseMove(e) {
     var cy = slotRect.top + slotRect.height / 2;
     var dist = Math.hypot(e.clientX - cx, e.clientY - cy);
     var ratio = dist / _slotDrag.startDist;
-    var newScale = Math.max(0.2, Math.min(3.0, _slotDrag.startScale * ratio));
+    var newScale = Math.max(0.2, Math.min(5.0, _slotDrag.startScale * ratio));
     _slotDrag.fileObj.slotScale = Math.round(newScale * 100) / 100;
 
     // Real-time visual feedback

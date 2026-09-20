@@ -115,7 +115,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **报销单分段模式**（`S.feat.reimburse`，默认段高 120mm）：单列 N 段（N=⌊paperH÷seg⌋），mt/mb 为段内安全边距，裁切线在 k×seg 绝对位置强制绘制（不经 cutline 开关）；发票**左上对齐**——JS `renderPage`、Rust `build_nup_content_stream`/`build_page_ops`、`setSlotAlignment` 基准三处同步；rows/cols/gap/footerMargin 扣除均忽略（UI 置灰 `syncReimburseUI()`），关闭后网格布局原样恢复。
 
-**单票独立调整**：`fileObj.{slotScale, slotOffsetX, slotOffsetY}`，CSS transform 预览 + Rust `SlotSpec` 参数输出。九宫格快速对齐、数字框/滑块滚轮微调、选中后滚轮缩放单票（5%/步）、拖拽约束按实际显示尺寸动态计算、放大上限 3x、编辑态溢出可见（`.selected/.dragging` 时 `overflow:visible`）。持久化：`perFileAdjustments` Map 按文件名匹配，可选开关。
+**单票独立调整**：`fileObj.{slotScale, slotOffsetX, slotOffsetY}`，CSS transform 预览 + Rust `SlotSpec` 参数输出。九宫格快速对齐、数字框/滑块滚轮微调、选中后滚轮缩放单票（5%/步）、拖拽约束按实际显示尺寸动态计算、放大上限 5x、编辑态溢出可见（`.selected/.dragging` 时 `overflow:visible`）。持久化：`perFileAdjustments` Map 按文件名匹配，可选开关。
 
 **预览滚轮交互**（`previewWrap` wheel 三分支，按优先级）：选中槽位+悬停 → 缩放单票；Ctrl+滚轮 → 缩放整体视图；普通滚轮 → 滚动内容，触顶/触底翻页。`_wheelFlipTs` 150ms 节流。
 

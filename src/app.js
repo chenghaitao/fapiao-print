@@ -3003,7 +3003,7 @@ function openInvModal(i) {
     mRF('旋转', '<select id="mRot" style="width:140px;flex:none"><option value="0" ' + (f.rotation === 0 ? 'selected' : '') + '>不旋转</option><option value="90" ' + (f.rotation === 90 ? 'selected' : '') + '>90\u00B0</option><option value="180" ' + (f.rotation === 180 ? 'selected' : '') + '>180\u00B0</option><option value="270" ' + (f.rotation === 270 ? 'selected' : '') + '>270\u00B0</option></select>') +
     '<div style="border-top:1px dashed var(--border);margin-top:4px;padding-top:8px">' +
     '<div style="font-size:11px;font-weight:700;color:var(--text-secondary);margin-bottom:6px">🎯 单票调整</div>' +
-    mRF('缩放', '<input type="number" id="mSlotScale" value="' + Math.round((f.slotScale || 1) * 100) + '" min="20" max="300" style="' + _fw + '"><span style="font-size:11px;color:var(--text-muted);width:16px;flex-shrink:0;text-align:left">%</span>') +
+    mRF('缩放', '<input type="number" id="mSlotScale" value="' + Math.round((f.slotScale || 1) * 100) + '" min="20" max="500" style="' + _fw + '"><span style="font-size:11px;color:var(--text-muted);width:16px;flex-shrink:0;text-align:left">%</span>') +
     mRF('X偏移', '<input type="number" id="mSlotOffX" value="' + (f.slotOffsetX || 0) + '" min="-50" max="50" step="0.5" style="' + _fw + '"><span style="font-size:11px;color:var(--text-muted);width:16px;flex-shrink:0;text-align:left">mm</span>') +
     mRF('Y偏移', '<input type="number" id="mSlotOffY" value="' + (f.slotOffsetY || 0) + '" min="-50" max="50" step="0.5" style="' + _fw + '"><span style="font-size:11px;color:var(--text-muted);width:16px;flex-shrink:0;text-align:left">mm</span>') +
     '</div>' +
@@ -3032,7 +3032,7 @@ function confirmInvModal() {
   f.buyerCreditCode = document.getElementById('mBuyerCreditCode').value;
   f.note = document.getElementById('mNote').value;
   // Per-slot adjustments
-  f.slotScale = Math.max(0.2, Math.min(3.0, (parseInt(document.getElementById('mSlotScale').value) || 100) / 100));
+  f.slotScale = Math.max(0.2, Math.min(5.0, (parseInt(document.getElementById('mSlotScale').value) || 100) / 100));
   f.slotOffsetX = parseFloat(document.getElementById('mSlotOffX').value) || 0;
   f.slotOffsetY = parseFloat(document.getElementById('mSlotOffY').value) || 0;
   closeInvModal(); renderFileList(); updatePreview(); updateAmountSummary();
@@ -3164,7 +3164,7 @@ function updateAdjPanel() {
 function onAdjScaleChange() {
   var f = getSelectedFileObj();
   if (!f) return;
-  f.slotScale = Math.max(0.2, Math.min(3.0, parseInt(document.getElementById('adjScale').value) / 100));
+  f.slotScale = Math.max(0.2, Math.min(5.0, parseInt(document.getElementById('adjScale').value) / 100));
   updatePreview();
 }
 
@@ -3505,9 +3505,17 @@ function toggleFeature(k, btn) {
   if (k === 'pasteShowSig') {
     document.getElementById('pasteSigOpts').style.display = S.feat[k] ? 'block' : 'none';
   }
-  if (k === 'trimWhite' && S.feat[k]) processTrim();
+  if (k === 'trimWhite' && S.feat[k]) {
+    // 清空旧裁剪缓存再重算：否则 processTrim 的 !f.trimmedUrl 判断直接跳过，
+    // 用户先开「裁剪白边」再切「截图裁剪」时只会看到旧的白边结果（issue #38）
+    S.files.forEach(function(f) { clearTrimCache(f); });
+    processTrim();
+  }
   if (k === 'screenshotTrim') {
-    if (S.feat[k]) processTrim();
+    if (S.feat[k]) {
+      S.files.forEach(function(f) { clearTrimCache(f); });
+      processTrim();
+    }
     // 关断截图裁剪：若白边裁剪也关着，恢复原图由 layout/print 的
     // trimmedUrl 使用条件（两开关任一开启）自动保证，无需清缓存
   }
@@ -4501,7 +4509,7 @@ document.getElementById('previewWrap').addEventListener('wheel', function(e) {
         var step = 5;
         var curPct = Math.round((f.slotScale || 1) * 100);
         var newPct = e.deltaY > 0 ? curPct - step : curPct + step;
-        f.slotScale = Math.max(0.2, Math.min(3.0, newPct / 100));
+        f.slotScale = Math.max(0.2, Math.min(5.0, newPct / 100));
         updatePreview();
         updateAdjPanel();
         return;

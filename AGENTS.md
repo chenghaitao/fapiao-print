@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- **版本**: v2.6.5（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json）
+- **版本**: v2.6.6（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json）
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架、无打包）
 - **双版本**: 轻量版 / OCR 版（PP-OCRv6）；Cargo.toml 定义 `ocr` feature，`lib.rs` 按 `#[cfg(feature = "ocr")]` 条件注册命令，OCR 构建用 `tauri.ocr.conf.json` 叠加配置（仅追加 bundle.resources）
 - **目录结构**:
@@ -115,6 +115,8 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **报销单分段模式**（`S.feat.reimburse`，默认段高 120mm）：单列 N 段（N=⌊paperH÷seg⌋），mt/mb 为段内安全边距，裁切线在 k×seg 绝对位置强制绘制（不经 cutline 开关）；发票**左上对齐**——JS `renderPage`、Rust `build_nup_content_stream`/`build_page_ops`、`setSlotAlignment` 基准三处同步；rows/cols/gap/footerMargin 扣除均忽略（UI 置灰 `syncReimburseUI()`），关闭后网格布局原样恢复。
 
+**粘贴单模式**（`S.feat.pasteMode`，v2.6.6）：表单式整页版式，票据只排在装订线上方、签字栏下方；**与报销单分段互斥**（开启互关，`enablePasteMode`/`enableReimburse` 同步 UI）。独立边距（`pasteTop/Bottom/Left/Right`，默认上 20.8mm 装订区 / 下·左·右 4.1mm）+ 装订线（`pasteBindLine` 开关 + `pasteBindText` 文字 + `pasteBindSize` 字号）+ 右下角签字栏（`pasteShowSig` + `pasteSigCols` 列名 / `pasteSigWidth` 宽 / `pasteSigRowH` 表头行高 / `pasteSigBodyH` 填写行高 / `pasteSigGap` 区间距），签字栏留空打印后手写；粘贴单下页码/日期/自定义页脚停用（`getPageSettings` 置空）；Rust `calculate_layout_mm` 与 JS 解析规则逐字对应（预览/PDF 同源）；`applyPastePreset()` 一键恢复标准边距，`resetSettings` 的 `layoutOnly` 分支须同步粘贴单 UI。
+
 **单票独立调整**：`fileObj.{slotScale, slotOffsetX, slotOffsetY}`，CSS transform 预览 + Rust `SlotSpec` 参数输出。九宫格快速对齐、数字框/滑块滚轮微调、选中后滚轮缩放单票（5%/步）、拖拽约束按实际显示尺寸动态计算、放大上限 5x、编辑态溢出可见（`.selected/.dragging` 时 `overflow:visible`）。持久化：`perFileAdjustments` Map 按文件名匹配，可选开关。
 
 **预览滚轮交互**（`previewWrap` wheel 三分支，按优先级）：选中槽位+悬停 → 缩放单票；Ctrl+滚轮 → 缩放整体视图；普通滚轮 → 滚动内容，触顶/触底翻页。`_wheelFlipTs` 150ms 节流。
@@ -154,7 +156,11 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **重复发票识别**：`getDupKey()` 按发票号（`no:`）或 销售方+金额+日期（`sum:` 疑似）生成 key 标记 `_dup`。**安全边界**：自动删除只信任 `no:` key，`sum:` 一律跳过（同日同销售方同金额的真发票会被误判，仅标记交人工核对）；「重复」筛选会覆盖原有勾选（toast 明示）。
 
-**图片文本增强**（`toggleTextEnhance`，纯本地）：Rust `enhance_image()` 读原图全分辨率 → EXIF 烘焙 → 直方图 1%/99% 色阶拉伸 + gamma 1.4 + USM 锐化 → JPEG q92；同一 LUT 应用 RGB 三通道（红章保色），退化图恒等映射防噪点放大。`f._enhanced` + 备份可还原；打印链路走 dataUrl 分支（去重 key 改用 previewUrl）；限图片文件且有 `_filePath`（web 未移植）。
+**图片文本增强**（`toggleTextEnhance`，纯本地）：Rust `enhance_image()` 读原图全分辨率 → EXIF 烘焙 → 直方图 1%/99% 色阶拉伸 + gamma 1.4 + USM 锐化 → JPEG q92；同一 LUT 应用 RGB 三通道（红章保色），退化图恒等映射防噪点放大。`f._enhanced` + 备份可还原；打印链路走 dataUrl 分支（去重 key 改用 previewUrl）；限图片文件且有 `_filePath`（web 未移植）。**核心 `enhance_rgb_inplace()` 与打印自动增强共用（单一真源）**，`normalize_for_jpeg()` 统一 16 位/32F 高精度图。
+
+**清晰度体检与打印自动增强**（v2.6.6，issue #39）：`audit_clarity`（`async fn` + `spawn_blocking`）只读文件头毫秒级算每张发票折算打印 DPI（矢量电子发票 `kind='vector'` 与分辨率无关刻意不参与），低于阈值前端打 `clarity-badge` ⚠ 徽章；`S.feat.autoEnhance` 开启后打印/保存时对折算 DPI < `enhanceMinDpi`（默认 250）的图片自动增强（`EnhanceParams{minDpi, gamma, amountPct, quality}`，滑块越界 clamp 而非拒绝），读原图全分辨率、预览缩略图永不作增强源。
+
+**白边裁剪坐标换算**（v2.6.6，issue #38）：`trimmedBox` 基于预览缩略图（`THUMB_MAX_DIM=600`）坐标，而图片文件 `ow/oh` 是原图尺寸——进 `SlotSpec.trimBox` 前必须按 `ow/tw`、`oh/th` 比例换算到原图坐标（否则 Rust 读全分辨率原图执行裁剪时整体偏移，打印与预览不一致）；PDF/OFD 页面 `ow/oh` 即渲染位图尺寸，无需换算。`trim_image` 为 `async fn` + `spawn_blocking`。
 
 ### 发票识别与数据提取
 

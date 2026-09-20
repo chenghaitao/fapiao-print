@@ -3643,8 +3643,9 @@ pub fn trim_invoice_face_box(img: &image::DynamicImage) -> Option<TrimBox> {
                     }
                 }
             }
-            // 外扩 2%（容忍票面边框/阴影），并整体裁剪回图片边界
-            let ext = (min_dim as f32 * 0.02).max(2.0) as u32;
+            // 外扩 1%（容忍票面边框/阴影；2% 实测让裁剪框比票面大一圈、
+            // "上下留一点"，降到 1%），并整体裁剪回图片边界
+            let ext = (min_dim as f32 * 0.01).max(1.0) as u32;
             let fx0 = x0.saturating_sub(ext);
             let fy0 = y0.saturating_sub(ext);
             let fx1 = (x1 + ext).min(w - 1);
@@ -6140,42 +6141,57 @@ fn image_to_lopdf_xobject(
     source: &ImageSource,
     rotation: i32,
     output_doc: &mut lopdf::Document,
+    // 白边裁剪：(裁剪框像素, 位图基准宽, 位图基准高)。None = 嵌入整图。
+    // 框坐标基于「位图基准」位图；解码尺寸与基准不一致时按比例缩放（图片
+    // 场景前端已换算到原图坐标，此处缩放主要兜底 EXIF 等偏差）。
+    trim: Option<(TrimBox, u32, u32)>,
 ) -> Result<(lopdf::ObjectId, f32, f32), String> {
     let rot = ((rotation % 360) + 360) % 360;
 
     match source {
-        ImageSource::JpegPassthrough { raw_bytes, width, height, num_components } => {
-            if rot == 0 {
-                // No rotation: embed raw JPEG bytes directly (zero re-encoding)
-                let nc = *num_components;
-                let w_pt = *width as f32 * 72.0 / RENDER_DPI as f32;
-                let h_pt = *height as f32 * 72.0 / RENDER_DPI as f32;
-                let xobj_id = build_lopdf_jpeg_xobject(output_doc, raw_bytes, *width, *height, nc);
-                Ok((xobj_id, w_pt, h_pt))
-            } else {
-                // Any rotation (90°/180°/270°): decode → rotate → re-encode
-                let img = image::load_from_memory(raw_bytes)
-                    .map_err(|e| format!("JPEG解码失败: {}", e))?;
-                let rotated = match rot {
-                    90  => img.rotate90(),
-                    180 => img.rotate180(),
-                    270 => img.rotate270(),
-                    _   => img,
-                };
-                let (w, h) = (rotated.width(), rotated.height());
-                let jpeg_bytes = encode_image_to_jpeg_bytes(&rotated)?;
-                let w_pt = w as f32 * 72.0 / RENDER_DPI as f32;
-                let h_pt = h as f32 * 72.0 / RENDER_DPI as f32;
-                let xobj_id = build_lopdf_jpeg_xobject(output_doc, &jpeg_bytes, w, h, 3);
-                Ok((xobj_id, w_pt, h_pt))
-            }
+        ImageSource::JpegPassthrough { raw_bytes, width, height, num_components } if trim.is_none() && rot == 0 => {
+            // No rotation & no crop: embed raw JPEG bytes directly (zero re-encoding)
+            let nc = *num_components;
+            let w_pt = *width as f32 * 72.0 / RENDER_DPI as f32;
+            let h_pt = *height as f32 * 72.0 / RENDER_DPI as f32;
+            let xobj_id = build_lopdf_jpeg_xobject(output_doc, raw_bytes, *width, *height, nc);
+            Ok((xobj_id, w_pt, h_pt))
         }
-        ImageSource::Decoded(img) => {
+        _ => {
+            // Decode source into a DynamicImage first (needed for crop/rotation)
+            let img = match source {
+                ImageSource::JpegPassthrough { raw_bytes, .. } => image::load_from_memory(raw_bytes)
+                    .map_err(|e| format!("JPEG解码失败: {}", e))?,
+                ImageSource::Decoded(img) => img.clone(),
+            };
+            // Apply crop box (scaled from the reference bitmap to actual decoded size)
+            use image::GenericImageView;
+            let cropped = if let Some(([bx, by, bkw, bkh], bmp_w, bmp_h)) = trim {
+                let (dw, dh) = img.dimensions();
+                if bkw > 0 && bkh > 0 && bmp_w > 0 && bmp_h > 0 {
+                    let sx = dw as f32 / bmp_w as f32;
+                    let sy = dh as f32 / bmp_h as f32;
+                    let max_x = dw.saturating_sub(1) as f32;
+                    let max_y = dh.saturating_sub(1) as f32;
+                    let cx = (bx as f32 * sx).round().clamp(0.0, max_x) as u32;
+                    let cy = (by as f32 * sy).round().clamp(0.0, max_y) as u32;
+                    let max_cw = (dw.saturating_sub(cx)) as f32;
+                    let max_ch = (dh.saturating_sub(cy)) as f32;
+                    let cw = (bkw as f32 * sx).round().clamp(1.0, max_cw) as u32;
+                    let ch = (bkh as f32 * sy).round().clamp(1.0, max_ch) as u32;
+                    let img = image::imageops::crop_imm(&img, cx, cy, cw, ch).to_image();
+                    image::DynamicImage::from(img)
+                } else {
+                    img.clone()
+                }
+            } else {
+                img.clone()
+            };
             let rotated = match rot {
-                90  => img.rotate90(),
-                180 => img.rotate180(),
-                270 => img.rotate270(),
-                _   => img.clone(),
+                90  => cropped.rotate90(),
+                180 => cropped.rotate180(),
+                270 => cropped.rotate270(),
+                _   => cropped,
             };
             let (w, h) = (rotated.width(), rotated.height());
             let jpeg_bytes = encode_image_to_jpeg_bytes(&rotated)?;
@@ -6448,7 +6464,13 @@ fn generate_pdf_passthrough(
                         continue;
                     }
                 };
-                match image_to_lopdf_xobject(source, slot.rotation, &mut output_doc) {
+                // 白边裁剪：图片同样按裁剪框裁切（原图坐标由前端换算，此处缩放兜底）。
+                let trim = if request.settings.trim_white.unwrap_or(false) {
+                    file.trim_box.map(|b| (b, file.ow, file.oh))
+                } else {
+                    None
+                };
+                match image_to_lopdf_xobject(source, slot.rotation, &mut output_doc, trim) {
                     Ok(result) => result,
                     Err(e) => {
                         log::warn!("lopdf hybrid: image slot {} encode failed: {}, skipping", file_idx, e);

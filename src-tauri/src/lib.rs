@@ -556,37 +556,43 @@ struct TrimImageResult {
 
 /// Trim white edges from an image (base64 data URL → 裁剪后 data URL + 裁剪框)
 /// `pad`: 裁剪后向外保留的边距（px，前端「留边」配置项；缺省 3，上限 60）
+/// **Async command**: 连通域票面检测 + BFS 对高分辨率图是 CPU 密集操作，
+/// 须跑 spawn_blocking，避免阻塞 IPC 消息泵（AGENTS 硬性规则 3）。
 #[command]
-fn trim_image(data_url: String, pad: Option<u32>) -> Result<TrimImageResult, String> {
+async fn trim_image(data_url: String, pad: Option<u32>) -> Result<TrimImageResult, String> {
     use base64::Engine;
     use std::io::Cursor;
 
-    let img = pdf_engine::decode_base64_image(&data_url)
-        .map_err(|e| format!("解码失败: {}", e))?;
-    let pad = pad.unwrap_or(pdf_engine::TRIM_PAD_DEFAULT).min(pdf_engine::TRIM_PAD_MAX);
-    let (mut trimmed, mut trim_box) = pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad);
-    // 白边裁剪无效（四周都有内容，常见于应用界面截图）时，尝试「截图票面检测」：
-    // 定位灰底内容区中的票面大块浅色区域（issue #38/#39），裁掉状态栏/标题栏等 UI
-    if trim_box.is_none() {
-        if let Some(box_) = pdf_engine::trim_invoice_face_box(&img) {
-            let [x, y, cw, ch] = box_;
-            let rgba = img.to_rgba8();
-            let cropped = image::imageops::crop_imm(&rgba, x, y, cw, ch);
-            trimmed = image::DynamicImage::from(cropped.to_image());
-            trim_box = Some(box_);
+    tauri::async_runtime::spawn_blocking(move || {
+        let img = pdf_engine::decode_base64_image(&data_url)
+            .map_err(|e| format!("解码失败: {}", e))?;
+        let pad = pad.unwrap_or(pdf_engine::TRIM_PAD_DEFAULT).min(pdf_engine::TRIM_PAD_MAX);
+        let (mut trimmed, mut trim_box) = pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad);
+        // 白边裁剪无效（四周都有内容，常见于应用界面截图）时，尝试「截图票面检测」：
+        // 定位灰底内容区中的票面大块浅色区域（issue #38/#39），裁掉状态栏/标题栏等 UI
+        if trim_box.is_none() {
+            if let Some(box_) = pdf_engine::trim_invoice_face_box(&img) {
+                let [x, y, cw, ch] = box_;
+                let rgba = img.to_rgba8();
+                let cropped = image::imageops::crop_imm(&rgba, x, y, cw, ch);
+                trimmed = image::DynamicImage::from(cropped.to_image());
+                trim_box = Some(box_);
+            }
         }
-    }
 
-    // Encode back to PNG base64
-    let mut buf = Cursor::new(Vec::new());
-    trimmed.write_to(&mut buf, image::ImageFormat::Png)
-        .map_err(|e| format!("PNG编码失败: {}", e))?;
+        // Encode back to PNG base64
+        let mut buf = Cursor::new(Vec::new());
+        trimmed.write_to(&mut buf, image::ImageFormat::Png)
+            .map_err(|e| format!("PNG编码失败: {}", e))?;
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
-    Ok(TrimImageResult {
-        data_url: format!("data:image/png;base64,{}", b64),
-        trim_box,
+        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+        Ok(TrimImageResult {
+            data_url: format!("data:image/png;base64,{}", b64),
+            trim_box,
+        })
     })
+    .await
+    .map_err(|e| format!("裁剪任务失败: {}", e))?
 }
 
 /// Enhance a faint/blurry invoice image (levels stretch + gamma + unsharp mask).

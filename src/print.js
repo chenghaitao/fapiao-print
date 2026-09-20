@@ -120,8 +120,24 @@ function buildLayoutRequest(files, settings) {
       // 白边裁剪框（像素、原点左上，基于该文件渲染位图 ow × oh）。
       // PDF 直通路径用它做矢量裁切——否则矢量直通会嵌入整页原件，
       // 出现"预览裁了白边、打印没裁"。
+      // 注意：图片文件 ow/oh 是原图尺寸，而 trimmedBox 基于预览缩略图
+      //（THUMB_MAX_DIM=600）坐标——须换算到原图坐标，Rust 读全分辨率原图
+      // 才能对齐；PDF/OFD 页面 ow/oh 即渲染位图尺寸，无需换算。
       if (fileObj.trimmedBox) {
-        spec.trimBox = [fileObj.trimmedBox.x, fileObj.trimmedBox.y, fileObj.trimmedBox.w, fileObj.trimmedBox.h];
+        var tb = fileObj.trimmedBox;
+        var tw = fileObj.img ? fileObj.img.naturalWidth : 0;
+        var th = fileObj.img ? fileObj.img.naturalHeight : 0;
+        if (tw > 0 && th > 0 && fileObj.ow > 0 && fileObj.oh > 0 &&
+            (tw !== fileObj.ow || th !== fileObj.oh)) {
+          spec.trimBox = [
+            Math.round(tb.x * fileObj.ow / tw),
+            Math.round(tb.y * fileObj.oh / th),
+            Math.round(tb.w * fileObj.ow / tw),
+            Math.round(tb.h * fileObj.oh / th)
+          ];
+        } else {
+          spec.trimBox = [tb.x, tb.y, tb.w, tb.h];
+        }
       }
       fileSpecs.push(spec);
     }

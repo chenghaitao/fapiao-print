@@ -556,26 +556,32 @@ struct TrimImageResult {
 
 /// Trim white edges from an image (base64 data URL → 裁剪后 data URL + 裁剪框)
 /// `pad`: 裁剪后向外保留的边距（px，前端「留边」配置项；缺省 3，上限 60）
+/// **Async command**: 白边检测是 CPU 密集操作，须跑 spawn_blocking，
+/// 避免阻塞 IPC 消息泵（AGENTS 硬性规则 3）。
 #[command]
-fn trim_image(data_url: String, pad: Option<u32>) -> Result<TrimImageResult, String> {
+async fn trim_image(data_url: String, pad: Option<u32>) -> Result<TrimImageResult, String> {
     use base64::Engine;
     use std::io::Cursor;
 
-    let img = pdf_engine::decode_base64_image(&data_url)
-        .map_err(|e| format!("解码失败: {}", e))?;
-    let pad = pad.unwrap_or(pdf_engine::TRIM_PAD_DEFAULT).min(pdf_engine::TRIM_PAD_MAX);
-    let (trimmed, trim_box) = pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad);
+    tauri::async_runtime::spawn_blocking(move || {
+        let img = pdf_engine::decode_base64_image(&data_url)
+            .map_err(|e| format!("解码失败: {}", e))?;
+        let pad = pad.unwrap_or(pdf_engine::TRIM_PAD_DEFAULT).min(pdf_engine::TRIM_PAD_MAX);
+        let (trimmed, trim_box) = pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad);
 
-    // Encode back to PNG base64
-    let mut buf = Cursor::new(Vec::new());
-    trimmed.write_to(&mut buf, image::ImageFormat::Png)
-        .map_err(|e| format!("PNG编码失败: {}", e))?;
+        // Encode back to PNG base64
+        let mut buf = Cursor::new(Vec::new());
+        trimmed.write_to(&mut buf, image::ImageFormat::Png)
+            .map_err(|e| format!("PNG编码失败: {}", e))?;
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
-    Ok(TrimImageResult {
-        data_url: format!("data:image/png;base64,{}", b64),
-        trim_box,
+        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+        Ok(TrimImageResult {
+            data_url: format!("data:image/png;base64,{}", b64),
+            trim_box,
+        })
     })
+    .await
+    .map_err(|e| format!("裁剪任务失败: {}", e))?
 }
 
 /// Enhance a faint/blurry invoice image (levels stretch + gamma + unsharp mask).
@@ -592,6 +598,17 @@ async fn enhance_image(file_path: String) -> Result<String, String> {
     })
     .await
     .map_err(|e| format!("图片增强任务失败: {}", e))?
+}
+
+/// 清晰度体检：只读文件头算出每张发票折算后的实际打印 DPI，
+/// 不解码像素，毫秒级。矢量电子发票标记 vector（与分辨率无关）。
+#[command]
+async fn audit_clarity(request: LayoutRenderRequest) -> Result<Vec<pdf_engine::ClarityInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(pdf_engine::audit_clarity(&request))
+    })
+    .await
+    .map_err(|e| format!("清晰度体检任务失败: {}", e))?
 }
 
 /// Generate PDF from layout request (files + pages + settings).
@@ -1499,6 +1516,7 @@ pub fn run() {
         show_window,
         trim_image,
         enhance_image,
+        audit_clarity,
         generate_pdf_from_layout,
         print_pdf_file,
         parse_ofd,
@@ -1538,6 +1556,7 @@ pub fn run() {
         show_window,
         trim_image,
         enhance_image,
+        audit_clarity,
         generate_pdf_from_layout,
         print_pdf_file,
         parse_ofd,

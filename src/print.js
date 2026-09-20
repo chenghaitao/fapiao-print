@@ -54,10 +54,24 @@ function updatePdfCache(request, pdfPath) {
  * skipping the expensive base64 encode→IPC→decode round-trip.
  * For rendered PDF pages and OFD images (no disk path), dataUrl is used.
  */
+/**
+ * 源文件唯一 key：清晰度体检/缓存等按它把结果反查回 fileObj。
+ * 用 _filePath 时更稳定（预览图 URL 是内存 blob，会话间会变）；OFD 回退
+ * previewUrl（_filePath 多页共享）；增强图也走 previewUrl（同路径可能存在
+ * 原图（filePath 分支）与增强图（dataUrl 分支）两份 entry）。
+ */
+function fileSpecKey(fileObj) {
+  if (!fileObj) return '';
+  return (fileObj.type !== 'ofd' && fileObj._filePath && !fileObj._enhanced)
+    ? fileObj._filePath
+    : (fileObj.previewUrl || '');
+}
+
 function buildLayoutRequest(files, settings) {
   // 1. Collect unique file specs
   var fileMap = {};
   var fileSpecs = [];
+  var specKeys = [];
 
   function getFileIndex(fileObj) {
     if (!fileObj) return null;
@@ -69,10 +83,11 @@ function buildLayoutRequest(files, settings) {
     // For OFD, fall back to previewUrl since _filePath is shared across pages.
     // Enhanced files also key by previewUrl: same path may exist as both
     // original (filePath branch) and enhanced (dataUrl branch) entries.
-    var key = (fileObj.type !== 'ofd' && fileObj._filePath && !fileObj._enhanced) ? fileObj._filePath : (fileObj.previewUrl || '');
+    var key = fileSpecKey(fileObj);
     if (!key) return null;
     if (!(key in fileMap)) {
       fileMap[key] = fileSpecs.length;
+      specKeys[fileMap[key]] = key;
       var spec = {
         ow: fileObj.ow || 0,
         oh: fileObj.oh || 0,
@@ -105,8 +120,24 @@ function buildLayoutRequest(files, settings) {
       // 白边裁剪框（像素、原点左上，基于该文件渲染位图 ow × oh）。
       // PDF 直通路径用它做矢量裁切——否则矢量直通会嵌入整页原件，
       // 出现"预览裁了白边、打印没裁"。
+      // 注意：图片文件 ow/oh 是原图尺寸，而 trimmedBox 基于预览缩略图
+      //（THUMB_MAX_DIM=600）坐标——须换算到原图坐标，Rust 读全分辨率原图
+      // 才能对齐；PDF/OFD 页面 ow/oh 即渲染位图尺寸，无需换算。
       if (fileObj.trimmedBox) {
-        spec.trimBox = [fileObj.trimmedBox.x, fileObj.trimmedBox.y, fileObj.trimmedBox.w, fileObj.trimmedBox.h];
+        var tb = fileObj.trimmedBox;
+        var tw = fileObj.img ? fileObj.img.naturalWidth : 0;
+        var th = fileObj.img ? fileObj.img.naturalHeight : 0;
+        if (tw > 0 && th > 0 && fileObj.ow > 0 && fileObj.oh > 0 &&
+            (tw !== fileObj.ow || th !== fileObj.oh)) {
+          spec.trimBox = [
+            Math.round(tb.x * fileObj.ow / tw),
+            Math.round(tb.y * fileObj.oh / th),
+            Math.round(tb.w * fileObj.ow / tw),
+            Math.round(tb.h * fileObj.oh / th)
+          ];
+        } else {
+          spec.trimBox = [tb.x, tb.y, tb.w, tb.h];
+        }
       }
       fileSpecs.push(spec);
     }
@@ -152,7 +183,9 @@ function buildLayoutRequest(files, settings) {
   for (var k in settings) {
     if (!(k in _cacheExclude)) layoutSettings[k] = settings[k];
   }
-  return { files: fileSpecs, pages: pageSpecs, settings: layoutSettings };
+  // _specKeys 是纯前端字段（与 fileSpecs 同序），供清晰度体检把结果反查回 fileObj。
+  // Rust 的 LayoutRenderRequest 不认识它，会被 serde 忽略。
+  return { files: fileSpecs, pages: pageSpecs, settings: layoutSettings, _specKeys: specKeys };
 }
 
 /**
@@ -696,6 +729,19 @@ function fallbackPrint(files, s) {
     html += '<div class="page">';
     var mt = s.marginTop, mb = s.marginBottom, ml = s.marginLeft, mr = s.marginRight;
     var fm = s.footerMargin || 0;
+    // 粘贴单：独立边距（上=装订区高）+ 底部签字栏预留带，与 calculateLayout/Rust 一致
+    var sigPx = 0;
+    if (s.pasteMode) {
+      mt = s.pasteTop != null ? s.pasteTop : 20.8;
+      mb = s.pasteBottom != null ? s.pasteBottom : 4.1;
+      ml = s.pasteLeft != null ? s.pasteLeft : 4.1;
+      mr = s.pasteRight != null ? s.pasteRight : 4.1;
+      if (s.pasteShowSig !== false) {
+        sigPx = (s.pasteSigRowH != null ? s.pasteSigRowH : 8)
+          + (s.pasteSigBodyH != null ? s.pasteSigBodyH : 14)
+          + (s.pasteSigGap != null ? s.pasteSigGap : 2);
+      }
+    }
     var isReimb = !!s.reimburseMode;
     var segMm = s.reimburseHeight || 120;
     var segCount = isReimb ? Math.max(1, Math.floor(s.paperH / segMm)) : 0;
@@ -708,7 +754,7 @@ function fallbackPrint(files, s) {
       slotH = Math.max(10, segMm - mt - mb);
     } else {
       slotW = (s.paperW - s.cols * (ml + mr) - (s.cols - 1) * s.gapH) / s.cols;
-      slotH = (s.paperH - s.rows * (mt + mb) - (s.rows - 1) * s.gapV - fm) / s.rows;
+      slotH = (s.paperH - s.rows * (mt + mb) - (s.rows - 1) * s.gapV - fm - sigPx) / s.rows;
     }
     // Draw cut lines (vertical + horizontal) between slots
     if (isReimb) {
@@ -716,12 +762,13 @@ function fallbackPrint(files, s) {
       for (var k = 1; k <= segCount; k++) {
         html += '<div class="cutline-h" style="top:' + (k * segMm) + 'mm"></div>';
       }
-    } else if (s.cutline && (s.cols > 1 || s.rows > 1)) {
+    } else if (s.cutline && (s.cols > 1 || s.rows > 1 || sigPx > 0)) {
       var hasFb = s.pageNum || s.printDate || (s.footerText || '').trim();
-      var vLineH = hasFb ? (s.paperH - fm) : s.paperH;
+      // 粘贴单：垂直线止于签字栏上沿（多让一个下边距，不切进签字栏）
+      var vLineEnd = (hasFb || sigPx > 0) ? (s.paperH - fm - (sigPx > 0 ? sigPx + mb : 0)) : s.paperH;
       for (var c = 1; c < s.cols; c++) {
         var x = ml + c * (slotW + ml + mr + s.gapH) - s.gapH / 2;
-        html += '<div class="cutline-v" style="left:' + x + 'mm;height:' + vLineH + 'mm"></div>';
+        html += '<div class="cutline-v" style="left:' + x + 'mm;height:' + vLineEnd + 'mm"></div>';
       }
       for (var r = 1; r < s.rows; r++) {
         var y = mt + r * (slotH + mt + mb + s.gapV) - s.gapV / 2;
@@ -789,6 +836,8 @@ function fallbackPrint(files, s) {
       if (s.pageNum || s.printDate) footerBottomMm += lineHeightMm;
       html += '<div style="position:absolute;bottom:' + footerBottomMm + 'mm;left:0;right:0;text-align:center;font-size:10px;color:#94a3b8">' + escHtml(s.footerText) + '</div>';
     }
+    // 粘贴单：装订线 + 右下角签字栏（毫米单位，与预览同源）
+    html += buildPasteSheetHtml(s, 1, 'mm');
     html += '</div>';
   });
   html += '</body></html>';

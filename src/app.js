@@ -80,7 +80,9 @@ var S = {
     pdfTextEnabled: true,
     customFM: false,
     fileListMemory: false,
-    autoDedup: false
+    autoDedup: false,
+    autoEnhance: false,
+    pasteMode: false, pasteBindLine: true, pasteShowSig: true
   }
 };
 
@@ -2335,6 +2337,68 @@ function removeDuplicates(silent) {
   return removed;
 }
 
+// =====================================================
+// 清晰度体检（issue #39）
+// =====================================================
+// key（fileSpecKey 的结果）→ ClarityInfo。点「检查清晰度」后填充。
+var _clarityMap = {};
+
+/**
+ * 清晰度徽章 —— 只对像素不足的位图源显示。
+ * 矢量电子发票（kind='vector'）与分辨率无关，刻意不显示。
+ */
+function buildClarityBadge(f) {
+  var c = _clarityMap[fileSpecKey(f)];
+  if (!c || !c.low) return '';
+  var dpi = c.effectiveDpi != null ? Math.round(c.effectiveDpi) : 0;
+  return '<span class="clarity-badge" title="折算打印 DPI 约 ' + dpi
+    + '（源 ' + c.srcW + '×' + c.srcH + 'px），低于阈值，打印会偏糊">⚠ ' + dpi + ' DPI</span>';
+}
+
+/**
+ * 只读文件头算出每张发票折算后的实际打印 DPI（不解码像素，毫秒级），
+ * 让用户在上纸之前就知道哪张会糊。
+ */
+function runClarityAudit() {
+  if (!isTauri || !invoke) { toast('清晰度体检需要桌面版'); return; }
+  var files = getActiveFiles();
+  if (!files.length) { toast('请先添加发票'); return; }
+  var req;
+  try { req = buildLayoutRequest(files, getSettings()); }
+  catch (e) { toast('构建版式失败：' + e); return; }
+
+  invoke('audit_clarity', { request: req }).then(function (list) {
+    var keys = req._specKeys || [];
+    _clarityMap = {};
+    var low = 0;
+    (list || []).forEach(function (c) {
+      var k = keys[c.index];
+      if (!k) return;
+      _clarityMap[k] = c;
+      if (c.low) low++;
+    });
+    renderFileList();
+
+    var el = document.getElementById('claritySummary');
+    if (el) {
+      if (!low) {
+        el.textContent = '✓ 全部达标（矢量电子发票不计入）';
+      } else {
+        var names = [];
+        files.forEach(function (f) {
+          var c = _clarityMap[fileSpecKey(f)];
+          if (c && c.low) names.push(escHtml(f.name) + '（' + Math.round(c.effectiveDpi) + ' DPI）');
+        });
+        el.innerHTML = '<span style="color:var(--danger)">' + low + ' 张低于阈值</span>：'
+          + names.slice(0, 5).join('、') + (names.length > 5 ? ' 等' : '');
+      }
+    }
+    toast(low ? (low + ' 张发票清晰度不足') : '清晰度检查完成，全部达标');
+  }).catch(function (e) {
+    toast('清晰度检查失败：' + e);
+  });
+}
+
 function renderFileList() {
   updateDuplicateMarks();
   var list = document.getElementById('fileList');
@@ -2397,7 +2461,7 @@ function renderFileList() {
         '<div class="file-thumb">' + gthumb + '<span class="file-index">' + (i + 1) + '</span><div class="type-badge">' + gtype + '</div>' +
         '<div class="file-check ' + (f.checked ? 'checked' : '') + '" onclick="togCheck(' + i + ')"></div>' +
         '<div class="card-actions">' + gacts + '</div></div>' +
-        '<div class="card-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + '</div>' +
+        '<div class="card-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + buildClarityBadge(f) + '</div>' +
         gseller +
         '<div class="card-meta">' + gpd + gab + gcb + grb + gdupb + gsize + '</div></div>';
     }
@@ -2443,7 +2507,7 @@ function renderFileList() {
       '<div class="file-check ' + (f.checked ? 'checked' : '') + '" onclick="togCheck(' + i + ')"></div>' +
       '<div class="file-index" style="width:' + indexWidth + '">' + (i + 1) + '</div>' +
       '<div class="file-thumb">' + thumbContent + '<div class="type-badge">' + typeBadgeText + '</div></div>' +
-      '<div class="file-info"><div class="file-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + '</div>' + sellerRow + '<div class="file-meta">' + metaActions + '</div></div>' +
+      '<div class="file-info"><div class="file-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + buildClarityBadge(f) + '</div>' + sellerRow + '<div class="file-meta">' + metaActions + '</div></div>' +
     '</div>';
   }).join('');
 
@@ -3093,7 +3157,7 @@ function openInvModal(i) {
     mRF('旋转', '<select id="mRot" style="width:140px;flex:none"><option value="0" ' + (f.rotation === 0 ? 'selected' : '') + '>不旋转</option><option value="90" ' + (f.rotation === 90 ? 'selected' : '') + '>90\u00B0</option><option value="180" ' + (f.rotation === 180 ? 'selected' : '') + '>180\u00B0</option><option value="270" ' + (f.rotation === 270 ? 'selected' : '') + '>270\u00B0</option></select>') +
     '<div style="border-top:1px dashed var(--border);margin-top:4px;padding-top:8px">' +
     '<div style="font-size:11px;font-weight:700;color:var(--text-secondary);margin-bottom:6px">🎯 单票调整</div>' +
-    mRF('缩放', '<input type="number" id="mSlotScale" value="' + Math.round((f.slotScale || 1) * 100) + '" min="20" max="300" style="' + _fw + '"><span style="font-size:11px;color:var(--text-muted);width:16px;flex-shrink:0;text-align:left">%</span>') +
+    mRF('缩放', '<input type="number" id="mSlotScale" value="' + Math.round((f.slotScale || 1) * 100) + '" min="20" max="500" style="' + _fw + '"><span style="font-size:11px;color:var(--text-muted);width:16px;flex-shrink:0;text-align:left">%</span>') +
     mRF('X偏移', '<input type="number" id="mSlotOffX" value="' + (f.slotOffsetX || 0) + '" min="-50" max="50" step="0.5" style="' + _fw + '"><span style="font-size:11px;color:var(--text-muted);width:16px;flex-shrink:0;text-align:left">mm</span>') +
     mRF('Y偏移', '<input type="number" id="mSlotOffY" value="' + (f.slotOffsetY || 0) + '" min="-50" max="50" step="0.5" style="' + _fw + '"><span style="font-size:11px;color:var(--text-muted);width:16px;flex-shrink:0;text-align:left">mm</span>') +
     '</div>' +
@@ -3122,7 +3186,7 @@ function confirmInvModal() {
   f.buyerCreditCode = document.getElementById('mBuyerCreditCode').value;
   f.note = document.getElementById('mNote').value;
   // Per-slot adjustments
-  f.slotScale = Math.max(0.2, Math.min(3.0, (parseInt(document.getElementById('mSlotScale').value) || 100) / 100));
+  f.slotScale = Math.max(0.2, Math.min(5.0, (parseInt(document.getElementById('mSlotScale').value) || 100) / 100));
   f.slotOffsetX = parseFloat(document.getElementById('mSlotOffX').value) || 0;
   f.slotOffsetY = parseFloat(document.getElementById('mSlotOffY').value) || 0;
   closeInvModal(); renderFileList(); updatePreview(); updateAmountSummary();
@@ -3254,7 +3318,7 @@ function updateAdjPanel() {
 function onAdjScaleChange() {
   var f = getSelectedFileObj();
   if (!f) return;
-  f.slotScale = Math.max(0.2, Math.min(3.0, parseInt(document.getElementById('adjScale').value) / 100));
+  f.slotScale = Math.max(0.2, Math.min(5.0, parseInt(document.getElementById('adjScale').value) / 100));
   updatePreview();
 }
 
@@ -3580,7 +3644,26 @@ function toggleFeature(k, btn) {
 
   if (k === 'watermark') document.getElementById('wmOpts').style.display = S.feat[k] ? 'block' : 'none';
   if (k === 'trimWhite') document.getElementById('trimPadOpts').style.display = S.feat[k] ? 'block' : 'none';
-  if (k === 'trimWhite' && S.feat[k]) processTrim();
+  if (k === 'autoEnhance') document.getElementById('enhanceOpts').style.display = S.feat[k] ? 'block' : 'none';
+  if (k === 'pasteMode') {
+    document.getElementById('pasteOpts').style.display = S.feat[k] ? 'block' : 'none';
+    // 粘贴单与报销单分段互斥：两者都要接管整页版式
+    if (S.feat[k] && S.feat.reimburse) {
+      S.feat.reimburse = false;
+      document.getElementById('toggleReimburse').classList.remove('on');
+      syncReimburseUI();
+      toast('粘贴单模式已接管版式，已关闭报销单模式');
+    }
+  }
+  if (k === 'pasteShowSig') {
+    document.getElementById('pasteSigOpts').style.display = S.feat[k] ? 'block' : 'none';
+  }
+  if (k === 'trimWhite' && S.feat[k]) {
+    // 开关切换时清空旧裁剪缓存再重算：否则 processTrim 的 !f.trimmedUrl
+    // 判断直接跳过，切换裁剪模式只会看到旧结果
+    S.files.forEach(function(f) { clearTrimCache(f); });
+    processTrim();
+  }
   if (k === 'footer') {
     document.getElementById('footerOpts').style.display = S.feat[k] ? 'block' : 'none';
   }
@@ -3766,7 +3849,7 @@ function maybeAutoTrim() {
 
 async function processTrim() {
   if (!isTauri || !invoke) {
-    toast('白边裁剪需要桌面版');
+    toast('裁剪需要桌面版');
     return;
   }
   showLoading('裁剪白边...');
@@ -3823,6 +3906,27 @@ function getSettings() {
     customScale: parseFloat(document.getElementById('customScale').value) / 100,
     colorMode: document.getElementById('colorMode').value,
     globalRotation: document.getElementById('globalRotation').value,
+    // 清晰度优化（issue #39）：自动增强开关与参数（threshold 无 UI，Rust 用默认 8）
+    autoEnhance: !!S.feat.autoEnhance,
+    enhanceMinDpi: parseFloat(document.getElementById('enhanceMinDpi').value) || 250,
+    enhanceGamma: parseFloat(document.getElementById('enhanceGamma').value) || null,
+    enhanceAmount: parseFloat(document.getElementById('enhanceAmount').value) || null,
+    enhanceQuality: parseFloat(document.getElementById('enhanceQuality').value) || null,
+    // 粘贴单模式：独立边距 + 装订线 + 签字栏参数
+    pasteMode: !!S.feat.pasteMode,
+    pasteTop: parseFloat(document.getElementById('pasteTop').value) || 20.8,
+    pasteBottom: parseFloat(document.getElementById('pasteBottom').value) || 4.1,
+    pasteLeft: parseFloat(document.getElementById('pasteLeft').value) || 4.1,
+    pasteRight: parseFloat(document.getElementById('pasteRight').value) || 4.1,
+    pasteBindLine: S.feat.pasteBindLine,
+    pasteBindText: document.getElementById('pasteBindText').value,
+    pasteBindSize: parseFloat(document.getElementById('pasteBindSize').value) || 4,
+    pasteShowSig: S.feat.pasteShowSig,
+    pasteSigCols: document.getElementById('pasteSigCols').value,
+    pasteSigWidth: parseFloat(document.getElementById('pasteSigWidth').value) || 80,
+    pasteSigRowH: parseFloat(document.getElementById('pasteSigRowH').value) || 8,
+    pasteSigBodyH: parseFloat(document.getElementById('pasteSigBodyH').value) || 14,
+    pasteSigGap: parseFloat(document.getElementById('pasteSigGap').value) || 2,
     cutline: S.feat.cutline, number: S.feat.number, border: S.feat.border,
     borderWidth: 1, borderColor: '#000000', trimWhite: S.feat.trimWhite,
     trimPad: getTrimPad(),
@@ -3833,8 +3937,10 @@ function getSettings() {
     watermarkColor: document.getElementById('wmColor').value,
     watermarkAngle: parseFloat(document.getElementById('wmAngle').value),
     watermarkSize: parseFloat(document.getElementById('wmSize').value),
-    pageNum: S.feat.pageNum, printDate: S.feat.printDate,
-    footerText: S.feat.footer ? document.getElementById('footerText').value : '',
+    pageNum: S.feat.pageNum && !S.feat.pasteMode, printDate: S.feat.printDate && !S.feat.pasteMode,
+    // 粘贴单是一张表单，页码/日期/自定义页脚会与装订线/签字栏打架，本模式下停用
+    //（与魔改版语义一致；Rust 端 slot_size_mm 对 paste 不叠加页脚扣除）
+    footerText: S.feat.footer && !S.feat.pasteMode ? document.getElementById('footerText').value : '',
     footerMargin: (S.feat.pageNum || S.feat.printDate || S.feat.footer) ? (S.feat.customFM ? parseFloat(document.getElementById('footerMargin').value) || 0 : _autoFooterMargin()) : 0,
     customFm: S.feat.customFM,
     copies: parseInt(document.getElementById('copies').value) || 1,
@@ -4014,7 +4120,7 @@ function saveSettings() {
     printerName: document.getElementById('printerSel').value || null,
     feat: {}
   };
-  var featKeys = ['cutline','number','border','trimWhite','watermark','collate','duplex','pageNum','printDate','footer','autoOpenPdf','customFM','slotAdjMemory','fileListMemory','autoDedup','reimburse','copyBadge'];
+  var featKeys = ['cutline','number','border','trimWhite','watermark','collate','duplex','pageNum','printDate','footer','autoOpenPdf','customFM','slotAdjMemory','fileListMemory','autoDedup','reimburse','copyBadge','autoEnhance','pasteMode','pasteBindLine','pasteShowSig'];
   featKeys.forEach(function(k) { o.feat[k] = S.feat[k]; });
   o.reimburseHeight = document.getElementById('reimburseHeight').value;
   o.trimPad = getTrimPad();
@@ -4046,6 +4152,23 @@ function saveSettings() {
   o.wmSize = document.getElementById('wmSize').value;
   o.footerText = document.getElementById('footerText').value;
   o.footerMargin = document.getElementById('footerMargin').value;
+  // 清晰度优化参数（始终保存，开关关闭时保留用户设置）
+  o.enhanceMinDpi = document.getElementById('enhanceMinDpi').value;
+  o.enhanceGamma = document.getElementById('enhanceGamma').value;
+  o.enhanceAmount = document.getElementById('enhanceAmount').value;
+  o.enhanceQuality = document.getElementById('enhanceQuality').value;
+  // 粘贴单参数（始终保存）
+  o.pasteTop = document.getElementById('pasteTop').value;
+  o.pasteBottom = document.getElementById('pasteBottom').value;
+  o.pasteLeft = document.getElementById('pasteLeft').value;
+  o.pasteRight = document.getElementById('pasteRight').value;
+  o.pasteBindText = document.getElementById('pasteBindText').value;
+  o.pasteBindSize = document.getElementById('pasteBindSize').value;
+  o.pasteSigCols = document.getElementById('pasteSigCols').value;
+  o.pasteSigWidth = document.getElementById('pasteSigWidth').value;
+  o.pasteSigRowH = document.getElementById('pasteSigRowH').value;
+  o.pasteSigBodyH = document.getElementById('pasteSigBodyH').value;
+  o.pasteSigGap = document.getElementById('pasteSigGap').value;
   if (_summaryActiveCols && _summaryActiveCols.length > 0) {
     o.summaryCols = _summaryActiveCols;
   }
@@ -4135,7 +4258,11 @@ function loadSettings() {
       fileListMemory: 'toggleFileListMemory',
       autoDedup: 'toggleAutoDedup',
       reimburse: 'toggleReimburse',
-      copyBadge: 'toggleCopyBadge'
+      copyBadge: 'toggleCopyBadge',
+      autoEnhance: 'toggleAutoEnhance',
+      pasteMode: 'togglePasteMode',
+      pasteBindLine: 'togglePasteBindLine',
+      pasteShowSig: 'togglePasteSig'
     };
     Object.keys(featMap).forEach(function(k) {
       if (o.feat[k] != null) {
@@ -4153,6 +4280,15 @@ function loadSettings() {
     if (S.feat.footer) {
       document.getElementById('footerOpts').style.display = 'block';
     }
+    if (S.feat.autoEnhance) {
+      document.getElementById('enhanceOpts').style.display = 'block';
+    }
+    if (S.feat.pasteMode) {
+      document.getElementById('pasteOpts').style.display = 'block';
+    }
+    if (S.feat.pasteShowSig) {
+      document.getElementById('pasteSigOpts').style.display = 'block';
+    }
     var lineCount = (S.feat.pageNum || S.feat.printDate ? 1 : 0) + (S.feat.footer ? 1 : 0);
     if (S.feat.customFM && lineCount > 0) {
       document.getElementById('customFMRow').style.display = 'flex';
@@ -4168,6 +4304,21 @@ function loadSettings() {
   if (o.wmColor) document.getElementById('wmColor').value = o.wmColor;
   if (o.wmAngle != null) { document.getElementById('wmAngle').value = o.wmAngle; document.getElementById('wmAngleN').value = o.wmAngle; }
   if (o.wmSize != null) { document.getElementById('wmSize').value = o.wmSize; document.getElementById('wmSizeN').value = o.wmSize; }
+  // 清晰度优化参数（阈值与四个增强滑块，含数字副本）
+  var enhanceIds = { enhanceMinDpi: 1, enhanceGamma: 1, enhanceAmount: 1, enhanceQuality: 1 };
+  Object.keys(enhanceIds).forEach(function(id) {
+    if (o[id] != null) {
+      document.getElementById(id).value = o[id];
+      var nEl = document.getElementById(id + 'N');
+      if (nEl) nEl.value = o[id];
+    }
+  });
+  // 粘贴单参数恢复
+  var pasteIds = ['pasteTop','pasteBottom','pasteLeft','pasteRight','pasteBindText','pasteBindSize','pasteBindSizeN','pasteSigCols','pasteSigWidth','pasteSigRowH','pasteSigBodyH','pasteSigGap'];
+  pasteIds.forEach(function(id) {
+    var k = id.replace(/N$/, '');
+    if (o[k] != null) document.getElementById(id).value = o[k];
+  });
   if (o.footerText != null) document.getElementById('footerText').value = o.footerText;
   if (o.footerMargin != null) {
     document.getElementById('footerMargin').value = o.footerMargin;
@@ -4221,6 +4372,13 @@ function togglePref(k, btn) {
 function toggleReimburseMode(btn) {
   S.feat.reimburse = !S.feat.reimburse;
   btn.classList.toggle('on', S.feat.reimburse);
+  // 报销单与粘贴单互斥：开启报销单时关闭粘贴单
+  if (S.feat.reimburse && S.feat.pasteMode) {
+    S.feat.pasteMode = false;
+    document.getElementById('togglePasteMode').classList.remove('on');
+    document.getElementById('pasteOpts').style.display = 'none';
+    toast('报销单模式已接管版式，已关闭粘贴单模式');
+  }
   syncReimburseUI();
   saveSettings();
   updatePreview();
@@ -4237,6 +4395,16 @@ function syncReimburseUI() {
       el.style.pointerEvents = on ? 'none' : '';
     }
   });
+}
+
+// 粘贴单标准边距：上 2.08cm（装订区）、下/左/右 0.41cm
+function applyPastePreset() {
+  document.getElementById('pasteTop').value = 20.8;
+  document.getElementById('pasteBottom').value = 4.1;
+  document.getElementById('pasteLeft').value = 4.1;
+  document.getElementById('pasteRight').value = 4.1;
+  toast('已恢复标准边距：上 2.08cm / 下·左·右 0.41cm');
+  updatePreview();
 }
 
 function toggleFileListMemory(btn) {
@@ -4312,10 +4480,10 @@ function resetSettings(scope) {
   // scope='layout'：仅恢复「排版」页（纸张/行列/边距/间距/水印等），不动打印与偏好（issue #33）
   var layoutOnly = scope === 'layout';
   if (!confirm(layoutOnly ? '仅恢复「排版」页默认设置（纸张/行列/边距/间距/水印等），不影响打印、OCR、主题等偏好？' : '确认恢复所有默认设置？')) return;
-  var featDefaults = { cutline: true, number: false, border: false, trimWhite: false, trimPad: 3, watermark: false, footer: false, customFM: false, collate: true, duplex: false, pageNum: false, printDate: false, autoOpenPdf: true, ocrEnabled: false, pdfTextEnabled: true, slotAdjMemory: false, fileListMemory: false, autoDedup: false, reimburse: false, copyBadge: false };
+  var featDefaults = { cutline: true, number: false, border: false, trimWhite: false, trimPad: 3, watermark: false, footer: false, customFM: false, collate: true, duplex: false, pageNum: false, printDate: false, autoOpenPdf: true, ocrEnabled: false, pdfTextEnabled: true, slotAdjMemory: false, fileListMemory: false, autoDedup: false, reimburse: false, copyBadge: false, autoEnhance: false, pasteMode: false, pasteBindLine: true, pasteShowSig: true };
   S.layout = { cols: 1, rows: 1 };
   if (layoutOnly) {
-    ['cutline','number','border','trimWhite','watermark','reimburse','copyBadge'].forEach(function(k) { S.feat[k] = featDefaults[k]; });
+    ['cutline','number','border','trimWhite','watermark','reimburse','copyBadge','pasteMode'].forEach(function(k) { S.feat[k] = featDefaults[k]; });
   } else {
     S.feat = featDefaults;
   }
@@ -4357,10 +4525,38 @@ function resetSettings(scope) {
   document.getElementById('toggleTrimWhite').classList.remove('on');
   document.getElementById('toggleWatermark').classList.remove('on');
   document.getElementById('toggleReimburse').classList.remove('on');
+  // pasteMode 同样在 layoutOnly 重置数组内，按钮与面板必须同步恢复，
+  // 否则「仅恢复排版页」时状态已关而 UI 仍显示开启
+  document.getElementById('togglePasteMode').classList.remove('on');
+  document.getElementById('pasteOpts').style.display = 'none';
   document.getElementById('reimburseHeight').value = 120;
   S.feat.trimPad = 3;
   document.getElementById('trimPad').value = 3;
   syncReimburseUI();
+  // 清晰度优化恢复默认
+  if (!layoutOnly) {
+    document.getElementById('toggleAutoEnhance').classList.remove('on');
+    document.getElementById('enhanceOpts').style.display = 'none';
+    document.getElementById('togglePasteBindLine').classList.add('on');
+    document.getElementById('togglePasteSig').classList.add('on');
+    document.getElementById('pasteOpts').style.display = 'none';
+    document.getElementById('pasteSigOpts').style.display = 'block';
+  }
+  document.getElementById('enhanceMinDpi').value = 250; document.getElementById('enhanceMinDpiN').value = 250;
+  document.getElementById('enhanceGamma').value = 1.4; document.getElementById('enhanceGammaN').value = 1.4;
+  document.getElementById('enhanceAmount').value = 60; document.getElementById('enhanceAmountN').value = 60;
+  document.getElementById('enhanceQuality').value = 90; document.getElementById('enhanceQualityN').value = 90;
+  document.getElementById('pasteTop').value = 20.8;
+  document.getElementById('pasteBottom').value = 4.1;
+  document.getElementById('pasteLeft').value = 4.1;
+  document.getElementById('pasteRight').value = 4.1;
+  document.getElementById('pasteBindText').value = '装 订 线';
+  document.getElementById('pasteBindSize').value = 4; document.getElementById('pasteBindSizeN').value = 4;
+  document.getElementById('pasteSigCols').value = '票据张数,金额,报销人';
+  document.getElementById('pasteSigWidth').value = 80;
+  document.getElementById('pasteSigRowH').value = 8;
+  document.getElementById('pasteSigBodyH').value = 14;
+  document.getElementById('pasteSigGap').value = 2;
   if (layoutOnly) {
     syncLayoutHighlight();
     updatePreview();
@@ -4454,7 +4650,7 @@ document.getElementById('previewWrap').addEventListener('wheel', function(e) {
         var step = 5;
         var curPct = Math.round((f.slotScale || 1) * 100);
         var newPct = e.deltaY > 0 ? curPct - step : curPct + step;
-        f.slotScale = Math.max(0.2, Math.min(3.0, newPct / 100));
+        f.slotScale = Math.max(0.2, Math.min(5.0, newPct / 100));
         updatePreview();
         updateAdjPanel();
         return;

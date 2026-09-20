@@ -33,6 +33,15 @@ function calculateLayout(settings, pxPerMm) {
   var gh = settings.gapH * pxPerMm;
   var gv = settings.gapV * pxPerMm;
 
+  // 粘贴单模式：改用独立边距（上边距 = 装订区高度，装订线即画在该处）。
+  // 与 Rust calculate_layout_mm 的解析规则逐字对应，保证预览/PDF 同源。
+  if (settings.pasteMode) {
+    mt = (settings.pasteTop != null ? settings.pasteTop : 20.8) * pxPerMm;
+    mb = (settings.pasteBottom != null ? settings.pasteBottom : 4.1) * pxPerMm;
+    ml = (settings.pasteLeft != null ? settings.pasteLeft : 4.1) * pxPerMm;
+    mr = (settings.pasteRight != null ? settings.pasteRight : 4.1) * pxPerMm;
+  }
+
   // 报销单分段模式：固定段高（默认120mm），裁切线位于段边界绝对位置（k×段高），
   // 不受任何边距影响；mt/mb 仅作为段内上下安全边距，ml/mr 决定发票区域左右边界。
   // 忽略 rows/cols/gap/footerMargin；裁切线强制绘制（本模式的核心目的）。
@@ -65,7 +74,15 @@ function calculateLayout(settings, pxPerMm) {
   // When there is no footer content: no deduction (no footer to collide with).
   var hasFooterContent = settings.pageNum || settings.printDate || (settings.footerText || '').trim();
   var autoFm = 3 + ((settings.pageNum || settings.printDate ? 1 : 0) + ((settings.footerText || '').trim() ? 1 : 0)) * 5;
-  var effectiveFm = hasFooterContent ? (settings.customFM ? fm : autoFm * pxPerMm) : 0;
+  var footerFm = hasFooterContent ? (settings.customFM ? fm : autoFm * pxPerMm) : 0;
+  // 粘贴单：在页面底部为右下角签字栏预留一整条带（表头行 + 填写行 + 与票据区的间距），
+  // 保证票据只排版在装订线下方、签字栏上方。签字栏底边落在下边距处，故此处不含 mb。
+  var sigPx = (settings.pasteMode && settings.pasteShowSig !== false)
+    ? ((settings.pasteSigRowH != null ? settings.pasteSigRowH : 8)
+      + (settings.pasteSigBodyH != null ? settings.pasteSigBodyH : 14)
+      + (settings.pasteSigGap != null ? settings.pasteSigGap : 2)) * pxPerMm
+    : 0;
+  var effectiveFm = footerFm + sigPx;
   var sw = (pw - settings.cols * (ml + mr) - (settings.cols - 1) * gh) / settings.cols;
   var sh = (ph - settings.rows * (mt + mb) - (settings.rows - 1) * gv - effectiveFm) / settings.rows;
 
@@ -84,7 +101,7 @@ function calculateLayout(settings, pxPerMm) {
 
   // Cut line positions — based on actual slot boundaries (not page averages)
   var cutLines = [];
-  if (settings.cutline && (settings.cols > 1 || settings.rows > 1 || hasFooterContent)) {
+  if (settings.cutline && (settings.cols > 1 || settings.rows > 1 || hasFooterContent || sigPx > 0)) {
     // Horizontal cut lines: between adjacent rows
     for (var r = 1; r < settings.rows; r++) {
       // slot[r-1] bottom edge (top-down) and slot[r] top edge (top-down)
@@ -105,8 +122,10 @@ function calculateLayout(settings, pxPerMm) {
         cutLines.push({ type: 'horizontal', pos: ph - footerTextTopMm * pxPerMm });
       }
     }
-    // Vertical cut lines: between adjacent columns (stop at footer area if present)
-    var vLineEndY = hasFooterContent ? ph - effectiveFm : ph;
+    // Vertical cut lines: between adjacent columns (stop at footer/signature area if present)
+    // 粘贴单：额外多算一个下边距，让垂直线与票据区底边齐平，不切进右下角签字栏
+    var vLineReserve = sigPx > 0 ? sigPx + mb : effectiveFm;
+    var vLineEndY = (hasFooterContent || sigPx > 0) ? ph - vLineReserve : ph;
     for (var c = 1; c < settings.cols; c++) {
       var slotLeftX = ml + c * (sw + ml + mr + gh);       // slot[c].x
       var slotPrevRightX = ml + (c - 1) * (sw + ml + mr + gh) + sw; // slot[c-1].x + sw
@@ -114,7 +133,64 @@ function calculateLayout(settings, pxPerMm) {
     }
   }
 
-  return { pw: pw, ph: ph, mt: mt, mb: mb, fm: fm, ml: ml, mr: mr, gh: gh, gv: gv, sw: sw, sh: sh, slots: slots, cutLines: cutLines };
+  return { pw: pw, ph: ph, mt: mt, mb: mb, fm: fm, ml: ml, mr: mr, gh: gh, gv: gv, sw: sw, sh: sh, slots: slots, cutLines: cutLines, sig: sigPx };
+}
+
+/**
+ * 粘贴单：装订线 + 右下角签字栏的 HTML（只画线，数据留空手写）。
+ * @param {Object} s - getSettings()
+ * @param {number} k - 毫米 → 输出单位的换算系数（预览传 MM2PX*scale，HTML 打印兜底传 1）
+ * @param {string} unit - 输出单位 'px' 或 'mm'
+ */
+function buildPasteSheetHtml(s, k, unit) {
+  if (!s.pasteMode) return '';
+  var u = function (mm) { return (mm * k).toFixed(2) + unit; };
+  var uf = function (mm) { return unit === 'px' ? Math.max(8, mm * k).toFixed(1) + 'px' : mm.toFixed(2) + 'mm'; };
+  // 缺省回落值必须与 calculateLayout / Rust paste_sheet_geom 完全一致；
+  // 用 != null 而非 || ，否则用户把边距设成 0 会被默认值覆盖（线画在 20.8 而槽位按 0 算）。
+  var d = function (v, def) { return v != null ? v : def; };
+  var html = '';
+
+  // 装订线：上边距处一条横贯全页的实线，线上方居中「装 订 线」
+  if (s.pasteBindLine !== false) {
+    var bt = (s.pasteBindText == null ? '装 订 线' : s.pasteBindText).trim();
+    var btFsMm = d(s.pasteBindSize, 4);
+    var btTopMm = d(s.pasteTop, 20.8);
+    var btFs = unit === 'px' ? Math.max(8, btFsMm * k) : btFsMm * k;
+    html += '<div style="position:absolute;left:0;right:0;top:' + u(btTopMm)
+      + ';border-top:1px solid #334155;pointer-events:none"></div>';
+    if (bt) {
+      // 文字底边与装订线留 1.5mm 间隙
+      html += '<div style="position:absolute;left:0;right:0;top:' + u(btTopMm - btFsMm - 1.5)
+        + ';height:' + u(btFsMm) + ';line-height:' + u(btFsMm)
+        + ';text-align:center;font-size:' + (unit === 'px' ? btFs.toFixed(1) + 'px' : btFs.toFixed(2) + 'mm')
+        + ';color:#334155;pointer-events:none">' + escHtml(bt) + '</div>';
+    }
+  }
+  // 右下角签字栏：表头行 + 一个空白填写行，右边距/下边距对齐
+  if (s.pasteShowSig !== false) {
+    var colsRaw = s.pasteSigCols == null ? '票据张数,金额,报销人' : s.pasteSigCols;
+    var cols = colsRaw.split(/[,，]/).map(function (x) { return x.trim(); }).filter(Boolean);
+    if (cols.length > 0) {
+      var fsMm = 3.5;
+      var cell = 'border:1px solid #334155;text-align:center;vertical-align:middle;padding:0;';
+      html += '<table style="position:absolute;right:' + u(d(s.pasteRight, 4.1))
+        + ';bottom:' + u(d(s.pasteBottom, 4.1))
+        + ';width:' + u(d(s.pasteSigWidth, 80))
+        + ';border-collapse:collapse;table-layout:fixed;pointer-events:none">';
+      html += '<tr>';
+      cols.forEach(function (c) {
+        html += '<td style="' + cell + 'height:' + u(d(s.pasteSigRowH, 8))
+          + ';font-size:' + uf(fsMm) + ';color:#334155">' + escHtml(c) + '</td>';
+      });
+      html += '</tr><tr>';
+      cols.forEach(function () {
+        html += '<td style="' + cell + 'height:' + u(d(s.pasteSigBodyH, 14)) + '"></td>';
+      });
+      html += '</tr></table>';
+    }
+  }
+  return html;
 }
 
 /**
@@ -127,7 +203,9 @@ function calculateLayout(settings, pxPerMm) {
  */
 function getObjDims(fileObj, settings) {
   if (!fileObj) return { w: 1, h: 1 };
-  if (settings && settings.trimWhite && fileObj.trimmedW > 0 && fileObj.trimmedH > 0) {
+  // 开启「裁剪白边」且已生成裁剪缓存时才用裁剪后尺寸
+  var trimOn = settings && settings.trimWhite;
+  if (trimOn && fileObj.trimmedW > 0 && fileObj.trimmedH > 0) {
     return { w: fileObj.trimmedW, h: fileObj.trimmedH };
   }
   return { w: fileObj.ow || 1, h: fileObj.oh || 1 };
@@ -332,6 +410,9 @@ function renderPage(pageFiles, pi, total, s) {
     var dateStyle = s.pageNum ? 'position:absolute;bottom:' + pageNumBottomPx + 'px;right:' + (10 * MM2PX * scale) + 'px;font-size:' + footerFontSize + 'px;color:#94a3b8' : 'position:absolute;bottom:' + pageNumBottomPx + 'px;left:0;right:0;text-align:center;font-size:' + footerFontSize + 'px;color:#94a3b8';
     html += '<div style="' + dateStyle + '">打印日期 ' + dateStr + '</div>';
   }
+
+  // 粘贴单：装订线 + 右下角签字栏（页面级 overlay，与 slot 同坐标系）
+  html += buildPasteSheetHtml(s, MM2PX * scale, 'px');
 
   document.getElementById('previewPages').style.display = 'block';
   document.getElementById('emptyState').style.display = 'none';
@@ -603,7 +684,7 @@ function onSlotMouseMove(e) {
     var cy = slotRect.top + slotRect.height / 2;
     var dist = Math.hypot(e.clientX - cx, e.clientY - cy);
     var ratio = dist / _slotDrag.startDist;
-    var newScale = Math.max(0.2, Math.min(3.0, _slotDrag.startScale * ratio));
+    var newScale = Math.max(0.2, Math.min(5.0, _slotDrag.startScale * ratio));
     _slotDrag.fileObj.slotScale = Math.round(newScale * 100) / 100;
 
     // Real-time visual feedback

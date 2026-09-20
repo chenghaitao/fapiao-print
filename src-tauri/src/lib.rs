@@ -564,7 +564,18 @@ fn trim_image(data_url: String, pad: Option<u32>) -> Result<TrimImageResult, Str
     let img = pdf_engine::decode_base64_image(&data_url)
         .map_err(|e| format!("解码失败: {}", e))?;
     let pad = pad.unwrap_or(pdf_engine::TRIM_PAD_DEFAULT).min(pdf_engine::TRIM_PAD_MAX);
-    let (trimmed, trim_box) = pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad);
+    let (mut trimmed, mut trim_box) = pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad);
+    // 白边裁剪无效（四周都有内容，常见于应用界面截图）时，尝试「截图票面检测」：
+    // 定位灰底内容区中的票面大块浅色区域（issue #38/#39），裁掉状态栏/标题栏等 UI
+    if trim_box.is_none() {
+        if let Some(box_) = pdf_engine::trim_invoice_face_box(&img) {
+            let [x, y, cw, ch] = box_;
+            let rgba = img.to_rgba8();
+            let cropped = image::imageops::crop_imm(&rgba, x, y, cw, ch);
+            trimmed = image::DynamicImage::from(cropped.to_image());
+            trim_box = Some(box_);
+        }
+    }
 
     // Encode back to PNG base64
     let mut buf = Cursor::new(Vec::new());
@@ -592,6 +603,17 @@ async fn enhance_image(file_path: String) -> Result<String, String> {
     })
     .await
     .map_err(|e| format!("图片增强任务失败: {}", e))?
+}
+
+/// 清晰度体检：只读文件头算出每张发票折算后的实际打印 DPI，
+/// 不解码像素，毫秒级。矢量电子发票标记 vector（与分辨率无关）。
+#[command]
+async fn audit_clarity(request: LayoutRenderRequest) -> Result<Vec<pdf_engine::ClarityInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(pdf_engine::audit_clarity(&request))
+    })
+    .await
+    .map_err(|e| format!("清晰度体检任务失败: {}", e))?
 }
 
 /// Generate PDF from layout request (files + pages + settings).
@@ -1490,6 +1512,7 @@ pub fn run() {
         show_window,
         trim_image,
         enhance_image,
+        audit_clarity,
         generate_pdf_from_layout,
         print_pdf_file,
         parse_ofd,
@@ -1529,6 +1552,7 @@ pub fn run() {
         show_window,
         trim_image,
         enhance_image,
+        audit_clarity,
         generate_pdf_from_layout,
         print_pdf_file,
         parse_ofd,

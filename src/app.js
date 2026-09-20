@@ -4370,6 +4370,10 @@ function resetSettings(scope) {
   document.getElementById('toggleTrimWhite').classList.remove('on');
   document.getElementById('toggleWatermark').classList.remove('on');
   document.getElementById('toggleReimburse').classList.remove('on');
+  // pasteMode 同样在 layoutOnly 重置数组内，按钮与面板必须同步恢复，
+  // 否则「仅恢复排版页」时状态已关而 UI 仍显示开启
+  document.getElementById('togglePasteMode').classList.remove('on');
+  document.getElementById('pasteOpts').style.display = 'none';
   document.getElementById('reimburseHeight').value = 120;
   S.feat.trimPad = 3;
   document.getElementById('trimPad').value = 3;
@@ -4378,7 +4382,6 @@ function resetSettings(scope) {
   if (!layoutOnly) {
     document.getElementById('toggleAutoEnhance').classList.remove('on');
     document.getElementById('enhanceOpts').style.display = 'none';
-    document.getElementById('togglePasteMode').classList.remove('on');
     document.getElementById('togglePasteBindLine').classList.add('on');
     document.getElementById('togglePasteSig').classList.add('on');
     document.getElementById('pasteOpts').style.display = 'none';

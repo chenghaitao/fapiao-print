@@ -556,10 +556,12 @@ struct TrimImageResult {
 
 /// Trim white edges from an image (base64 data URL → 裁剪后 data URL + 裁剪框)
 /// `pad`: 裁剪后向外保留的边距（px，前端「留边」配置项；缺省 3，上限 60）
-/// **Async command**: 连通域票面检测 + BFS 对高分辨率图是 CPU 密集操作，
+/// `face_first`: 「截图裁剪」开关 —— 开启时优先「截图票面检测」（识别人工截图
+/// 里的票面、裁掉应用 UI），失败才回退白边裁剪；关闭时保持纯白边裁剪（旧行为）。
+/// **Async command**: 票面检测 BFS/Canny 对高分辨率图是 CPU 密集操作，
 /// 须跑 spawn_blocking，避免阻塞 IPC 消息泵（AGENTS 硬性规则 3）。
 #[command]
-async fn trim_image(data_url: String, pad: Option<u32>) -> Result<TrimImageResult, String> {
+async fn trim_image(data_url: String, pad: Option<u32>, face_first: Option<bool>) -> Result<TrimImageResult, String> {
     use base64::Engine;
     use std::io::Cursor;
 
@@ -567,18 +569,22 @@ async fn trim_image(data_url: String, pad: Option<u32>) -> Result<TrimImageResul
         let img = pdf_engine::decode_base64_image(&data_url)
             .map_err(|e| format!("解码失败: {}", e))?;
         let pad = pad.unwrap_or(pdf_engine::TRIM_PAD_DEFAULT).min(pdf_engine::TRIM_PAD_MAX);
-        let (mut trimmed, mut trim_box) = pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad);
-        // 白边裁剪无效（四周都有内容，常见于应用界面截图）时，尝试「截图票面检测」：
-        // 定位灰底内容区中的票面大块浅色区域（issue #38/#39），裁掉状态栏/标题栏等 UI
-        if trim_box.is_none() {
+        // 截图裁剪开启：先试「截图票面检测」——应用/PDF 预览器界面截图里定位
+        // 灰底内容区的票面，裁掉状态栏/标题栏等 UI；检测失败回退白边裁剪。
+        // 关闭（默认）：保持纯白边裁剪旧行为。
+        let face_first = face_first.unwrap_or(false);
+        let (trimmed, trim_box) = if face_first {
             if let Some(box_) = pdf_engine::trim_invoice_face_box(&img) {
                 let [x, y, cw, ch] = box_;
                 let rgba = img.to_rgba8();
                 let cropped = image::imageops::crop_imm(&rgba, x, y, cw, ch);
-                trimmed = image::DynamicImage::from(cropped.to_image());
-                trim_box = Some(box_);
+                (image::DynamicImage::from(cropped.to_image()), Some(box_))
+            } else {
+                pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad)
             }
-        }
+        } else {
+            pdf_engine::trim_white_edges(&img, pdf_engine::WHITE_THRESHOLD, pad)
+        };
 
         // Encode back to PNG base64
         let mut buf = Cursor::new(Vec::new());

@@ -3528,6 +3528,100 @@ pub fn trim_white_edges(img: &image::DynamicImage, threshold: u8, pad: u32) -> (
 const FACE_STRICT_TH: u8 = 245;
 const FACE_LOOSE_TH: u8 = 200;
 
+/// Canny 横贯线精化票面上下界（在连通域 base 框基础上，扫码 APP 同款思路）：
+/// 票面上下边框是 base 范围内的「最上/最下横贯边缘线」，比连通域的下界
+/// 补全更精确贴边。只有横贯线跨度覆盖 base 高度过半才采信（防局部表格线
+/// 误当票面边框）。返回精化后的完整裁剪框（含保守外扩），None 表示无需精化。
+fn refine_face_rect(img: &image::DynamicImage, base: TrimBox) -> Option<TrimBox> {
+    use image::GenericImageView;
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let [bx, by, bw, bh] = base;
+    // 下采样到最长边 ~600
+    let longest = w.max(h);
+    let (dw, dh) = if longest > 600 {
+        let s = 600.0 / longest as f32;
+        (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1))
+    } else {
+        (w, h)
+    };
+    let small = if dw != w || dh != h {
+        img.resize_exact(dw, dh, image::imageops::FilterType::Triangle)
+    } else {
+        img.clone()
+    };
+    let gray = small.to_luma8();
+    let edges = imageproc::edges::canny(&gray, 30.0, 100.0);
+    // 行投影
+    let mut row_counts = vec![0u32; dh as usize];
+    for y in 0..dh {
+        let mut c = 0u32;
+        for x in 0..dw {
+            if edges.get_pixel(x, y)[0] > 0 {
+                c += 1;
+            }
+        }
+        row_counts[y as usize] = c;
+    }
+    // 横贯线行段：count ≥ 40% 图宽（文字行分散 <30%）
+    let row_thr = (dw as f32 * 0.40) as u32;
+    let mut y_bands: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0usize;
+    while i < row_counts.len() {
+        if row_counts[i] >= row_thr {
+            let mut j = i;
+            let mut gap = 0usize;
+            while j + 1 < row_counts.len() {
+                if row_counts[j + 1] >= row_thr {
+                    gap = 0;
+                } else {
+                    gap += 1;
+                    if gap > 2 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if (j - i + 1) >= 2 {
+                y_bands.push((i as u32, j as u32));
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    // base 框在缩略图坐标下的 y 范围（外扩 2 行容错）
+    let sy = dh as f32 / h as f32;
+    let by0_s = (by as f32 * sy) as i64 - 2;
+    let by1_s = ((by + bh) as f32 * sy) as i64 + 2;
+    // 筛选落在 base 范围内的横贯线段
+    let in_bands: Vec<(u32, u32)> = y_bands
+        .into_iter()
+        .filter(|(a, b)| (*a as i64) <= by1_s && (*b as i64) >= by0_s)
+        .collect();
+    if in_bands.len() < 2 {
+        return None; // 不足上下边框两条，无法精化
+    }
+    let (top0, _top1) = in_bands.first().copied()?;
+    let (_bot0, bot1) = in_bands.last().copied()?;
+    let base_span = (by1_s - by0_s).max(1) as f32;
+    let span = (bot1 as i64 - top0 as i64).max(0) as f32;
+    if span < base_span * 0.5 {
+        return None; // 横贯线跨度不足 base 高度一半 → 是局部表格线，不信
+    }
+    // 精化上下界并外扩 2%（x 保持 base 外扩后的左右界）
+    let ext = (dw.min(dh) as f32 * 0.02).max(2.0) as u32;
+    let inv_sy = h as f32 / dh as f32;
+    let fy0 = (((top0 as f32 * inv_sy) as i64) - ext as i64).max(0) as u32;
+    let fy1 = (((bot1 as f32 * inv_sy) as i64) + ext as i64).min(h as i64 - 1) as u32;
+    if fy0 >= fy1 {
+        return None;
+    }
+    Some([bx, fy0, bw, fy1 - fy0 + 1])
+}
+
 /// 截图中票面框检测：返回非 None 即表示检测到可信票面区域。
 /// 任何一步不满足校验即回退 None（保持原图，绝不误裁）。
 pub fn trim_invoice_face_box(img: &image::DynamicImage) -> Option<TrimBox> {
@@ -3599,6 +3693,9 @@ pub fn trim_invoice_face_box(img: &image::DynamicImage) -> Option<TrimBox> {
             if (ch as f32) < h as f32 * 0.20 {
                 continue; // 高度不足两成 → 顶部 UI 白带或票面子块
             }
+            if (ch as f32) > h as f32 * 0.60 {
+                continue; // 占高超过六成 = 整图即票面（普通扫描件），回退白边裁剪
+            }
             // 顶部全宽 UI 白带（状态栏/标题栏）：贴顶、几乎全宽、且较扁
             let is_ui_band = y0 as f32 <= h as f32 * 0.08
                 && cw as f32 >= w as f32 * 0.95
@@ -3643,9 +3740,8 @@ pub fn trim_invoice_face_box(img: &image::DynamicImage) -> Option<TrimBox> {
                     }
                 }
             }
-            // 外扩 1%（容忍票面边框/阴影；2% 实测让裁剪框比票面大一圈、
-            // "上下留一点"，降到 1%），并整体裁剪回图片边界
-            let ext = (min_dim as f32 * 0.01).max(1.0) as u32;
+            // 外扩 2%（检测已贴边框；留少量边防 JPEG 压缩毛边，用户可二次裁剪）
+            let ext = (min_dim as f32 * 0.02).max(2.0) as u32;
             let fx0 = x0.saturating_sub(ext);
             let fy0 = y0.saturating_sub(ext);
             let fx1 = (x1 + ext).min(w - 1);
@@ -3653,7 +3749,9 @@ pub fn trim_invoice_face_box(img: &image::DynamicImage) -> Option<TrimBox> {
             if fx0 >= fx1 || fy0 >= fy1 {
                 continue;
             }
-            return Some([fx0, fy0, fx1 - fx0 + 1, fy1 - fy0 + 1]);
+            let box_ = [fx0, fy0, fx1 - fx0 + 1, fy1 - fy0 + 1];
+            // Canny 横贯线精化上下界（贴票面边框，比下界补全更准）；失败保留原框
+            return Some(refine_face_rect(img, box_).unwrap_or(box_));
         }
         // 当前阈值无有效块 → 尝试下一档（严格→宽松）
     }
@@ -3700,6 +3798,9 @@ pub struct RenderSettings {
     pub border_width: Option<f32>,
     pub border_color: Option<String>,
     pub trim_white: Option<bool>,
+    /// 截图裁剪（独立开关）：识别人工截图中的票面、裁掉应用 UI（issue #38）
+    #[serde(default)]
+    pub screenshot_trim: Option<bool>,
     /// 裁剪后向外保留的边距（px，前端「留边」配置项；缺省 3，上限 60）
     #[serde(default)]
     pub trim_pad: Option<u32>,
@@ -4586,6 +4687,7 @@ fn decode_images(
     use rayon::prelude::*;
 
     let trim = settings.trim_white.unwrap_or(false);
+    let trim_face = settings.screenshot_trim.unwrap_or(false);
     let trim_pad = settings.trim_pad.unwrap_or(TRIM_PAD_DEFAULT).min(TRIM_PAD_MAX);
     let color_mode = settings.color_mode.clone();
     // 清晰度优化：打印时自动增强低有效 DPI 的位图源（issue #39）
@@ -4700,8 +4802,21 @@ fn decode_images(
 
             // Apply trim (global setting, not per-slot)
             // 位图路径：裁剪直接烘焙进像素，不需要保留裁剪框
-            if trim {
-                img = trim_white_edges(&img, WHITE_THRESHOLD, trim_pad).0;
+            // 截图裁剪开启时优先「截图票面检测」（与 trim_image 命令同语义），
+            // 失败回退白边裁剪；纯白边开关保持旧行为。
+            if trim || trim_face {
+                img = if trim_face {
+                    if let Some(box_) = trim_invoice_face_box(&img) {
+                        let [x, y, cw, ch] = box_;
+                        let rgba = img.to_rgba8();
+                        let cropped = image::imageops::crop_imm(&rgba, x, y, cw, ch);
+                        image::DynamicImage::from(cropped.to_image())
+                    } else {
+                        trim_white_edges(&img, WHITE_THRESHOLD, trim_pad).0
+                    }
+                } else {
+                    trim_white_edges(&img, WHITE_THRESHOLD, trim_pad).0
+                };
             }
 
             // 清晰度优化：非 JPEG 位图解码后才有尺寸，此时按实际有效 DPI 增强。
@@ -6024,7 +6139,8 @@ fn build_nup_content_stream(
         let draw_w = vis_w * scale_x;
         let draw_h = vis_h * scale_y;
         let is_rot90 = rot == 90 || rot == 270;
-        let top_align = settings.reimburse_mode || (settings.trim_white.unwrap_or(false) && is_rot90);
+        let top_align = settings.reimburse_mode
+            || ((settings.trim_white.unwrap_or(false) || settings.screenshot_trim.unwrap_or(false)) && is_rot90);
         let mut offset_x = slot.x_mm * MM_TO_PT;
         let mut offset_y = slot.y_mm * MM_TO_PT + if top_align {
             // bottom-up 坐标：顶部对齐 = slot 顶边 - 图像高度
@@ -6444,8 +6560,10 @@ fn generate_pdf_passthrough(
                     .ok_or_else(|| format!("PDF页面{}不存在 (文件: {})", page_idx_in_pdf + 1, pdf_path))?;
 
                 // Extract as Form XObject (vector quality preserved).
-                // 白边裁剪开启时按前端传来的裁剪框做矢量裁切（整页 → 裁剪框）。
-                let trim = if request.settings.trim_white.unwrap_or(false) {
+                // 白边裁剪/截图裁剪开启时按前端传来的裁剪框做矢量裁切（整页 → 裁剪框）。
+                let trim_on = request.settings.trim_white.unwrap_or(false)
+                    || request.settings.screenshot_trim.unwrap_or(false);
+                let trim = if trim_on {
                     file.trim_box.map(|b| (b, file.ow, file.oh))
                 } else {
                     None
@@ -6464,8 +6582,10 @@ fn generate_pdf_passthrough(
                         continue;
                     }
                 };
-                // 白边裁剪：图片同样按裁剪框裁切（原图坐标由前端换算，此处缩放兜底）。
-                let trim = if request.settings.trim_white.unwrap_or(false) {
+                // 白边裁剪/截图裁剪：图片同样按裁剪框裁切（原图坐标由前端换算，此处缩放兜底）。
+                let trim_on = request.settings.trim_white.unwrap_or(false)
+                    || request.settings.screenshot_trim.unwrap_or(false);
+                let trim = if trim_on {
                     file.trim_box.map(|b| (b, file.ow, file.oh))
                 } else {
                     None

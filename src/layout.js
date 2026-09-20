@@ -203,7 +203,9 @@ function buildPasteSheetHtml(s, k, unit) {
  */
 function getObjDims(fileObj, settings) {
   if (!fileObj) return { w: 1, h: 1 };
-  if (settings && settings.trimWhite && fileObj.trimmedW > 0 && fileObj.trimmedH > 0) {
+  // 「裁剪白边」或「截图裁剪」任一开启且已生成裁剪缓存时才用裁剪后尺寸
+  var trimOn = settings && (settings.screenshotTrim || settings.trimWhite);
+  if (trimOn && fileObj.trimmedW > 0 && fileObj.trimmedH > 0) {
     return { w: fileObj.trimmedW, h: fileObj.trimmedH };
   }
   return { w: fileObj.ow || 1, h: fileObj.oh || 1 };
@@ -269,7 +271,7 @@ function renderPage(pageFiles, pi, total, s) {
     var selClass = isSelected ? ' selected' : '';
 
     if (f && f.previewUrl) {
-      var src = S.feat.trimWhite && f.trimmedUrl ? f.trimmedUrl : f.previewUrl;
+      var src = (S.feat.trimWhite || S.feat.screenshotTrim) && f.trimmedUrl ? f.trimmedUrl : f.previewUrl;
       var rot = getRotation(f, slot, s);
       var filt = s.colorMode === 'grayscale' ? 'filter:grayscale(1);' : s.colorMode === 'bw' ? 'filter:grayscale(1) contrast(1.5);' : '';
       var fit = 'contain';

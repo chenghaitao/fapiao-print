@@ -82,7 +82,8 @@ var S = {
     fileListMemory: false,
     autoDedup: false,
     autoEnhance: false,
-    pasteMode: false, pasteBindLine: true, pasteShowSig: true
+    pasteMode: false, pasteBindLine: true, pasteShowSig: true,
+    screenshotTrim: false
   }
 };
 
@@ -3248,7 +3249,7 @@ function setTrimPad(v) {
   if (n === S.feat.trimPad) return;
   S.feat.trimPad = n;
   S.files.forEach(function(f) { clearTrimCache(f); });
-  if (S.feat.trimWhite) processTrim(); else updatePreview();
+  if (S.feat.trimWhite || S.feat.screenshotTrim) processTrim(); else updatePreview();
   saveSettings();
 }
 
@@ -3268,7 +3269,7 @@ function toggleTextEnhance() {
     updateAdjPanel();
     updatePreview();
     renderFileList();
-    if (S.feat.trimWhite) processTrim();
+    if (S.feat.trimWhite || S.feat.screenshotTrim) processTrim();
     return;
   }
 
@@ -3288,7 +3289,7 @@ function toggleTextEnhance() {
       updateAdjPanel();
       updatePreview();
       renderFileList();
-      if (S.feat.trimWhite) processTrim();
+      if (S.feat.trimWhite || S.feat.screenshotTrim) processTrim();
       toast('已增强：' + f.name);
     };
     img.onerror = function() {
@@ -3489,6 +3490,7 @@ function toggleFeature(k, btn) {
 
   if (k === 'watermark') document.getElementById('wmOpts').style.display = S.feat[k] ? 'block' : 'none';
   if (k === 'trimWhite') document.getElementById('trimPadOpts').style.display = S.feat[k] ? 'block' : 'none';
+  if (k === 'screenshotTrim') document.getElementById('screenTrimHint').style.display = S.feat[k] ? 'block' : 'none';
   if (k === 'autoEnhance') document.getElementById('enhanceOpts').style.display = S.feat[k] ? 'block' : 'none';
   if (k === 'pasteMode') {
     document.getElementById('pasteOpts').style.display = S.feat[k] ? 'block' : 'none';
@@ -3504,6 +3506,11 @@ function toggleFeature(k, btn) {
     document.getElementById('pasteSigOpts').style.display = S.feat[k] ? 'block' : 'none';
   }
   if (k === 'trimWhite' && S.feat[k]) processTrim();
+  if (k === 'screenshotTrim') {
+    if (S.feat[k]) processTrim();
+    // 关断截图裁剪：若白边裁剪也关着，恢复原图由 layout/print 的
+    // trimmedUrl 使用条件（两开关任一开启）自动保证，无需清缓存
+  }
   if (k === 'footer') {
     document.getElementById('footerOpts').style.display = S.feat[k] ? 'block' : 'none';
   }
@@ -3682,22 +3689,23 @@ function setMP(t, b, l, r) {
 function changeCopies(d) { var e = document.getElementById('copies'); e.value = Math.max(1, Math.min(99, parseInt(e.value) + d)); updatePreview(); }
 
 // Trim whitespace — now delegates to Rust backend (10-50x faster)
-/** 批量加载结束后：若「裁剪白边」已开启（开关跨会话记忆），自动补裁剪 */
+/** 批量加载结束后：若「裁剪白边」或「截图裁剪」已开启（开关跨会话记忆），自动补裁剪 */
 function maybeAutoTrim() {
-  if (S.feat.trimWhite) processTrim();
+  if (S.feat.trimWhite || S.feat.screenshotTrim) processTrim();
 }
 
 async function processTrim() {
   if (!isTauri || !invoke) {
-    toast('白边裁剪需要桌面版');
+    toast('裁剪需要桌面版');
     return;
   }
-  showLoading('裁剪白边...');
+  var caption = S.feat.screenshotTrim ? '截图裁剪...' : '裁剪白边...';
+  showLoading(caption);
   try {
     for (var i = 0; i < S.files.length; i++) {
       var f = S.files[i];
       if (f.previewUrl && !f.trimmedUrl) {
-        var trimmed = await invoke('trim_image', { dataUrl: f.previewUrl, pad: getTrimPad() });
+        var trimmed = await invoke('trim_image', { dataUrl: f.previewUrl, pad: getTrimPad(), faceFirst: S.feat.screenshotTrim });
         if (!trimmed || !trimmed.dataUrl) continue;
         f.trimmedUrl = trimmed.dataUrl;
         var tb = trimmed.trimBox;
@@ -3769,6 +3777,7 @@ function getSettings() {
     pasteSigGap: parseFloat(document.getElementById('pasteSigGap').value) || 2,
     cutline: S.feat.cutline, number: S.feat.number, border: S.feat.border,
     borderWidth: 1, borderColor: '#000000', trimWhite: S.feat.trimWhite,
+    screenshotTrim: S.feat.screenshotTrim,
     trimPad: getTrimPad(),
     copyBadge: S.feat.copyBadge,
     watermark: S.feat.watermark,
@@ -3960,7 +3969,7 @@ function saveSettings() {
     printerName: document.getElementById('printerSel').value || null,
     feat: {}
   };
-  var featKeys = ['cutline','number','border','trimWhite','watermark','collate','duplex','pageNum','printDate','footer','autoOpenPdf','customFM','slotAdjMemory','fileListMemory','autoDedup','reimburse','copyBadge','autoEnhance','pasteMode','pasteBindLine','pasteShowSig'];
+  var featKeys = ['cutline','number','border','trimWhite','watermark','collate','duplex','pageNum','printDate','footer','autoOpenPdf','customFM','slotAdjMemory','fileListMemory','autoDedup','reimburse','copyBadge','autoEnhance','pasteMode','pasteBindLine','pasteShowSig','screenshotTrim'];
   featKeys.forEach(function(k) { o.feat[k] = S.feat[k]; });
   o.reimburseHeight = document.getElementById('reimburseHeight').value;
   o.trimPad = getTrimPad();
@@ -4102,7 +4111,8 @@ function loadSettings() {
       autoEnhance: 'toggleAutoEnhance',
       pasteMode: 'togglePasteMode',
       pasteBindLine: 'togglePasteBindLine',
-      pasteShowSig: 'togglePasteSig'
+      pasteShowSig: 'togglePasteSig',
+      screenshotTrim: 'toggleScreenshotTrim'
     };
     Object.keys(featMap).forEach(function(k) {
       if (o.feat[k] != null) {
@@ -4116,6 +4126,9 @@ function loadSettings() {
     }
     if (S.feat.trimWhite) {
       document.getElementById('trimPadOpts').style.display = 'block';
+    }
+    if (S.feat.screenshotTrim) {
+      document.getElementById('screenTrimHint').style.display = 'block';
     }
     if (S.feat.footer) {
       document.getElementById('footerOpts').style.display = 'block';
@@ -4320,10 +4333,10 @@ function resetSettings(scope) {
   // scope='layout'：仅恢复「排版」页（纸张/行列/边距/间距/水印等），不动打印与偏好（issue #33）
   var layoutOnly = scope === 'layout';
   if (!confirm(layoutOnly ? '仅恢复「排版」页默认设置（纸张/行列/边距/间距/水印等），不影响打印、OCR、主题等偏好？' : '确认恢复所有默认设置？')) return;
-  var featDefaults = { cutline: true, number: false, border: false, trimWhite: false, trimPad: 3, watermark: false, footer: false, customFM: false, collate: true, duplex: false, pageNum: false, printDate: false, autoOpenPdf: true, ocrEnabled: false, pdfTextEnabled: true, slotAdjMemory: false, fileListMemory: false, autoDedup: false, reimburse: false, copyBadge: false, autoEnhance: false, pasteMode: false, pasteBindLine: true, pasteShowSig: true };
+  var featDefaults = { cutline: true, number: false, border: false, trimWhite: false, trimPad: 3, watermark: false, footer: false, customFM: false, collate: true, duplex: false, pageNum: false, printDate: false, autoOpenPdf: true, ocrEnabled: false, pdfTextEnabled: true, slotAdjMemory: false, fileListMemory: false, autoDedup: false, reimburse: false, copyBadge: false, autoEnhance: false, pasteMode: false, pasteBindLine: true, pasteShowSig: true, screenshotTrim: false };
   S.layout = { cols: 1, rows: 1 };
   if (layoutOnly) {
-    ['cutline','number','border','trimWhite','watermark','reimburse','copyBadge','pasteMode'].forEach(function(k) { S.feat[k] = featDefaults[k]; });
+    ['cutline','number','border','trimWhite','screenshotTrim','watermark','reimburse','copyBadge','pasteMode'].forEach(function(k) { S.feat[k] = featDefaults[k]; });
   } else {
     S.feat = featDefaults;
   }
@@ -4363,6 +4376,7 @@ function resetSettings(scope) {
   document.getElementById('toggleCopyBadge').classList.remove('on');
   document.getElementById('toggleBorder').classList.remove('on');
   document.getElementById('toggleTrimWhite').classList.remove('on');
+  document.getElementById('toggleScreenshotTrim').classList.remove('on');
   document.getElementById('toggleWatermark').classList.remove('on');
   document.getElementById('toggleReimburse').classList.remove('on');
   document.getElementById('reimburseHeight').value = 120;

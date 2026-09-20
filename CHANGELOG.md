@@ -1,15 +1,6 @@
 # 📋 更新日志
 
-## v2.6.6 — NSIS 图标固定与 GitHub Actions Node.js 24 适配
-
-_2026-09-17_
-
-### 🎨 优化
-
-- **NSIS 安装包固定使用项目图标**：显式指定 `src-tauri/icons/icon.ico`，避免后续同步配置时回退到默认安装包图标
-- **GitHub Actions 运行时升级**：将 `checkout`、`setup-node` 和 `upload-artifact` 升级到 Node.js 24 版本，消除 Node.js 20 弃用提示；项目构建使用的 Node.js 20 版本保持不变
-
-## v2.6.6 — 粘贴单格式 + 清晰度优化 + 白边裁剪打印一致性
+## v2.6.6 — 粘贴单格式 + 清晰度优化 + 白边裁剪打印一致性 + NSIS 图标固定
 
 _2026-09-20_
 
@@ -24,6 +15,11 @@ _2026-09-20_
 
 - **截图发票打印结果与预览不一致**（issue #38）：白边裁剪此前在预览缩略图坐标系计算裁剪框、却在全分辨率原图坐标直接执行，坐标未换算导致打印时裁剪位置整体偏移。现裁剪框统一在缩略图坐标系计算、换算到原图坐标后执行（`trim_image` 同步异步化），打印与预览严格一致
 - **仅恢复排版页时粘贴单开关 UI 未同步**：`resetSettings` 的 `layoutOnly` 分支漏同步粘贴单开关状态
+
+### 🎨 优化
+
+- **NSIS 安装包固定使用项目图标**：显式指定 `src-tauri/icons/icon.ico`，避免后续同步配置时回退到默认安装包图标
+- **GitHub Actions 运行时升级**：将 `checkout`、`setup-node` 和 `upload-artifact` 升级到 Node.js 24 版本，消除 Node.js 20 弃用提示；项目构建使用的 Node.js 20 版本保持不变
 
 ### 📌 说明
 

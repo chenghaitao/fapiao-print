@@ -1459,6 +1459,7 @@ function updateFileItem(fileObj) {
   if (!items[idx]) { renderFileList(); return; }
   var f = fileObj;
   var cb = f.copies > 1 ? '<span class="copy-badge">' + f.copies + '份</span>' : '';
+  var mpb = buildMultiPageBadge(f);
   var rb = f.rotation ? '<span class="rot-badge">' + f.rotation + '°</span>' : '';
   var ab = buildAmtBadge(f);
   var pd = f._printed ? '<span class="printed-dot" title="已打印">\u2713</span>' : '';
@@ -1467,7 +1468,7 @@ function updateFileItem(fileObj) {
     var cardMetaEl = items[idx].querySelector('.card-meta');
     if (cardMetaEl) {
       var gdupb = f._dup ? '<span class="dup-badge" title="检测到重复发票">\u26A0</span>' : '';
-      cardMetaEl.innerHTML = pd + ab + cb + rb + gdupb + '<span class="card-size" title="文件大小">' + fmtSize(f.size) + '</span>';
+      cardMetaEl.innerHTML = pd + ab + cb + mpb + rb + gdupb + '<span class="card-size" title="文件大小">' + fmtSize(f.size) + '</span>';
     }
     var gsellerInner = sellerRowHtml(f, false);
     var sellerLine = items[idx].querySelector('.card-seller');
@@ -1491,7 +1492,7 @@ function updateFileItem(fileObj) {
     var leftEl = items[idx].querySelector('.file-meta-left');
     if (leftEl) {
       var dupb = f._dup ? '<span class="dup-badge" title="检测到重复发票：点击左上角「重复」筛选可一键勾选删除">⚠重复</span>' : '';
-      leftEl.innerHTML = pd + '<span class="file-size">' + fmtSize(f.size) + '</span>' + cb + rb + dupb + ab;
+      leftEl.innerHTML = pd + '<span class="file-size">' + fmtSize(f.size) + '</span>' + cb + mpb + rb + dupb + ab;
     }
     var sellerEl = items[idx].querySelector('.file-seller');
     if (sellerEl) {
@@ -1629,6 +1630,9 @@ function buildPdfResults(pages, id, name, size, filePath) {
       renderDpi: pg.renderDpi || PDF_RENDER_DPI,
       pdfPath: filePath, pdfPageIdx: p
     });
+    // 加载批次标识：同一 PDF 在同一次加载中拆出的多页共享 id 前缀，
+    // 用于把「单次加载的跨页单票」与「同一文件被拖入两次（真重复）」区分开
+    fileObj._batchId = id;
     results.push(fileObj);
   }
   return results;
@@ -2163,6 +2167,69 @@ function getFilteredFiles() {
   });
 }
 
+// ---- 多页发票「逻辑票」分组（issue #40）----
+// 同一 PDF 一次加载拆出的多页，若识别到相同发票号，视为「同一张跨页发票」，
+// 而非多张独立发票。物理层仍逐页（打印/预览照旧），逻辑层聚合成一张票：
+//   _invoiceGroupId           逻辑票分组 id（同页同值）
+//   _multiPageInvoice.total   该组总页数
+//   _multiPageInvoice.pageNo  当前页序号（从 1 起）
+//   _multiPageInvoice.isSummary 是否合计页（统计只计此页）
+function getPdfBatchKey(f) {
+  if (!f._pdfPath) return null;
+  return f._pdfPath + '|' + (f._batchId || f.id);
+}
+
+// 逻辑票唯一 id：多页组取首成员，纯单页退化为页自身 id
+function getLogicalInvoiceId(f) {
+  return f._invoiceGroupId || f.id;
+}
+
+// 是否为跨页单票的非合计页（统计/汇总应跳过）
+function isMultiPageDetail(f) {
+  return !!(f._multiPageInvoice && !f._multiPageInvoice.isSummary);
+}
+
+// 幂等重建逻辑票分组。依赖已识别的 invoiceNo；识别异步完成后需重复调用。
+function rebuildPdfInvoiceGroups() {
+  var groups = {};
+  for (var i = 0; i < S.files.length; i++) {
+    var f = S.files[i];
+    if (f._placeholder || f._xmlInvoice) { delete f._invoiceGroupId; delete f._multiPageInvoice; continue; }
+    var bk = getPdfBatchKey(f);
+    if (!bk) { delete f._invoiceGroupId; delete f._multiPageInvoice; continue; }
+    (groups[bk] = groups[bk] || []).push(f);
+  }
+  var gk = Object.keys(groups);
+  for (var g = 0; g < gk.length; g++) {
+    var members = groups[gk[g]];
+    if (members.length < 2) { resetGroupMeta(members); continue; }
+    members.sort(function(a, b) { return (a._pdfPageIdx || 0) - (b._pdfPageIdx || 0); });
+    // 同一张跨页票：组内非空发票号去重后唯一
+    var nos = [];
+    members.forEach(function(f) { var n = String(f.invoiceNo || '').replace(/\s+/g, '').trim().toUpperCase(); if (n && nos.indexOf(n) < 0) nos.push(n); });
+    if (nos.length !== 1) { resetGroupMeta(members); continue; }
+    // 合计页 = 组内最后一个识别到含税金额的页；无金额页则取末页
+    var summary = null;
+    members.forEach(function(f) { if (f.amountTax > 0) summary = f; });
+    if (!summary) summary = members[members.length - 1];
+    var total = members.length;
+    members.forEach(function(f, idx) {
+      var isSum = (f === summary);
+      f._invoiceGroupId = bk;
+      f._multiPageInvoice = { total: total, pageNo: idx + 1, isSummary: isSum };
+      // 明细页回填合计页票种（只补空不覆盖，金额不回填）
+      if (summary.invoiceType && !f.invoiceType) f.invoiceType = summary.invoiceType;
+      if (summary._isToll && !f._isToll) f._isToll = true;
+      if (summary._isTicket && !f._isTicket) f._isTicket = true;
+      if (summary._isNonTax && !f._isNonTax) f._isNonTax = true;
+    });
+  }
+}
+
+function resetGroupMeta(members) {
+  for (var i = 0; i < members.length; i++) { delete members[i]._invoiceGroupId; delete members[i]._multiPageInvoice; }
+}
+
 // 生成发票去重key：优先发票号，回退到 销售方+含税金额+日期（针对重复下载被改名的文件）
 function getDupKey(f) {
   if (f.invoiceNo) return 'no:' + String(f.invoiceNo).replace(/\s+/g, '').trim().toUpperCase();
@@ -2172,16 +2239,25 @@ function getDupKey(f) {
   return null;
 }
 
-// 标记重复发票：同 key 出现多次的文件置 _dup=true（保留第一份为原迹）
+// 标记重复发票：同 key 出现多次的文件置 _dup=true（保留第一份为原迹）。
+// 逻辑票感知：同一张跨页发票（组内多页）只计数一次，重复标记按整组置位，
+// 避免多页同票号被误判为彼此重复（issue #40）。
 function updateDuplicateMarks() {
+  rebuildPdfInvoiceGroups();
   var counts = {};
+  var seenLogical = {};
   for (var i = 0; i < S.files.length; i++) {
-    var k = getDupKey(S.files[i]);
-    if (k) counts[k] = (counts[k] || 0) + 1;
+    var f = S.files[i];
+    var key = getDupKey(f);
+    if (!key) continue;
+    var lid = getLogicalInvoiceId(f);
+    if (seenLogical[lid]) continue; // 同逻辑票的页只计数一次
+    seenLogical[lid] = true;
+    counts[key] = (counts[key] || 0) + 1;
   }
   for (var i = 0; i < S.files.length; i++) {
-    var k = getDupKey(S.files[i]);
-    S.files[i]._dup = !!k && counts[k] > 1;
+    var key = getDupKey(S.files[i]);
+    S.files[i]._dup = !!key && counts[key] > 1;
   }
   var dupCount = S.files.filter(function(f) { return f._dup && !f._placeholder; }).length;
   var dupEl = document.getElementById('duplicateCount');
@@ -2191,17 +2267,20 @@ function updateDuplicateMarks() {
 // 删除每组第一份之后的重复项。仅处理按发票号判定的可靠重复（no: key）；
 // sum:（同销售方+金额+日期）疑似重复可能是同日同额的两张真发票，只标记不删除，
 // 交由人工勾选处理。无 key、加载骨架、排版占位一律不动。
+// 逻辑票感知：删除按整组进行——同一张跨页发票绝不拆开单删（防打印缺页）。
 // silent=true 为自动去重路径（加载完成/OCR 识别后），删除后仍会 toast 告知用户。
 function removeDuplicates(silent) {
-  var seen = {};
+  var seen = {}; // key → 已保留的逻辑票 id（该 key 的第一组成员）
   var removed = 0;
   var active = _activeFileIdx >= 0 ? S.files[_activeFileIdx] : null;
   S.files = S.files.filter(function(f) {
     if (f._placeholder || f._loading) return true;
     var key = getDupKey(f);
     if (!key || key.indexOf('no:') !== 0) return true;
-    if (seen[key]) { removed++; return false; }
-    seen[key] = true;
+    var lid = getLogicalInvoiceId(f);
+    if (lid && seen[key] === lid) return true;   // 同逻辑票其余页保留
+    if (seen[key] !== undefined) { removed++; return false; } // 该 key 已有保留组 → 本组删除
+    seen[key] = lid;                              // 记录该 key 第一组的逻辑票 id
     return true;
   });
   _activeFileIdx = active ? S.files.indexOf(active) : -1;
@@ -2213,9 +2292,9 @@ function removeDuplicates(silent) {
     updateFilterSummary();
     selectFilteredOnly();
     renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn();
-    toast(removed ? '已删除 ' + removed + ' 个重复项，保留每组第一份' : '未发现可删除的重复项');
+    toast(removed ? '已删除 ' + removed + ' 个重复发票，每组整版保留' : '未发现可删除的重复项');
   } else if (removed) {
-    toast('已自动去重：删除 ' + removed + ' 个重复项（每组保留第一份）');
+    toast('已自动去重：删除 ' + removed + ' 个重复发票（每组整版保留）');
   }
   return removed;
 }
@@ -2225,6 +2304,15 @@ function removeDuplicates(silent) {
 // =====================================================
 // key（fileSpecKey 的结果）→ ClarityInfo。点「检查清晰度」后填充。
 var _clarityMap = {};
+
+// 跨页发票续页徽章：非合计页显示「续 2/3」，合计页显示「共 3 页」（issue #40）
+function buildMultiPageBadge(f) {
+  if (!f._multiPageInvoice) return '';
+  var t = f._multiPageInvoice.total, n = f._multiPageInvoice.pageNo;
+  if (!t) return '';
+  var label = f._multiPageInvoice.isSummary ? ('共 ' + t + ' 页') : ('续 ' + n + '/' + t);
+  return '<span class="mpp-badge" title="同一张发票的第 ' + n + ' / ' + t + ' 页，统计以合计页金额为准">' + label + '</span>';
+}
 
 /**
  * 清晰度徽章 —— 只对像素不足的位图源显示。
@@ -2318,6 +2406,7 @@ function renderFileList() {
           '<div class="card-meta"><button class="ib card-ib danger" onclick="rmFile(' + i + ')" title="删除空白占位">\u2715</button></div></div>';
       }
       var gcb = f.copies > 1 ? '<span class="copy-badge">' + f.copies + '\u4efd</span>' : '';
+      var gmpb = buildMultiPageBadge(f);
       var grb = f.rotation ? '<span class="rot-badge">' + f.rotation + '°</span>' : '';
       var gdupb = f._dup ? '<span class="dup-badge" title="检测到重复发票">⚠</span>' : '';
       var gab = buildAmtBadge(f);
@@ -2345,7 +2434,7 @@ function renderFileList() {
         '<div class="card-actions">' + gacts + '</div></div>' +
         '<div class="card-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + buildClarityBadge(f) + '</div>' +
         gseller +
-        '<div class="card-meta">' + gpd + gab + gcb + grb + gdupb + gsize + '</div></div>';
+        '<div class="card-meta">' + gpd + gab + gcb + gmpb + grb + gdupb + gsize + '</div></div>';
     }
     if (f._placeholder) {
       var pMeta = '<div class="file-meta-left"><span class="blank-badge">空白</span></div>' +
@@ -2360,6 +2449,7 @@ function renderFileList() {
         '<div class="file-info"><div class="file-name">空白占位</div><div class="file-meta">' + pMeta + '</div></div></div>';
     }
     var cb = f.copies > 1 ? '<span class="copy-badge">' + f.copies + '份</span>' : '';
+    var mpb = buildMultiPageBadge(f);
     var rb = f.rotation ? '<span class="rot-badge">' + f.rotation + '°</span>' : '';
     var dupb = f._dup ? '<span class="dup-badge" title="检测到重复发票：点击左上角「重复」筛选可一键勾选删除">⚠重复</span>' : '';
     var ab = buildAmtBadge(f);
@@ -2378,7 +2468,7 @@ function renderFileList() {
     var pd = f._printed ? '<span class="printed-dot" title="已打印">✓</span>' : '';
     var metaActions = f._loading
       ? '<button class="ib danger" onclick="rmFile(' + i + ')">\u2715</button>'
-      : '<div class="file-meta-left">' + pd + '<span class="file-size">' + fmtSize(f.size) + '</span>' + cb + rb + dupb + ab + '</div>' +
+      : '<div class="file-meta-left">' + pd + '<span class="file-size">' + fmtSize(f.size) + '</span>' + cb + mpb + rb + dupb + ab + '</div>' +
         '<div class="file-meta-sep"></div>' +
         '<div class="file-meta-right">' +
         '<button class="ib sort-btn' + (i === 0 ? ' disabled' : '') + '" onclick="moveFile(' + i + ',-1)" title="上移">\u25B2</button>' +
@@ -2915,9 +3005,11 @@ function showListDragHint() {
 
 // Amount statistics
 function updateAmountSummary() {
+  rebuildPdfInvoiceGroups();
   var el = document.getElementById('amountSummary');
   if (!el) return;
-  var checked = S.files.filter(function(f) { return f.checked; });
+  // 跨页发票只计合计页金额（issue #40），非合计页不参与统计与已识别计数
+  var checked = S.files.filter(function(f) { return f.checked && !isMultiPageDetail(f); });
   var taxTotal = checked.reduce(function(s, f) { return s + (f.amountTax || 0); }, 0);
   var noTaxTotal = checked.reduce(function(s, f) { return s + (f.amountNoTax || 0); }, 0);
   var taxAmtTotal = checked.reduce(function(s, f) { return s + (f.taxAmount || 0); }, 0);
@@ -5116,6 +5208,8 @@ function summaryDeselectAll() {
 
 // Get display value for a field on a fileObj
 function getSummaryCellValue(fileObj, field, idx) {
+  // 跨页发票非合计页：金额留空，避免与合计页重复展示/被误改（issue #40）
+  if (isMultiPageDetail(fileObj) && field.type === 'amount') return '';
   switch (field.key) {
     case 'seq': return String(idx + 1);
     case 'invoiceType':
@@ -5191,9 +5285,12 @@ function renderSummaryTable() {
         html += '<td class="' + cls + '"><input class="' + inputCls + '" value="' + escHtml(val) + '" data-idx="' + idx + '" data-key="' + f.key + '" onchange="onSummaryCellEdit(this)" onfocus="this.select()" onkeydown="onSummaryKeyNav(event, this)"></td>';
       }
 
-      if (f.key === 'amountTax' && fileObj.amountTax > 0) totalAmountTax += fileObj.amountTax;
-      if (f.key === 'amountNoTax' && fileObj.amountNoTax > 0) totalAmountNoTax += fileObj.amountNoTax;
-      if (f.key === 'taxAmount' && fileObj.taxAmount > 0) totalTaxAmount += fileObj.taxAmount;
+      // 跨页发票只计合计页（issue #40），非合计页金额不参与合计行
+      if (!isMultiPageDetail(fileObj)) {
+        if (f.key === 'amountTax' && fileObj.amountTax > 0) totalAmountTax += fileObj.amountTax;
+        if (f.key === 'amountNoTax' && fileObj.amountNoTax > 0) totalAmountNoTax += fileObj.amountNoTax;
+        if (f.key === 'taxAmount' && fileObj.taxAmount > 0) totalTaxAmount += fileObj.taxAmount;
+      }
     });
     html += '</tr>';
   });
@@ -5265,16 +5362,17 @@ async function exportSummaryCsv() {
   var rows = [];
   // Header
   rows.push(visibleFields.map(function(f) { return csvEscape(f.label); }).join(','));
-  // Data rows
+  // Data rows（跨页发票非合计页金额自动留空，issue #40，见 getSummaryCellValue）
   files.forEach(function(fileObj, idx) {
     rows.push(visibleFields.map(function(f) {
       return csvEscape(getSummaryCellValue(fileObj, f, idx));
     }).join(','));
   });
-  // Total row
-  var totalAmountTax = files.reduce(function(s, f) { return s + (f.amountTax || 0); }, 0);
-  var totalAmountNoTax = files.reduce(function(s, f) { return s + (f.amountNoTax || 0); }, 0);
-  var totalTaxAmount = files.reduce(function(s, f) { return s + (f.taxAmount || 0); }, 0);
+  // Total row（跨页发票只计合计页，issue #40）
+  var sumFiles = files.filter(function(f) { return !isMultiPageDetail(f); });
+  var totalAmountTax = sumFiles.reduce(function(s, f) { return s + (f.amountTax || 0); }, 0);
+  var totalAmountNoTax = sumFiles.reduce(function(s, f) { return s + (f.amountNoTax || 0); }, 0);
+  var totalTaxAmount = sumFiles.reduce(function(s, f) { return s + (f.taxAmount || 0); }, 0);
   rows.push(visibleFields.map(function(f, ci) {
     if (f.key === 'amountTax') return csvEscape(totalAmountTax.toFixed(2));
     if (f.key === 'amountNoTax') return csvEscape(totalAmountNoTax.toFixed(2));

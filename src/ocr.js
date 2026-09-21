@@ -162,6 +162,28 @@ function getNonTaxLabel(text) {
 }
 
 /**
+ * 医疗收费票据细分标签（替代 sellerName，语义同非税票据）。
+ * 报销口径是金额合计，不识别自费/统筹等支付分解字段。
+ */
+function getMedicalLabel(text) {
+  var t = text.substring(0, 500);
+  if (/医\s*疗\s*住\s*院/.test(t)) return '医疗住院收费票据';
+  if (/医\s*疗\s*急\s*诊/.test(t)) return '医疗急诊收费票据';
+  if (/医\s*疗\s*门\s*诊/.test(t)) return '医疗门诊收费票据';
+  return '医疗收费票据';
+}
+
+/**
+ * 医疗票明细页（第二页起的长页清单，标题「医疗收费明细」）判定——双确认：
+ * 「医疗收费明细」+「所属电子票据号码」。「所属」前缀是明细页独有特征，
+ * 主票（汇总页）只有「票据号码」，防止普通发票商品名误撞。
+ */
+function isMedicalDetailPage(text) {
+  var t = (text || '').replace(/\s/g, '');
+  return /医疗(?:门诊|住院|急诊)?收费明细/.test(t) && /所属电子票据号码/.test(t);
+}
+
+/**
  * Normalize OCR currency symbol artifacts.
  * OCR commonly misreads digits and ¥ symbols because they look similar:
  *   - "1" as "¥" → "¥¥72.68" should be "¥172.68" (second ¥ is misread "1")
@@ -395,13 +417,15 @@ function applyOcrResult(fileObj, ocrResult) {
       info = extractByCoordinates(ocrResult);
     }
 
-    if (!info) { fileObj._ocrText = ocrResult.text || ''; return; }
+    if (!info) { fileObj._ocrText = ocrResult.text || ''; if (isMedicalDetailPage(fileObj._ocrText)) fileObj._isMedicalDetail = true; return; }
 
     // Always set _ocrText for display — this is the main purpose of running OCR on all pages
     fileObj._ocrText = info._ocrText || ocrResult.text || '';
     fileObj._isTicket = info.isTicket || false;
     fileObj._isNonTax = info.isNonTax || false;
     fileObj._isToll = info.isToll || false;
+    fileObj._isMedical = info.isMedical || false;
+    if (isMedicalDetailPage(fileObj._ocrText)) fileObj._isMedicalDetail = true;
     if (info.invoiceType && !fileObj.invoiceType) fileObj.invoiceType = info.invoiceType;
 
     // If amounts already set by PDF text extraction, skip OCR amount validation
@@ -561,6 +585,8 @@ function applyPdfTextResult(fileObj, pdfTextResult) {
     fileObj._isTicket = info.isTicket || false;
     fileObj._isNonTax = info.isNonTax || false;
     fileObj._isToll = info.isToll || false;
+    fileObj._isMedical = info.isMedical || false;
+    if (isMedicalDetailPage(fileObj._ocrText)) fileObj._isMedicalDetail = true;
     if (info.invoiceType && !fileObj.invoiceType) fileObj.invoiceType = info.invoiceType;
 
     // Only fill empty fields — structured extraction priority
@@ -2754,6 +2780,13 @@ function _detectInvoiceType(words, imgW, imgH) {
       return 'ticket';
     }
   }
+  // 医疗收费票据（门诊/住院/急诊）：财政票据，复用非税提取链路，单独标记
+  // 必须在 nontax 判定之前——否则「票据代码/票据号码/交款人」正则先抢走；
+  // 反向安全：非税票文本不含「医疗收费」字样，不会误入。
+  // 「医疗收费明细」也命中（同为 medical），由 app 侧 isMedicalDetailPage 双确认后作为附件排除。
+  if (/(?:医\s*疗\s*(?:门\s*诊|住\s*院|急\s*诊)?\s*收\s*费\s*(?:票\s*据|明\s*细))/.test(allText)) {
+    return 'medical';
+  }
   // Check for non-tax invoice (非税收入统一票据) keywords
   if (/(?:非\s*税\s*收\s*入|票\s*据\s*号\s*码|票\s*据\s*代\s*码|交\s*款\s*人)/.test(allText)) {
     return 'nontax';
@@ -3050,6 +3083,7 @@ function extractByCoordinates(ocrResult) {
   var vatSubtype = invType === 'vat' ? _detectVatSubtype(words, fullText) : '';
   var isTicket = invType === 'ticket';
   var isToll = invType === 'toll';
+  var isMedical = invType === 'medical';
   var sellerName = textInfo.sellerName || '';
   var sellerCreditCode = textInfo.sellerCreditCode || '';
   var amountTax = 0, amountNoTax = 0, taxAmount = 0;
@@ -3177,16 +3211,16 @@ function extractByCoordinates(ocrResult) {
              _ocrText: fullText, isTicket: true, isNonTax: false, isToll: false };
   }
 
-  // === Non-tax invoice extraction (非税收入票据) ===
-  var isNonTax = invType === 'nontax';
+  // === Non-tax / Medical invoice extraction (非税收入票据 / 医疗收费票据) ===
+  var isNonTax = invType === 'nontax' || invType === 'medical';
   if (isNonTax) {
-    // Non-tax invoices don't have a traditional seller — override with label
-    sellerName = getNonTaxLabel(fullText);
+    // Non-tax/medical invoices don't have a traditional seller — override with label
+    sellerName = isMedical ? getMedicalLabel(fullText) : getNonTaxLabel(fullText);
 
     // Extract amounts using text patterns
     var nontaxAmts = _extractAmountsByText(fullText);
     amountTax = nontaxAmts.amountTax;
-    // 非税发票无税额，不含税价必须等于含税价
+    // 非税/医疗发票无税额，不含税价必须等于含税价
     // 注意：不能信任 nontaxAmts.amountNoTax（可能被中文大写金额误解析，如"叁佰贰拾"→320）
     amountNoTax = amountTax;
     taxAmount = 0;
@@ -3200,12 +3234,12 @@ function extractByCoordinates(ocrResult) {
       sellerCreditCode = '';
     }
 
-    console.log('[坐标提取] 非税票据金额:', amountTax);
+    console.log('[坐标提取]' + (isMedical ? ' 医疗票据' : ' 非税票据') + '金额:', amountTax);
     return { amountTax: amountTax, amountNoTax: amountNoTax, taxAmount: 0,
              sellerName: sellerName, sellerCreditCode: sellerCreditCode,
              invoiceNo: invoiceNo, invoiceDate: invoiceDate,
              buyerName: buyerName, buyerCreditCode: buyerCreditCode,
-             _ocrText: fullText, isTicket: false, isNonTax: true, isToll: false };
+             _ocrText: fullText, isTicket: false, isNonTax: true, isToll: false, isMedical: isMedical };
   }
 
   // === VAT / Ride invoice extraction ===

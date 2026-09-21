@@ -143,7 +143,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **PDF 渲染双引擎**：首选 WinRT（`render_pdf_pages`，`check_winrt_pdf_available()` 启动检测）→ 失败回退 PDFium（`render_pdf_pages_pdfium`）。
 
-**筛选体系**（侧边栏，可折叠）：类型（专票/普票/车票/通行费/非税/其他 `S.typeFilter`）× 格式（PDF/OFD/图片/XML `S.formatFilter`）× 状态（全部/未打印/已打印/重复 `S.printedFilter`/`S.fileFilter`）三维正交；类型匹配与票种 chip 共用 `resolveInvoiceType` 单一真源（车票/通行费直判 `_isTicket`/`_isToll` 分类标记），「其他」= 不渲染票种 chip 的文件（未识别 + 无法归专普的粗粒度串），非税/专票/普票对 XML/OFD/PDF 文字层等非 OCR 来源同样生效；类型/格式切换即切换打印批次，`clearInvisibleChecks()` 清除不可见勾选（防筛选切换后残留勾选重复打印）。列表上方工具栏（`.file-header`）与筛选区（`.filter-section`）sticky 钉在滚动容器顶部，仅列表滚动。
+**筛选体系**（侧边栏，可折叠）：类型（专票/普票/车票/通行费/医疗/非税/其他 `S.typeFilter`）× 格式（PDF/OFD/图片/XML `S.formatFilter`）× 状态（全部/未打印/已打印/重复 `S.printedFilter`/`S.fileFilter`）三维正交；类型匹配与票种 chip 共用 `resolveInvoiceType` 单一真源（车票/通行费/医疗直判 `_isTicket`/`_isToll`/`_isMedical` 分类标记），「其他」= 不渲染票种 chip 的文件（未识别 + 无法归专普的粗粒度串），非税/专票/普票对 XML/OFD/PDF 文字层等非 OCR 来源同样生效；类型/格式切换即切换打印批次，`clearInvisibleChecks()` 清除不可见勾选（防筛选切换后残留勾选重复打印）。列表上方工具栏（`.file-header`）与筛选区（`.filter-section`）sticky 钉在滚动容器顶部，仅列表滚动。
 
 **文件列表双视图**：`S.fileView`（list/grid），`renderFileList()` grid 分支输出 `.file-card`；`updateFileItem()` 按视图增量更新。
 
@@ -165,11 +165,12 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **路径优先级**: PDF 文字层 > OFD XML > XML 数电票 > OCR。OCR 跳过条件：`_pdfTextExtracted && sellerName && amountTax > 0`。
 
-**类型检测** `_detectInvoiceType()`（ocr.js）：ticket > toll > nontax > vat > ride > unknown。
+**类型检测** `_detectInvoiceType()`（ocr.js）：ticket > toll > medical > nontax > vat > ride > unknown。
 
 - 专票 / 普票：`_detectVatSubtype()`（仅 vat 路径判定）—— 票头标题区 `ny < 0.18` 优先、全文兜底；关键词 `普通发票|增值税普通|电子普通` → 普票、`专用发票|增值税专用` → 专票，**「普通」优先于「专用」**（票面其它位置的「专用」字样不致误判）；结果写回 `fileObj.invoiceType`（不覆盖已有结构化类型）
 - ticket：强标记（铁路电子客票/电子客票号）直判 + 弱信号 `_countTicketSignalGroups()` 13 组关键词 ≥2 组确认，防增值税票误判；`getTicketTypeLabel()` 细分标签
 - toll（通行费）：「通行费」强标记；「车牌号/车牌颜色+通行日期」弱标记双组确认；复用 VAT 提取链路（销售方=路桥公司），不走 ticket/nontax 早退分支；老式纸质票无价税合计时两段式金额兜底
+- **medical（医疗收费票据）**：强标记「医疗门诊/住院/急诊收费票据|医疗收费明细」，**必须在 nontax 判定前**（否则「票据代码/票据号码/交款人」先抢走判成非税）；复用非税提取链路（金额合计/票据号码/交款人），`getMedicalLabel()` 细分门诊/住院/急诊标签；报销口径只取金额合计，不识别自费/统筹等支付分解字段。明细页（第二页起「医疗收费明细」长清单）由 `isMedicalDetailPage()` 双确认（`医疗收费明细` + `所属电子票据号码`，「所属」前缀是明细页独有特征），`finalizeMedicalDetailPages()` 从列表移除——只留汇总首页、不参与排版/统计/去重，主票挂「附N页明细」徽章并 toast（幂等 `_medDetailHandled`，与逻辑票聚合 issue #40 共存，移除后 `updateDuplicateMarks()` 重排）；web 分支识别同步（js/pdf-text.js）
 
 **金额提取**：含税价 → 数学验证配对 → 区域解析三阶段；中文大写 `parseChineseNumeral()` 兜底；金额求和校验失败时卡片 ⚠ 徽章 + hover 详情 + 汇总栏计数。
 

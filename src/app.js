@@ -1401,11 +1401,13 @@ function applyOcrAsync(fileObj, dataUrl) {
     }
     return ocrPromise.then(function() {
       fileObj._ocrPending = false;
+      // 先排除医疗明细页，再去重——否则明细页会以「去重」名义被整页删掉，
+      // 主票不挂徽章且 toast 误导（明细页 no: 与主票同号）
+      finalizeMedicalDetailPages([fileObj]);
       if (S.feat.autoDedup) {
         var autoRemoved = removeDuplicates(true);
         if (autoRemoved) { updatePreview(); updatePrintBtn(); updateSummaryBtn(); }
       }
-      finalizeMedicalDetailPages([fileObj]);
       updateFileItem(fileObj);
       updateAmountSummary();
       // Show result toast only for single-file OCR triggered by button click
@@ -2236,6 +2238,7 @@ function rebuildPdfInvoiceGroups() {
       if (summary._isToll && !f._isToll) f._isToll = true;
       if (summary._isTicket && !f._isTicket) f._isTicket = true;
       if (summary._isNonTax && !f._isNonTax) f._isNonTax = true;
+      if (summary._isMedical && !f._isMedical) f._isMedical = true;
     });
   }
 }

@@ -2259,7 +2259,13 @@ function updateDuplicateMarks() {
     var key = getDupKey(S.files[i]);
     S.files[i]._dup = !!key && counts[key] > 1;
   }
-  var dupCount = S.files.filter(function(f) { return f._dup && !f._placeholder; }).length;
+  // 重复计数按逻辑票（跨页多页算一张），_dup 仍按页整组置位供筛选/删除勾选
+  var dupLogical = {};
+  for (var i = 0; i < S.files.length; i++) {
+    var f2 = S.files[i];
+    if (f2._dup && !f2._placeholder) dupLogical[getLogicalInvoiceId(f2)] = true;
+  }
+  var dupCount = Object.keys(dupLogical).length;
   var dupEl = document.getElementById('duplicateCount');
   if (dupEl) dupEl.textContent = dupCount ? '(' + dupCount + ')' : '';
 }
@@ -2271,6 +2277,7 @@ function updateDuplicateMarks() {
 // silent=true 为自动去重路径（加载完成/OCR 识别后），删除后仍会 toast 告知用户。
 function removeDuplicates(silent) {
   var seen = {}; // key → 已保留的逻辑票 id（该 key 的第一组成员）
+  var removedLids = {}; // 被删除的逻辑票 id（跨页多页算一张，计数不膨胀）
   var removed = 0;
   var active = _activeFileIdx >= 0 ? S.files[_activeFileIdx] : null;
   S.files = S.files.filter(function(f) {
@@ -2279,7 +2286,10 @@ function removeDuplicates(silent) {
     if (!key || key.indexOf('no:') !== 0) return true;
     var lid = getLogicalInvoiceId(f);
     if (lid && seen[key] === lid) return true;   // 同逻辑票其余页保留
-    if (seen[key] !== undefined) { removed++; return false; } // 该 key 已有保留组 → 本组删除
+    if (seen[key] !== undefined) {               // 该 key 已有保留组 → 本逻辑票整组删除
+      if (!removedLids[lid]) { removedLids[lid] = true; removed++; }
+      return false;
+    }
     seen[key] = lid;                              // 记录该 key 第一组的逻辑票 id
     return true;
   });
@@ -2292,9 +2302,9 @@ function removeDuplicates(silent) {
     updateFilterSummary();
     selectFilteredOnly();
     renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn();
-    toast(removed ? '已删除 ' + removed + ' 个重复发票，每组整版保留' : '未发现可删除的重复项');
+    toast(removed ? '已删除 ' + removed + ' 个重复发票（跨页票整组保留/删除）' : '未发现可删除的重复项');
   } else if (removed) {
-    toast('已自动去重：删除 ' + removed + ' 个重复发票（每组整版保留）');
+    toast('已自动去重：删除 ' + removed + ' 个重复发票（跨页票整组删除）');
   }
   return removed;
 }

@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue.svg)]()
 [![Tauri 2.x](https://img.shields.io/badge/Tauri-2.x-orange.svg)]()
-[![Version](https://img.shields.io/badge/Version-2.6.6-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-2.6.7-blue.svg)]()
 
 轻量桌面应用，专为批量打印电子发票设计。支持 PDF、OFD、图片等多格式导入，智能排版，一键打印或导出。
 
@@ -261,6 +261,7 @@ npm run bump 1.9.8   # 同步 package.json → Cargo.toml → tauri.conf.json
 - [x] 修复 https 请求全挂（ureq TLS 后端缺失）+ 尾部第一个空槽点击失效（v2.6.5）
 - [x] NSIS 固定使用项目图标 + GitHub Actions 适配 Node.js 24（v2.6.6）
 - [x] 粘贴单格式 + 清晰度体检/打印自动增强 + 单票缩放 5x + 白边裁剪打印一致性修复（v2.6.6）
+- [x] 医疗收费票据专类（门诊/住院/急诊）+ 医疗明细页附件化 + 多页发票逻辑票聚合（issue #40）（v2.6.7）
 
 ## 🤖 关于此项目
 

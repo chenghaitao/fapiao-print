@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- **版本**: v2.6.6（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json）
+- **版本**: v2.6.7（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json）
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架、无打包）
 - **双版本**: 轻量版 / OCR 版（PP-OCRv6）；Cargo.toml 定义 `ocr` feature，`lib.rs` 按 `#[cfg(feature = "ocr")]` 条件注册命令，OCR 构建用 `tauri.ocr.conf.json` 叠加配置（仅追加 bundle.resources）
 - **目录结构**:
@@ -154,6 +154,8 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 **文件列表记忆**（可选 `S.feat.fileListMemory`）：启动 `restoreFiles()` 批量恢复路径，`check_path_exists` 校验；`_isRestoringFiles` 阻止恢复期触发 OCR。
 
 **重复发票识别**：`getDupKey()` 按发票号（`no:`）或 销售方+金额+日期（`sum:` 疑似）生成 key 标记 `_dup`。**安全边界**：自动删除只信任 `no:` key，`sum:` 一律跳过（同日同销售方同金额的真发票会被误判，仅标记交人工核对）；「重复」筛选会覆盖原有勾选（toast 明示）。
+
+**多页发票「逻辑票」聚合**（issue #40）：按发票号把同一张跨页发票的多个页面聚为一张「逻辑票」——`_invoiceGroupId`（同页同值，取首成员 id）为分组标识，`rebuildInvoiceGroups()` 幂等重建（依赖已识别的 invoiceNo，PDF 文字层/OCR 完成后须再调一次）。统计/去重/删除/类型判定一律按逻辑票整组处理：跨页发票只计数一次、`_dup` 整组置位、删除绝不拆组（防打印缺页）、续页徽章（非合计页「续 2/3」/ 合计页「共 3 页」）。医疗明细页移除后须重排分组，清掉残留的跨页聚合元数据。
 
 **图片文本增强**（`toggleTextEnhance`，纯本地）：Rust `enhance_image()` 读原图全分辨率 → EXIF 烘焙 → 直方图 1%/99% 色阶拉伸 + gamma 1.4 + USM 锐化 → JPEG q92；同一 LUT 应用 RGB 三通道（红章保色），退化图恒等映射防噪点放大。`f._enhanced` + 备份可还原；打印链路走 dataUrl 分支（去重 key 改用 previewUrl）；限图片文件且有 `_filePath`（web 未移植）。**核心 `enhance_rgb_inplace()` 与打印自动增强共用（单一真源）**，`normalize_for_jpeg()` 统一 16 位/32F 高精度图。
 

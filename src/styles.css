@@ -75,6 +75,7 @@ html.dark .vat-badge.special { background: #3a3520; color: #d69e2e; border-color
 html.dark .vat-badge.toll { background: #122a26; color: #2dd4bf; border-color: #1f4d45; }
 html.dark .vat-badge.ticket { background: #1a2a4a; color: #64b5f6; }
 html.dark .vat-badge.nontax { background: #2a2440; color: #b794f6; border-color: #44337a; }
+html.dark .vat-badge.medical { background: #06281c; color: #34d399; border-color: #064e3b; }
 html.dark .file-summary { background: #16213e; border-top-color: #2a2a4a; }
 html.dark .sec { border-bottom-color: #2a2a4a; }
 html.dark .tgl { background: #3a3a5a; }
@@ -272,6 +273,7 @@ input, textarea, select, [contenteditable="true"], .modal-body, .modal-body *, p
 .amt-warn-badge { background: var(--danger-light); color: var(--danger); padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 700; white-space: nowrap; cursor: help; }
 .rot-badge { font-size: 10px; color: var(--accent); font-weight: 700; }
 .dup-badge { background: var(--danger-light); color: var(--danger); padding: 2px 7px; border-radius: 3px; font-size: 11px; font-weight: 700; cursor: help; }
+.mpp-badge { background: var(--surface2); color: var(--text-muted); padding: 2px 7px; border-radius: 3px; font-size: 11px; font-weight: 700; cursor: help; white-space: nowrap; }
 .clarity-badge { background: var(--danger-light); color: var(--danger); padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 700; margin-left: 5px; cursor: help; white-space: nowrap; vertical-align: middle; display: inline-block; }
 .seller-badge { font-size: 10px; color: var(--text-muted); padding: 1px 4px; border-radius: 3px; background: var(--surface2); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
 .ticket-badge { font-size: 10px; color: #1976d2; padding: 1px 4px; border-radius: 3px; background: #e3f2fd; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
@@ -285,6 +287,8 @@ input, textarea, select, [contenteditable="true"], .modal-body, .modal-body *, p
 .vat-badge.toll { background: #f0fdfa; color: #0d9488; border-color: #99f6e4; }
 .vat-badge.ticket { background: #e3f2fd; color: #1976d2; }
 .vat-badge.nontax { background: #f5f3ff; color: #7c3aed; border-color: #ddd6fe; }
+.vat-badge.medical { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
+.vat-badge.detail { background: var(--surface2); color: var(--text-muted); border-color: var(--border); }
 .file-summary {
   padding: 10px 12px; border-top: 1px solid var(--border); background: var(--surface2);
   font-size: 12px; display: flex; align-items: center; gap: 8px;

@@ -736,6 +736,11 @@ html.dark .toast-spinner { border-color: rgba(26,26,46,0.3); border-top-color: #
 .update-asset-name { color: var(--text-primary); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .update-asset-size { color: var(--text-muted); font-size: 12px; flex-shrink: 0; }
 
+/* 四个操作按钮单行放不下（内容区 470px < 按钮总宽 518px）：三个次要按钮一行 + 主按钮独占一行 */
+.update-modal .modal-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.update-modal .modal-actions .btn { padding: 9px 6px; font-size: 13px; white-space: nowrap; }
+.update-modal .modal-actions #updateOpenBtn { grid-column: 1 / -1; }
+
 /* Statusbar version — clickable */
 #stVersion { display: flex; align-items: center; gap: 6px; transition: color 0.15s; }
 #stVersion:hover { color: var(--accent); }

@@ -19,22 +19,7 @@
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-tabs">
-      <div class="sidebar-tab active" id="tabFiles" onclick="switchTab('files',this)">
-        <span class="tab-main">📁 发票</span>
-        <div class="type-ctrl">
-          <button class="type-toggle" id="typeToggle" onclick="toggleTypeMenu()" title="按发票类型筛选（切换即自动勾选当前筛选结果并同步右侧预览，可分类型分批打印；识别/解析后生效）"><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6.5 4 4 4-4"/></svg></button>
-          <div class="copy-menu hidden" id="typeFilterMenu">
-            <div class="copy-menu-item" data-type="all" onclick="setTypeFilter('all')">全部</div>
-            <div class="copy-menu-item" data-type="special" onclick="setTypeFilter('special')">专票</div>
-            <div class="copy-menu-item" data-type="plain" onclick="setTypeFilter('plain')">普票</div>
-            <div class="copy-menu-item" data-type="ticket" onclick="setTypeFilter('ticket')">车票</div>
-            <div class="copy-menu-item" data-type="toll" onclick="setTypeFilter('toll')">通行费</div>
-            <div class="copy-menu-item" data-type="medical" onclick="setTypeFilter('medical')">医疗</div>
-            <div class="copy-menu-item" data-type="nontax" onclick="setTypeFilter('nontax')">非税</div>
-            <div class="copy-menu-item" data-type="other" onclick="setTypeFilter('other')" title="未识别出类型，或识别到的类型无法归入专票/普票">其他</div>
-          </div>
-        </div>
-      </div>
+      <button class="sidebar-tab active" onclick="switchTab('files',this)">📁 发票</button>
       <button class="sidebar-tab" onclick="switchTab('settings',this)">⚙ 排版</button>
       <button class="sidebar-tab" onclick="switchTab('print',this)">🖨 打印</button>
       <button class="sidebar-tab" onclick="switchTab('prefs',this)">🔧 设置</button>
@@ -77,6 +62,16 @@
           </div>
           <div class="filter-body">
             <div class="filter-body-inner">
+              <div class="print-filter-bar type-filter-bar" id="typeFilterBar" title="按发票类型筛选列表（切换即自动勾选当前筛选结果并同步右侧预览，可分类型分批打印；识别/解析后生效）">
+                <button class="pf-btn pf-active" data-type="all" onclick="setTypeFilter('all')">全部</button>
+                <button class="pf-btn" data-type="special" onclick="setTypeFilter('special')">专票</button>
+                <button class="pf-btn" data-type="plain" onclick="setTypeFilter('plain')">普票</button>
+                <button class="pf-btn" data-type="ticket" onclick="setTypeFilter('ticket')">车票</button>
+                <button class="pf-btn" data-type="toll" onclick="setTypeFilter('toll')">通行费</button>
+                <button class="pf-btn" data-type="medical" onclick="setTypeFilter('medical')">医疗</button>
+                <button class="pf-btn" data-type="nontax" onclick="setTypeFilter('nontax')">非税</button>
+                <button class="pf-btn" data-type="other" onclick="setTypeFilter('other')" title="未识别出类型，或识别到的类型无法归入专票/普票">其他</button>
+              </div>
               <div class="print-filter-bar type-filter-bar" id="formatFilterBar" title="按文件格式筛选列表（切换即自动勾选当前筛选结果并同步右侧预览，可分格式分批打印）">
                 <button class="pf-btn pf-active" data-format="all" onclick="setFormatFilter('all')">全部</button>
                 <button class="pf-btn" data-format="pdf" onclick="setFormatFilter('pdf')">PDF</button>

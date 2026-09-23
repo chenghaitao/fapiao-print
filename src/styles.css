@@ -168,8 +168,10 @@ input, textarea, select, [contenteditable="true"], .modal-body, .modal-body *, p
 }
 /* 类型/格式行与状态行组成连续筛选区，中间行去分隔线 */
 .type-filter-bar { padding: 3px 8px; }
+/* flex-basis:auto —— 先按文字宽度给底，余量再均分：宽窄不同的标签（如「通行费」）
+   各自拿到相等的左右留白，不再被均分挤到贴边 */
 .pf-btn {
-  flex: 1; padding: 2px 0; font-size: 11px; border: 1px solid var(--border);
+  flex: 1 1 auto; padding: 2px 4px; font-size: 11px; border: 1px solid var(--border);
   border-radius: 4px; background: transparent; color: var(--text-secondary);
   cursor: pointer; transition: all 0.15s;
 }

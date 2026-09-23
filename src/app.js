@@ -2045,6 +2045,8 @@ function applyFilterSelection() {
 }
 
 function setTypeFilter(t) {
+  var menu = document.getElementById('typeFilterMenu');
+  if (menu) menu.classList.add('hidden');
   if (S.typeFilter === t) return;
   S.typeFilter = t;
   syncTypeFilterButtons();
@@ -2055,11 +2057,20 @@ function setTypeFilter(t) {
   updateSummaryBtn();
 }
 
+// 类型筛选入口 = 顶部「发票」标签旁的下拉（筛选面板不再占横排按钮的空间）
+function toggleTypeMenu() {
+  var menu = document.getElementById('typeFilterMenu');
+  if (menu.classList.contains('hidden')) syncTypeFilterButtons();
+  menu.classList.toggle('hidden');
+}
+
 function syncTypeFilterButtons() {
   var active = S.typeFilter;
-  document.querySelectorAll('#typeFilterBar .pf-btn').forEach(function(b) {
-    b.classList.toggle('pf-active', b.dataset.type === active);
+  document.querySelectorAll('#typeFilterMenu .copy-menu-item').forEach(function(b) {
+    b.classList.toggle('on', b.dataset.type === active);
   });
+  var tg = document.getElementById('typeToggle');
+  if (tg) tg.classList.toggle('on', active !== 'all');
 }
 
 // 与票种 chip 共用 resolveInvoiceType 单一真源：非税/专票/普票对 XML/OFD/PDF 文字层
@@ -4082,6 +4093,10 @@ document.addEventListener('click', function(e) {
   if (!e.target.closest('.zoom-ctrl')) {
     var zm = document.getElementById('zoomMenu');
     if (zm) zm.classList.add('hidden');
+  }
+  if (!e.target.closest('.type-ctrl')) {
+    var tm = document.getElementById('typeFilterMenu');
+    if (tm) tm.classList.add('hidden');
   }
   var xm = document.getElementById('ctxMenu');
   if (xm && !xm.classList.contains('hidden') && !e.target.closest('#ctxMenu')) xm.classList.add('hidden');

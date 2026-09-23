@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- **版本**: v2.6.7（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json）
+- **版本**: v2.6.7（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架、无打包）
 - **双版本**: 轻量版 / OCR 版（PP-OCRv6）；Cargo.toml 定义 `ocr` feature，`lib.rs` 按 `#[cfg(feature = "ocr")]` 条件注册命令，OCR 构建用 `tauri.ocr.conf.json` 叠加配置（仅追加 bundle.resources）
 - **目录结构**:
@@ -175,6 +175,8 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - **medical（医疗收费票据）**：强标记「医疗门诊/住院/急诊收费票据|医疗收费明细」，**必须在 nontax 判定前**（否则「票据代码/票据号码/交款人」先抢走判成非税）；复用非税提取链路（金额合计/票据号码/交款人），`getMedicalLabel()` 细分门诊/住院/急诊标签；报销口径只取金额合计，不识别自费/统筹等支付分解字段。明细页（第二页起「医疗收费明细」长清单）由 `isMedicalDetailPage()` 双确认（`医疗收费明细` + `所属电子票据号码`，「所属」前缀是明细页独有特征），`finalizeMedicalDetailPages()` 从列表移除——只留汇总首页、不参与排版/统计/去重，主票挂「附N页明细」徽章并 toast（幂等 `_medDetailHandled`，与逻辑票聚合 issue #40 共存，移除后 `updateDuplicateMarks()` 重排）；web 分支识别同步（js/pdf-text.js）
 
 **金额提取**：含税价 → 数学验证配对 → 区域解析三阶段；中文大写 `parseChineseNumeral()` 兜底；金额求和校验失败时卡片 ⚠ 徽章 + hover 详情 + 汇总栏计数。
+
+**多页发票逻辑票聚合**（v2.6.7，issue #40）：**物理层逐页输出不变**，逻辑层新增分组——`rebuildPdfInvoiceGroups()` 把同批次同 PDF（`getPdfBatchKey` = `_pdfPath|_batchId`）且组内非空发票号去重后**唯一**的多页归为一张逻辑票，写回 `_invoiceGroupId`（= 批次 key）+ `_multiPageInvoice{total,pageNo,isSummary}`；**合计页** = 组内最后一个识别到含税金额的页（无则取末页），统计口径（底部汇总 / 汇总表合计行 / CSV）经 `isMultiPageDetail()` 跳过非合计页，明细页仅回填合计页票种（只补空不覆盖，金额不回填）；去重 `updateDuplicateMarks()` / `removeDuplicates` 按 `getLogicalInvoiceId()` **整组计数 + 整组删除**，杜绝续页被当成重复自动删除导致打印缺页；续页徽章 `buildMultiPageBadge()`「续 n/N」「共 N 页」列表 / 卡片双视图共用。分组**幂等**，依赖已识别的 `invoiceNo`，识别异步完成后须重跑；`_placeholder` / `_xmlInvoice` 不参与。
 
 **购销方识别**（表头锚点 + 交叉验证）：`_determineLabelSide()` 用「购买方/销售方」表头 x 坐标作区域锚点（支持融合词与 CJK 拆字）；`_getSideBoundary()` 动态边界（双表头中点/单表头±0.25/无表头 0.5）；`_crossValidateBuyerSeller()` 四规则（同名清空 sellerName、位置反了交换、信用代码位置交换、同侧迁移）；`_headerCache` 按 words 引用缓存防重复扫描。
 

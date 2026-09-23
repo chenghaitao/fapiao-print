@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- **版本**: v2.6.7（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
+- **版本**: v2.6.8（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架、无打包）
 - **双版本**: 轻量版 / OCR 版（PP-OCRv6）；Cargo.toml 定义 `ocr` feature，`lib.rs` 按 `#[cfg(feature = "ocr")]` 条件注册命令，OCR 构建用 `tauri.ocr.conf.json` 叠加配置（仅追加 bundle.resources）
 - **目录结构**:
@@ -118,6 +118,8 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 **粘贴单模式**（`S.feat.pasteMode`，v2.6.6）：表单式整页版式，票据只排在装订线上方、签字栏下方；**与报销单分段互斥**（开启互关，`enablePasteMode`/`enableReimburse` 同步 UI）。独立边距（`pasteTop/Bottom/Left/Right`，默认上 20.8mm 装订区 / 下·左·右 4.1mm）+ 装订线（`pasteBindLine` 开关 + `pasteBindText` 文字 + `pasteBindSize` 字号）+ 右下角签字栏（`pasteShowSig` + `pasteSigCols` 列名 / `pasteSigWidth` 宽 / `pasteSigRowH` 表头行高 / `pasteSigBodyH` 填写行高 / `pasteSigGap` 区间距），签字栏留空打印后手写；粘贴单下页码/日期/自定义页脚停用（`getPageSettings` 置空）；Rust `calculate_layout_mm` 与 JS 解析规则逐字对应（预览/PDF 同源）；`applyPastePreset()` 一键恢复标准边距，`resetSettings` 的 `layoutOnly` 分支须同步粘贴单 UI。
 
 **单票独立调整**：`fileObj.{slotScale, slotOffsetX, slotOffsetY}`，CSS transform 预览 + Rust `SlotSpec` 参数输出。九宫格快速对齐、数字框/滑块滚轮微调、选中后滚轮缩放单票（5%/步）、拖拽约束按实际显示尺寸动态计算、放大上限 5x、编辑态溢出可见（`.selected/.dragging` 时 `overflow:visible`）。持久化：`perFileAdjustments` Map 按文件名匹配，可选开关。
+
+**选中票面浮动工具条**（v2.6.1，v2.6.8 钳制 + 删除）：`app.js syncSlotToolbar()` 把 `#slotToolbar` 锚在选中槽位上方居中（CSS `translateX(-50%)`），随 `previewWrap` 滚动与窗口 resize 重算。⚠️ 两条硬约定：①**水平必须左右钳制**在预览区可视宽度内（各留 8px，槽位比工具条还窄时贴边）——否则 2×2 / 3×3 右列槽位的右半截会跑出框外（issue #43①）；②**先 `classList.remove('hidden')` 再读 `offsetWidth`**，`display:none` 时宽度为 0 会让钳制失效。按钮：重置 / 居中 / 应用到全部 / 旋转 / **✕ 删除**（`deleteSlotInvoice()`，删完清空选中）。
 
 **预览滚轮交互**（`previewWrap` wheel 三分支，按优先级）：选中槽位+悬停 → 缩放单票；Ctrl+滚轮 → 缩放整体视图；普通滚轮 → 滚动内容，触顶/触底翻页。`_wheelFlipTs` 150ms 节流。
 

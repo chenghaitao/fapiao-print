@@ -82,6 +82,7 @@ var S = {
     fileListMemory: false,
     autoDedup: false,
     autoEnhance: false,
+    compatFlat: false,
     pasteMode: false, pasteBindLine: true, pasteShowSig: true
   }
 };
@@ -276,6 +277,9 @@ function updateLoadingProgress(phase, current, total) {
     } else if (phase === 'print') {
       detail.textContent = current + ' / ' + total + ' 页';
       if (text) text.textContent = '正在渲染打印...';
+    } else if (phase === 'flatten') {
+      detail.textContent = current + ' / ' + total + ' 页';
+      if (text) text.textContent = '正在转为兼容格式...';
     } else {
       detail.textContent = current + ' / ' + total;
       if (text) text.textContent = '正在处理...';
@@ -1213,6 +1217,12 @@ async function processFilesIncremental(paths, batchInfo) {
   var remaining = placeholders.slice();
   var promises = loadPromises.slice();
   var completedCount = 0;
+  // 视图刷新按时间片合并：渲染数据早已并行就绪时，逐文件全量重绘 + 双 rAF
+  // 会让加载白耗数秒（renderFileList 是 O(n) 重建，累计 O(n²)）。每 ≥100ms 才
+  // 重绘一次并让帧；渲染 IPC 本身慢时（完成间隔本就 >100ms）行为与逐文件刷新
+  // 完全等价，进度与骨架屏反馈不受影响。
+  var lastFlushTs = Date.now();
+  var UI_FLUSH_MS = 100;
 
   while (remaining.length > 0) {
     // 等待任意一个完成
@@ -1257,8 +1267,11 @@ async function processFilesIncremental(paths, batchInfo) {
       }
     }
 
-    renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn();
-    await nextFrame();
+    if (Date.now() - lastFlushTs >= UI_FLUSH_MS) {
+      lastFlushTs = Date.now();
+      renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn();
+      await nextFrame();
+    }
   }
 
   if (slotInsert) locateInsertedFile(_lastInsertedId);
@@ -4104,19 +4117,30 @@ async function processTrim() {
     toast('裁剪需要桌面版');
     return;
   }
+  var targets = [];
+  for (var i = 0; i < S.files.length; i++) {
+    var f = S.files[i];
+    if (f.previewUrl && !f.trimmedUrl) targets.push(f);
+  }
+  // 无可裁剪项（已全部裁过 / 无图片）：直接返回，不发空批次 IPC，也不闪 loading
+  if (!targets.length) return;
   showLoading('裁剪白边...');
   try {
-    for (var i = 0; i < S.files.length; i++) {
-      var f = S.files[i];
-      if (f.previewUrl && !f.trimmedUrl) {
-        var trimmed = await invoke('trim_image', { dataUrl: f.previewUrl, pad: getTrimPad() });
-        if (!trimmed || !trimmed.dataUrl) continue;
-        f.trimmedUrl = trimmed.dataUrl;
-        var tb = trimmed.trimBox;
-        f.trimmedBox = (tb && tb[2] > 0 && tb[3] > 0) ? { x: tb[0], y: tb[1], w: tb[2], h: tb[3] } : null;
-        f.trimmedW = f.trimmedBox ? f.trimmedBox.w : 0;
-        f.trimmedH = f.trimmedBox ? f.trimmedBox.h : 0;
-      }
+    // 一次 IPC 批量裁剪（Rust 内 rayon 并行），替代逐张串行 invoke：
+    // 每张一次的往返 + 全量 base64 传输曾是加载完成后最大的一段串行等待
+    var results = await invoke('trim_images_batch', {
+      dataUrls: targets.map(function(t) { return t.previewUrl; }),
+      pad: getTrimPad()
+    });
+    for (var j = 0; j < targets.length; j++) {
+      var t = targets[j];
+      var trimmed = results && results[j];
+      if (!trimmed || !trimmed.dataUrl) continue;
+      t.trimmedUrl = trimmed.dataUrl;
+      var tb = trimmed.trimBox;
+      t.trimmedBox = (tb && tb[2] > 0 && tb[3] > 0) ? { x: tb[0], y: tb[1], w: tb[2], h: tb[3] } : null;
+      t.trimmedW = t.trimmedBox ? t.trimmedBox.w : 0;
+      t.trimmedH = t.trimmedBox ? t.trimmedBox.h : 0;
     }
     hideLoading();
     updatePreview();
@@ -4195,6 +4219,8 @@ function getSettings() {
     footerText: S.feat.footer && !S.feat.pasteMode ? document.getElementById('footerText').value : '',
     footerMargin: (S.feat.pageNum || S.feat.printDate || S.feat.footer) ? (S.feat.customFM ? parseFloat(document.getElementById('footerMargin').value) || 0 : _autoFooterMargin()) : 0,
     customFm: S.feat.customFM,
+    // 老打印机兼容模式（issue #46）：生成后整页栅格化为位图 PDF，进缓存比较（切换即失效）
+    compatFlat: !!S.feat.compatFlat,
     copies: parseInt(document.getElementById('copies').value) || 1,
     collate: S.feat.collate, duplex: S.feat.duplex,
     printerName: document.getElementById('printerSel').value || null
@@ -4372,7 +4398,7 @@ function saveSettings() {
     printerName: document.getElementById('printerSel').value || null,
     feat: {}
   };
-  var featKeys = ['cutline','number','border','trimWhite','watermark','collate','duplex','pageNum','printDate','footer','autoOpenPdf','customFM','slotAdjMemory','fileListMemory','autoDedup','reimburse','copyBadge','autoEnhance','pasteMode','pasteBindLine','pasteShowSig'];
+  var featKeys = ['cutline','number','border','trimWhite','watermark','collate','duplex','pageNum','printDate','footer','autoOpenPdf','customFM','slotAdjMemory','fileListMemory','autoDedup','reimburse','copyBadge','autoEnhance','compatFlat','pasteMode','pasteBindLine','pasteShowSig'];
   featKeys.forEach(function(k) { o.feat[k] = S.feat[k]; });
   o.reimburseHeight = document.getElementById('reimburseHeight').value;
   o.trimPad = getTrimPad();
@@ -4512,6 +4538,7 @@ function loadSettings() {
       reimburse: 'toggleReimburse',
       copyBadge: 'toggleCopyBadge',
       autoEnhance: 'toggleAutoEnhance',
+      compatFlat: 'toggleCompatFlat',
       pasteMode: 'togglePasteMode',
       pasteBindLine: 'togglePasteBindLine',
       pasteShowSig: 'togglePasteSig'
@@ -4732,7 +4759,7 @@ function resetSettings(scope) {
   // scope='layout'：仅恢复「排版」页（纸张/行列/边距/间距/水印等），不动打印与偏好（issue #33）
   var layoutOnly = scope === 'layout';
   if (!confirm(layoutOnly ? '仅恢复「排版」页默认设置（纸张/行列/边距/间距/水印等），不影响打印、OCR、主题等偏好？' : '确认恢复所有默认设置？')) return;
-  var featDefaults = { cutline: true, number: false, border: false, trimWhite: false, trimPad: 3, watermark: false, footer: false, customFM: false, collate: true, duplex: false, pageNum: false, printDate: false, autoOpenPdf: true, ocrEnabled: false, pdfTextEnabled: true, slotAdjMemory: false, fileListMemory: false, autoDedup: false, reimburse: false, copyBadge: false, autoEnhance: false, pasteMode: false, pasteBindLine: true, pasteShowSig: true };
+  var featDefaults = { cutline: true, number: false, border: false, trimWhite: false, trimPad: 3, watermark: false, footer: false, customFM: false, collate: true, duplex: false, pageNum: false, printDate: false, autoOpenPdf: true, ocrEnabled: false, pdfTextEnabled: true, slotAdjMemory: false, fileListMemory: false, autoDedup: false, reimburse: false, copyBadge: false, autoEnhance: false, compatFlat: false, pasteMode: false, pasteBindLine: true, pasteShowSig: true };
   S.layout = { cols: 1, rows: 1 };
   if (layoutOnly) {
     ['cutline','number','border','trimWhite','watermark','reimburse','copyBadge','pasteMode'].forEach(function(k) { S.feat[k] = featDefaults[k]; });
@@ -4789,6 +4816,7 @@ function resetSettings(scope) {
   if (!layoutOnly) {
     document.getElementById('toggleAutoEnhance').classList.remove('on');
     document.getElementById('enhanceOpts').style.display = 'none';
+    document.getElementById('toggleCompatFlat').classList.remove('on');
     document.getElementById('togglePasteBindLine').classList.add('on');
     document.getElementById('togglePasteSig').classList.add('on');
     document.getElementById('pasteOpts').style.display = 'none';

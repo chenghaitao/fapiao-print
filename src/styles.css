@@ -488,7 +488,9 @@ input[type="range"] { flex: 1; height: 5px; accent-color: var(--accent); cursor:
 
 /* ===== Preview ===== */
 .preview-wrap { flex: 1; overflow: auto; padding: 20px; display: flex; position: relative; }
-#previewPages { margin: 0 auto; align-self: flex-start; }
+/* 页高小于预览区时上下留白均分（issue #45）；margin:auto 在内容溢出时自动归零，滚动不受影响，
+   不能换成 align-self:center——交叉轴居中在溢出时会裁掉页面上半部分 */
+#previewPages { margin: auto; }
 .preview-container { background: var(--surface); box-shadow: var(--shadow-lg); position: relative; flex-shrink: 0; }
 
 /* 选中槽位浮动工具条（issue #33） */

@@ -186,9 +186,13 @@ pub struct RenderedImage {
     pub render_dpi: u32,
 }
 
+/// 逐页渲染为白底 PNG dataURL。
+/// `on_page`: 每页渲染完成后的回调 (已完成页数, 总页数)，供调用方上报进度
+/// （兼容模式整页栅格化时 300dpi 渲染耗时明显，没有回调界面会静默数秒）。
 pub fn render_pdf_to_images(
     pdf_bytes: &[u8],
     dpi: u32,
+    on_page: Option<&dyn Fn(u32, u32)>,
 ) -> Result<Vec<RenderedImage>, String> {
     if crate::pdf_engine::SHUTTING_DOWN.load(Ordering::SeqCst) {
         return Err("应用正在关闭".to_string());
@@ -320,7 +324,12 @@ pub fn render_pdf_to_images(
         });
 
         match rendered {
-            Ok(img) => results.push(img),
+            Ok(img) => {
+                results.push(img);
+                if let Some(cb) = on_page {
+                    cb(page_idx as u32 + 1, page_count as u32);
+                }
+            }
             Err(e) => {
                 log::warn!("PDFium render page {} failed: {}", page_idx + 1, e);
                 let _ = with_pdfium(|funcs| { unsafe { (funcs.close_document)(doc); } Ok(()) });

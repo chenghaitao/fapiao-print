@@ -420,7 +420,7 @@ pub(crate) fn render_pdf_pages_pdfium(pdf_path: &str, dpi: u32, use_jpeg: bool) 
     let pdf_bytes = std::fs::read(pdf_path)
         .map_err(|e| format!("读取PDF文件失败: {}", e))?;
 
-    let images = crate::pdfium_print::render_pdf_to_images(&pdf_bytes, dpi)?;
+    let images = crate::pdfium_print::render_pdf_to_images(&pdf_bytes, dpi, None)?;
 
     let results: Vec<RenderedPage> = images.into_iter().map(|img| {
         // Convert PNG to JPEG if requested
@@ -3629,6 +3629,11 @@ pub struct RenderSettings {
     pub copies: u32,
     #[serde(default)]
     pub duplex: bool,
+    /// 老打印机兼容模式（issue #46）：生成后把整份 PDF 逐页栅格化成纯位图 PDF
+    /// （无 SMask 透明 / 无嵌入字体 / 经典 xref 表），等效 Ghostscript 重写；
+    /// 代价是失去矢量锐度，故默认关闭、仅在设置里显式开启。
+    #[serde(default)]
+    pub compat_flat: Option<bool>,
 }
 
 /// A file image with its metadata — sent from JS.
@@ -4854,11 +4859,27 @@ pub type ProgressFn = Box<dyn Fn(&str, u32, u32) + Send>;
 /// Generate PDF from layout request (files + pages + settings).
 /// This replaces JS `renderPageToCanvas` + `generate_pdf_from_pages`.
 /// `on_progress` is called with (phase, current, total) to report progress.
-/// Phases: "decode" (image decoding), "build" (page composition), "save" (PDF writing).
+/// Phases: "decode" (image decoding), "build" (page composition), "save" (PDF writing),
+/// "flatten" (兼容模式整页栅格化)。
+///
+/// settings.compat_flat 开启时，生成完再做一次整页栅格化（issue #46「老打印机兼容模式」）。
 pub fn generate_pdf_from_layout(
     request: &LayoutRenderRequest,
     output_path: &std::path::Path,
     on_progress: Option<ProgressFn>,
+) -> Result<Option<String>, String> {
+    let warning = generate_pdf_from_layout_inner(request, output_path, on_progress.as_ref())?;
+    if request.settings.compat_flat.unwrap_or(false) {
+        apply_compat_flat(output_path, on_progress.as_ref())?;
+    }
+    Ok(warning)
+}
+
+/// 双管道生成主体：lopdf 直通 → printpdf 回退，产出（矢量/嵌图）PDF 到 output_path。
+fn generate_pdf_from_layout_inner(
+    request: &LayoutRenderRequest,
+    output_path: &std::path::Path,
+    on_progress: Option<&ProgressFn>,
 ) -> Result<Option<String>, String> {
     if request.pages.is_empty() {
         return Err("没有页面数据".to_string());
@@ -4889,7 +4910,7 @@ pub fn generate_pdf_from_layout(
     // Hybrid lopdf passthrough: handles ALL scenarios — pure PDF, pure images,
     // and mixed PDF + image/OFD. PDF pages stay vector-sharp; images are
     // encoded as JPEG XObjects. Falls back to printpdf pipeline on any error.
-    match generate_pdf_passthrough(request, output_path, on_progress.as_ref(), &sources) {
+    match generate_pdf_passthrough(request, output_path, on_progress, &sources) {
         Ok(()) => return Ok(font_warning),
         Err(e) => {
             log::warn!("lopdf直通失败，回退printpdf渲染管道: {}", e);
@@ -6208,6 +6229,12 @@ fn generate_pdf_passthrough(
     let ph_pt = ph * MM_TO_PT;
 
     let mut output_doc = lopdf::Document::with_version("1.4");
+    // lopdf 新建文档默认写「交叉引用流」（CrossReferenceStream，PDF 1.5 特性），
+    // 而本文件头声明 1.4——声明与结构不符，只认经典 xref 表的老 RIP/老打印机
+    // 解析不了整个文件（丢元素甚至空白页，issue #46）。这里强制写经典 xref 表；
+    // printpdf 回退管道自身就是 1.3 + xref 表（printpdf 0.9 serialize.rs），两条
+    // 管道保持一致。
+    output_doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
 
     // Cache loaded source PDFs by path
     let mut source_cache: std::collections::HashMap<String, lopdf::Document> = std::collections::HashMap::new();
@@ -6864,6 +6891,115 @@ fn generate_pdf_passthrough(
         cb("save", 1, 1);
     }
 
+    Ok(())
+}
+
+// =====================================================
+// 老打印机兼容模式（issue #46）—— 整页栅格化
+// =====================================================
+
+/// 兼容模式栅格化 DPI（与报告者验证过的 Ghostscript 重写方案同一档）
+const COMPAT_FLAT_DPI: u32 = 300;
+
+/// 老打印机兼容模式：把已生成的 PDF 逐页栅格化成纯位图 PDF（原地覆写）。
+/// 输出为 PDF 1.4 + 经典 xref 表、每页一个 JPEG Image XObject——没有 SMask 透明、
+/// 没有嵌入字体、没有对象流/交叉引用流，只认图元的老 RIP/驱动不会再丢元素。
+fn apply_compat_flat(output_path: &std::path::Path, on_progress: Option<&ProgressFn>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        flatten_pdf_to_raster(output_path, COMPAT_FLAT_DPI, on_progress)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (output_path, on_progress);
+        Err("老打印机兼容模式需要 PDFium 渲染，仅支持 Windows".to_string())
+    }
+}
+
+/// 逐页渲染（白底、含标注/签章）→ JPEG → 重建纯位图 PDF。依赖 PDFium（与静默打印同一组件）。
+/// 渲染进度以 "flatten" 阶段上报——300dpi 渲染是这一段最耗时的工作，不上报界面会静默数秒。
+#[cfg(target_os = "windows")]
+fn flatten_pdf_to_raster(
+    path: &std::path::Path,
+    dpi: u32,
+    on_progress: Option<&ProgressFn>,
+) -> Result<(), String> {
+    use base64::Engine;
+
+    let pdf_bytes = std::fs::read(path).map_err(|e| format!("兼容模式：读取 PDF 失败: {}", e))?;
+    let page_cb = on_progress.map(|f| move |cur: u32, total: u32| f("flatten", cur, total));
+    let pages = crate::pdfium_print::render_pdf_to_images(
+        &pdf_bytes,
+        dpi,
+        page_cb.as_ref().map(|c| c as &dyn Fn(u32, u32)),
+    )
+    .map_err(|e| format!("兼容模式：PDFium 渲染失败（需先下载 PDFium 组件）: {}", e))?;
+    if pages.is_empty() {
+        return Err("兼容模式：没有可栅格化的页面".to_string());
+    }
+
+    let mut doc = lopdf::Document::with_version("1.4");
+    doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
+    let pages_id = doc.new_object_id();
+    let mut kid_ids: Vec<lopdf::ObjectId> = Vec::new();
+
+    for page in &pages {
+        // render_pdf_to_images 返回白底 PNG dataURL，转 JPEG 嵌入（位图页无透明通道）
+        let b64 = page.image_data_url.split(',').nth(1).unwrap_or("");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("兼容模式：解码第 {} 页渲染结果失败: {}", page.index + 1, e))?;
+        let img = image::load_from_memory(&png)
+            .map_err(|e| format!("兼容模式：解析第 {} 页渲染结果失败: {}", page.index + 1, e))?;
+        // 页面尺寸按渲染 DPI 折算 pt，与原页面等大
+        let w_pt = page.width as f32 * 72.0 / dpi as f32;
+        let h_pt = page.height as f32 * 72.0 / dpi as f32;
+
+        let jpeg_bytes = encode_image_to_jpeg_bytes(&img)?;
+        let xobj_id = build_lopdf_jpeg_xobject(&mut doc, &jpeg_bytes, page.width, page.height, 3);
+        let content = format!("q {:.4} 0 0 {:.4} 0 0 cm /Im0 Do Q", w_pt, h_pt);
+        let content_id = doc.add_object(lopdf::Object::Stream(
+            lopdf::Stream::new(lopdf::Dictionary::new(), content.into_bytes()).with_compression(true),
+        ));
+
+        let mut xobjects = lopdf::Dictionary::new();
+        xobjects.set("Im0", lopdf::Object::Reference(xobj_id));
+        let mut resources = lopdf::Dictionary::new();
+        resources.set("XObject", lopdf::Object::Dictionary(xobjects));
+
+        let page_dict = lopdf::Dictionary::from_iter(vec![
+            ("Type", lopdf::Object::Name(b"Page".to_vec())),
+            ("Parent", lopdf::Object::Reference(pages_id)),
+            ("MediaBox", lopdf::Object::Array(vec![
+                lopdf::Object::Real(0.0),
+                lopdf::Object::Real(0.0),
+                lopdf::Object::Real(w_pt),
+                lopdf::Object::Real(h_pt),
+            ])),
+            ("Resources", lopdf::Object::Dictionary(resources)),
+            ("Contents", lopdf::Object::Reference(content_id)),
+        ]);
+        kid_ids.push(doc.add_object(lopdf::Object::Dictionary(page_dict)));
+    }
+
+    let pages_dict = lopdf::Dictionary::from_iter(vec![
+        ("Type", lopdf::Object::Name(b"Pages".to_vec())),
+        ("Count", lopdf::Object::Integer(kid_ids.len() as i64)),
+        ("Kids", lopdf::Object::Array(
+            kid_ids.iter().map(|&id| lopdf::Object::Reference(id)).collect()
+        )),
+    ]);
+    doc.set_object(pages_id, lopdf::Object::Dictionary(pages_dict));
+    let catalog_id = doc.add_object(lopdf::Dictionary::from_iter(vec![
+        ("Type", lopdf::Object::Name(b"Catalog".to_vec())),
+        ("Pages", lopdf::Object::Reference(pages_id)),
+    ]));
+    doc.trailer.set("Root", lopdf::Object::Reference(catalog_id));
+
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).map_err(|e| format!("兼容模式：保存位图 PDF 失败: {}", e))?;
+    std::fs::write(path, &buf).map_err(|e| format!("兼容模式：写入文件失败: {}", e))?;
+    log::info!("兼容模式：已栅格化 {} 页 @ {}dpi，输出 {} bytes", pages.len(), dpi, buf.len());
     Ok(())
 }
 

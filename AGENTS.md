@@ -71,6 +71,13 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 - `get_cached_xobj()` 按 `(file_idx, rotation)` 缓存 XObject；Decoded 图片像素级烘焙旋转；JpegPassthrough 仅 0°/180° 直通（180° 用 PDF 层 `rotate_op` 补转，**仅限 JpegPassthrough**——Decoded 已烘焙，再转会双重旋转抵消）
 
+**老打印机兼容模式**（`settings.compat_flat`，issue #46，默认关）：
+
+- 生成完成后 `apply_compat_flat()` 把整份 PDF **逐页栅格化**（原地覆写）：PDFium 白底渲染 300dpi（`COMPAT_FLAT_DPI`，含标注/签章）→ PNG dataURL → JPEG → 重建 PDF 1.4 + **经典 xref 表**、每页一个 Image XObject 的纯位图 PDF
+- 目的：消除 SMask 透明、嵌入字体、对象流/交叉引用流——只认图元的老 RIP / 老打印机驱动不再丢字丢章，等效「Ghostscript 重写为 PDF 1.3」；代价是失去矢量锐度、文件变大，故只在设置里显式开启
+- 打印与「保存为 PDF」共用生成链，开启后一并生效；`compatFlat` 属**内容参数**，留在 `print.js` 缓存比较内（切换即失效缓存，勿加入 `_cacheExclude`）
+- 依赖 PDFium 组件（与静默打印同一个 DLL），未下载时返回可读错误
+
 ### 打印体系
 
 **四种模式**（`print.js doPrint` 分发，各自独立调用命令，不经隐式降级）：
@@ -163,7 +170,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **清晰度体检与打印自动增强**（v2.6.6，issue #39）：`audit_clarity`（`async fn` + `spawn_blocking`）只读文件头毫秒级算每张发票折算打印 DPI（矢量电子发票 `kind='vector'` 与分辨率无关刻意不参与），低于阈值前端打 `clarity-badge` ⚠ 徽章；`S.feat.autoEnhance` 开启后打印/保存时对折算 DPI < `enhanceMinDpi`（默认 250）的图片自动增强（`EnhanceParams{minDpi, gamma, amountPct, quality}`，滑块越界 clamp 而非拒绝），读原图全分辨率、预览缩略图永不作增强源。
 
-**白边裁剪坐标换算**（v2.6.6，issue #38）：`trimmedBox` 基于预览缩略图（`THUMB_MAX_DIM=600`）坐标，而图片文件 `ow/oh` 是原图尺寸——进 `SlotSpec.trimBox` 前必须按 `ow/tw`、`oh/th` 比例换算到原图坐标（否则 Rust 读全分辨率原图执行裁剪时整体偏移，打印与预览不一致）；PDF/OFD 页面 `ow/oh` 即渲染位图尺寸，无需换算。`trim_image` 为 `async fn` + `spawn_blocking`。
+**白边裁剪坐标换算**（v2.6.6，issue #38）：`trimmedBox` 基于预览缩略图（`THUMB_MAX_DIM=600`）坐标，而图片文件 `ow/oh` 是原图尺寸——进 `SlotSpec.trimBox` 前必须按 `ow/tw`、`oh/th` 比例换算到原图坐标（否则 Rust 读全分辨率原图执行裁剪时整体偏移，打印与预览不一致）；PDF/OFD 页面 `ow/oh` 即渲染位图尺寸，无需换算。裁剪走 `trim_images_batch`（`async fn` + `spawn_blocking`，Rust 内 rayon 并行，一次 IPC 返回整批 `[Option<TrimImageResult>]`，单张失败为 `null` 由前端跳过）。
 
 ### 发票识别与数据提取
 
@@ -234,6 +241,8 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - ImageMask 遮罩：二值图合成主图 alpha 通道
 - 自闭合标签不能用 `read_element_text()`
 - CJK 拆字（dzcp 格式）：需虚拟标签合成
+- **TextCode 转义与占位符**（issue #44）：`\XXXX` 四位十六进制转义（标准要求空格等一律转义）必须解码，否则按字面 5 字符渲染；`¤`（U+00A4）是标准占位符——参与 ΔX 定位（占一个字符槽位）但**不渲染字形**，直接输出会与相邻字符叠字
+- **DeltaX 逐字定位的口径判定**（issue #44）：空格是否参与 ΔX 各生成器不一（`单··位` 4 字符配 3 个 ΔX=参与；数电票表头列分隔=不参与）。主判据 **Boundary 宽自校验**——ΔX 累加和应≈文字总宽（残差一个末字宽），两口径误差差 2 倍以上才切换；**CTM 含缩放时 ΔX 与 Boundary 不同坐标尺度（如 0.2367），必须退回长度拟合**（`invoice-engine/src/lib.rs` `build_svg_text`）
 
 ### 其他
 
@@ -241,6 +250,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - **批量文字提取**：多 PDF 必须按 pdfPath 分组调 `extract_pdf_texts`；返回 `HashMap<u32, PdfTextResult>` keyed by pageIdx，前端按 `r._pdfPageIdx` 取结果
 - **旋转方向**：全链路约定见「旋转与适配语义」小节——最易错点是 PDF 矩阵方向与 CSS 相反、pdf-lib 绕锚点旋转
 - **ureq 的 TLS 后端必须显式注入**（v2.6.4 线上事故，issue #37①）：`features = ["native-tls"]` 只是让 native-tls 适配器可用，**不会**成为默认 TLS 后端。未启用 `tls`(rustls) feature 时 `default_tls_config()` 返回一个直接报错的桩，于是**全部 https 请求**都以 `cannot make HTTPS request because no TLS backend is configured` 失败（更新检查、PDFium / SumatraPDF 下载同时报废）。所有 http 请求一律经 `build_http_agent()` 建 agent，不要裸建 `ureq::AgentBuilder`
+- **新建 lopdf 文档必须显式设经典 xref 表**（issue #46）：`Document::new()` / `with_version()` 的 `reference_table.cross_reference_type` 默认是 `CrossReferenceStream`（PDF 1.5 特性），而 `save_to()` 会照此写出——文件头声明 1.4 却在用 1.5 结构，只认经典 `xref` 表的老 RIP / 老打印机驱动解析不了整个文件（丢元素甚至空白页）。直通管道已强制 `lopdf::xref::XrefType::CrossReferenceTable`；printpdf 回退管道自身就写 1.3 + xref 表（printpdf 0.9 `serialize.rs`），两条管道需保持一致
 
 ## 硬性规则速查
 

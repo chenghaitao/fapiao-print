@@ -270,6 +270,11 @@
           <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">弹窗确认：确认后打印；PDFium：推荐，打印清晰（需下载）；SumatraPDF：备用（需下载）；PDF阅读器：通过默认阅读器打印（不支持选择打印机）。</div>
         </div>
         <div class="sec">
+          <div class="sec-title">🧩 兼容模式</div>
+          <div class="trow"><label class="tlbl">老打印机兼容</label><button class="tgl" id="toggleCompatFlat" onclick="toggleFeature('compatFlat',this)"></button></div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">开启后打印 / 保存的 PDF 会整页转成 300dpi 位图（无透明、无嵌入字体），老打印机不再丢字、丢章；代价是清晰度略降、文件变大。需要 PDFium 组件（与「静默打印 PDFium」同一个，未下载时会提示）。</div>
+        </div>
+        <div class="sec">
           <div class="sec-title">🔢 打印份数</div>
           <div class="row"><label class="lbl">份数</label><div style="display:flex;align-items:center;gap:4px"><button class="btn btn-sm btn-icon" onclick="changeCopies(-1)">−</button><input type="number" id="copies" value="1" min="1" max="99" style="width:52px;text-align:center" onchange="updatePreview()"><button class="btn btn-sm btn-icon" onclick="changeCopies(1)">+</button></div></div>
           <div class="trow"><label class="tlbl">逐份打印</label><button class="tgl on" id="toggleCollate" onclick="toggleFeature('collate',this)"></button></div>

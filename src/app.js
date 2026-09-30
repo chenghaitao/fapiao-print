@@ -5770,6 +5770,9 @@ async function exportSummaryCsv() {
 
 function csvEscape(val) {
   var s = String(val || '');
+  // ≥15 位纯数字（发票号/税号）用文本公式 ="..." 包裹：Excel 打开 CSV 时会自动转数字，
+  // 超 15 位精度截断变科学计数法（如 2.6952E+19），普通双引号是 CSV 字段边界、剥掉后照样转（issue #49）
+  if (/^\d{15,}$/.test(s)) return '="' + s + '"';
   if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
   return s;
 }

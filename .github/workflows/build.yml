@@ -233,9 +233,9 @@ jobs:
           Write-Host "`n=== Release Body Preview ==="
           Write-Host $body
 
-      # 不用 softprops/action-gh-release：它在 Windows runner 上会丢掉中文文件名
-      # （v2.5.1 实测 4 个产物上传后全变成 _2.5.1_x64-setup.exe 这类无中文名）。
-      # 改用 runner 预装的 gh CLI（Go 实现，UTF-8 处理正确）。
+      # 用 runner 预装的 gh CLI 创建 Release 并上传（Go 实现，UTF-8 处理正确）。
+      # 上传时用「本地路径#远端资产名」语法显式指定中文文件名，配合上一步的产物名校验，
+      # 保证 Release 上 4 个中文名产物完整。
       - name: Create Release & Upload (gh CLI)
         if: startsWith(github.ref, 'refs/tags/') || inputs.publish_release
         shell: pwsh
@@ -252,13 +252,25 @@ jobs:
             "发票酱_${version}_x64_OCR绿色版.zip"
           )
 
+          # 带「-」的 tag（如 v2.6.12-beta.1）发布为预发布：GitHub 的 /releases/latest
+          # 不含预发布，因此不会被应用内更新检查推送给所有用户（供指定用户试用验证）
+          $isPre = $tag.Contains('-')
+
           gh release view "$tag" --repo $repo 2>$null
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "创建 Release $tag"
-            gh release create "$tag" --repo $repo --title "$tag" --notes-file release_body.txt
+            Write-Host "创建 Release $tag (prerelease=$isPre)"
+            if ($isPre) {
+              gh release create "$tag" --repo $repo --title "$tag" --notes-file release_body.txt --prerelease
+            } else {
+              gh release create "$tag" --repo $repo --title "$tag" --notes-file release_body.txt
+            }
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::创建 Release 失败"; exit 1 }
           } else {
             Write-Host "Release $tag 已存在，仅覆盖更新资产"
+            if ($isPre) {
+              gh release edit "$tag" --repo $repo --prerelease
+              if ($LASTEXITCODE -ne 0) { Write-Host "::error::设置预发布标记失败"; exit 1 }
+            }
           }
 
           # 删除当前版本历史上传的错误命名资产，避免新旧文件同时显示。

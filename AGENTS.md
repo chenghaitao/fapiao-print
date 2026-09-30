@@ -241,8 +241,14 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - ImageMask 遮罩：二值图合成主图 alpha 通道
 - 自闭合标签不能用 `read_element_text()`
 - CJK 拆字（dzcp 格式）：需虚拟标签合成
-- **TextCode 转义与占位符**（issue #44）：`\XXXX` 四位十六进制转义（标准要求空格等一律转义）必须解码，否则按字面 5 字符渲染；`¤`（U+00A4）是标准占位符——参与 ΔX 定位（占一个字符槽位）但**不渲染字形**，直接输出会与相邻字符叠字
-- **DeltaX 逐字定位的口径判定**（issue #44）：空格是否参与 ΔX 各生成器不一（`单··位` 4 字符配 3 个 ΔX=参与；数电票表头列分隔=不参与）。主判据 **Boundary 宽自校验**——ΔX 累加和应≈文字总宽（残差一个末字宽），两口径误差差 2 倍以上才切换；**CTM 含缩放时 ΔX 与 Boundary 不同坐标尺度（如 0.2367），必须退回长度拟合**（`invoice-engine/src/lib.rs` `build_svg_text`）
+- **TextCode 转义与占位符**（issue #44/#47）：`\XXXX` 四位十六进制转义（标准要求空格等一律转义）必须解码，否则按字面 5 字符渲染；占位符参与 ΔX 定位（占一个字符槽位）但**不渲染字形**（直接输出会与相邻字符叠字），判定集中在 `is_placeholder()`——**只认国标 `¤`（U+00A4）＋ PUA 码位（U+E000–U+F8FF 等，系统字体渲染必乱码）**。⚠️ 不要把 Ø/∅/Φ 等圆圈符号拉进黑名单——issue #47 的「月Ø」已查明是「数字 0 被 ΔX 错位挤到『月』的竖笔上」，与占位符无关，乱扩名单会误伤正文。**不要**把占位符从字符序列里剔除（剔除会与 ΔX 错位），也不要按普通字符渲染
+- **一个 TextObject 可含 1..N 个 TextCode**（issue #47，国标 11.3：各带 X/Y/ΔX，标准示例就是两个）：解析为 `OfdTextObject.segments`，渲染逐段输出各自的 `<text>`；对象级 `text` 仍按序拼接（CustomTag 按 ID 取值、文本提取沿用旧口径）、`text_x/text_y` 保留末段（数电票 body 坐标提取依赖）。**禁止**再把多段拼成一行、用末段 X/ΔX 渲染（ΔX 用尽会重复末值，整行被均匀拉开）
+- **DeltaX 逐字定位的口径判定**（issue #44/#47）：空格是否参与 ΔX 各生成器不一（规范口径=空格是转义内容的一部分、参与定位，`单··位` 4 字符配 3 个 ΔX；数电票表头把空格当列分隔=不参与，属厂商偏差）。主判据 **Boundary 宽自校验**——ΔX 累加和应≈文字总宽（残差一个末字宽），两口径误差差 2 倍以上才切换；**CTM 含缩放不得跳过本校验**（表46：X/Y 是「对象坐标系」坐标，ΔX/ΔY 与 Boundary 同坐标系；issue #47 不动产证恰好一个空格时长度拟合无区分力，只能靠本校验）。仅当 **ΔX 与 Boundary 自身不自洽**（两口径误差都很大，如数电票表头样本 184.6 vs 172.6）时才退回长度拟合（`invoice-engine/src/lib.rs` `build_svg_text`）
+- **表46 的缺省语义**（issue #47）：`DeltaX` 缺省 = 字型在 X 方向**不偏移**（`char_dx()`；勿用字号顶替——纯 ΔY 定位的竖排/垂直文本会被斜着排）；`X/Y` 缺省 = 沿用**上一个 TextCode** 的坐标（对象内首个必需，解析处经 `t.text_x/t.text_y` 镜像继承）
+
+### OCR / MNN
+
+- **本地手工放置的 MNN 预编译缓存会把 exe 静默链成动态依赖**（v2.6.10 本地事故）：ocr-rs 的 `build.rs` 只在「**全新下载解压后**」把 `MNN.lib` 替换为静态库 `MNN_static.lib`；一旦命中已存在的缓存目录就直接早退、跳过替换。若把官方预编译 zip 手工解压到 `~/.cargo/registry/src/*/ocr-rs-*/3rd_party/prebuilt/mnn-dev-windows-x86_64/lib/`，那里的 `MNN.lib`（438KB）是 **DLL 导入库**，于是 `cargo:rustc-link-lib=static=MNN` 实际产出依赖 `MNN.dll` 的 exe —— 装上启动即报「找不到 MNN.dll」（build.rs 的 `remove_dynamic_libs()` 还会把该目录里的 DLL 删掉，更找不到）。修法：解压后 `MNN.lib` → `MNN_import.lib`，再复制 `MNN_static.lib` → `MNN.lib`（即 build.rs 下载路径做的事），然后 **`cargo clean -p ocr-rs` 强制重链接**（cargo 不知道 lib 被换过，否则重建是空操作）。校验：OCR 版 exe 二进制内**不得**出现 `MNN.dll` 字符串（CI 产物为静态链接，无此依赖；轻量版不受影响）
 
 ### 其他
 
@@ -277,6 +283,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 ## 用户偏好
 
 - 简洁直接，对 Bug 极度敏感，全面修复原则
+- **Issue 回复只说人话**：结论 + 让用户做什么（下载哪个文件、看哪几处、回报什么），不写规范条款、推导过程与术语细节——太复杂没人看；技术细节留在代码注释、CHANGELOG 与本文件里
 - 不要主动编译（耗时），等明确指令
 - 分析任务绝对不可修改代码，必须先确认方案
 

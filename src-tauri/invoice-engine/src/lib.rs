@@ -103,6 +103,19 @@ struct OfdImage {
     base64: String,
 }
 
+/// 单个 TextCode 的定位与文本（GB/T 33190 §11.3：一个 TextObject 可含 1..N 个 TextCode，
+/// 各自带 X/Y/DeltaX，标准示例就是两个，比如同一行里「Font」+「字体」）。
+/// 渲染必须按段独立输出——曾把多段文本拼成一行、只用末段的 X/ΔX（ΔX 用尽后还重复末值），
+/// 整行被均匀拉开（issue #47 截图里数字被隔开的形态之一）。
+#[derive(Debug, Clone, Default)]
+struct OfdTextSegment {
+    text_x: f64,
+    text_y: f64,
+    delta_x: Vec<f64>,
+    delta_y: Vec<f64>,
+    text: String,
+}
+
 #[derive(Debug)]
 struct OfdTextObject {
     id: u32,
@@ -110,7 +123,10 @@ struct OfdTextObject {
     font_id: u32,
     size: f64,
     ctm: Option<(f64, f64, f64, f64, f64, f64)>,
+    /// 对象级文本 = 各段文本按序拼接（CustomTag 按 ID 取值、文本提取沿用该口径）
     text: String,
+    /// 各 TextCode 的逐段定位参数；渲染路径用 segments，非空时不看下面这组镜像字段
+    segments: Vec<OfdTextSegment>,
     delta_x: Vec<f64>,
     delta_y: Vec<f64>, // per-character Y offsets for multi-line text (DeltaY attribute)
     text_x: f64,
@@ -132,6 +148,7 @@ impl Default for OfdTextObject {
             size: 3.175,
             ctm: None,
             text: String::new(),
+            segments: Vec::new(),
             delta_x: Vec::new(),
             delta_y: Vec::new(),
             text_x: 0.0,
@@ -398,14 +415,25 @@ fn normalize_font_name(raw: &str) -> String {
     }.to_string()
 }
 
-/// OFD 占位符字符（GB/T 33190：TextCode 作为占位符时一律用 ¤ U+00A4 表示）。
-/// 占位符参与 ΔX 定位（占一个字符槽位）但不渲染字形——直接输出会与相邻字符
-/// 重叠（issue #44 截图里「月¤」叠字的来源）。
+/// GB/T 33190 表45：TextCode 作为占位符使用时，一律采用 ¤（U+00A4）占位
 const OFD_PLACEHOLDER: char = '\u{A4}';
+
+/// 占位符判定：占一个字符槽位参与 ΔX 定位，但**不渲染字形**——直接输出会与相邻字符叠字
+/// （issue #44 的「月¤」叠字）。
+/// - `¤`（U+00A4）：国标占位符
+/// - PUA 码位（U+E000–U+F8FF 等）：字形索引类编码，用系统字体渲染必出乱码
+/// 注意：**不要**把 Ø/∅/Φ 之类圆圈符号也拉进黑名单——issue #47 那个「月Ø」已查明是
+/// 「数字 0 被 ΔX 错位挤到「月」的竖笔上」，与占位符无关；乱扩名单会误伤正文。
+fn is_placeholder(ch: char) -> bool {
+    ch == OFD_PLACEHOLDER
+        || ('\u{E000}'..='\u{F8FF}').contains(&ch)
+        || ('\u{F0000}'..='\u{FFFFD}').contains(&ch)
+        || ('\u{100000}'..='\u{10FFFD}').contains(&ch)
+}
 
 /// 输出单个字符的 SVG 文本内容；占位符输出空串（不渲染字形）
 fn glyph_out(ch: char) -> String {
-    if ch == OFD_PLACEHOLDER {
+    if is_placeholder(ch) {
         String::new()
     } else {
         esc_xml(&ch.to_string())
@@ -424,15 +452,61 @@ fn delta_sum_err(seq_len: usize, dx: &[f64], boundary_w: f64) -> f64 {
     (sum - boundary_w).abs()
 }
 
-/// Build SVG text element from an OFD TextObject
+/// 逐字 ΔX 取值（表46）：DeltaX 不出现时字型在 X 方向**不做偏移**，不能拿字号顶替
+/// ——否则纯 ΔY 定位的文本（竖排/垂直排列）会被斜着排（每字右移一个字号）。
+/// ΔX 数组用尽（畸形文件）沿用末值兜底。
+fn char_dx(delta_x: &[f64], i: usize) -> f64 {
+    if delta_x.is_empty() {
+        0.0
+    } else if i < delta_x.len() {
+        delta_x[i]
+    } else {
+        *delta_x.last().unwrap()
+    }
+}
+
+/// Build SVG text element(s) from an OFD TextObject.
+/// 一个 TextObject 可含多个 TextCode（GB/T 33190 §11.3），每段带独立的 X/Y/ΔX，必须逐段
+/// 输出各自的 <text>；无段对象（测试构造 / 异常文件）退回对象级字段那条路径。
 fn build_svg_text(
     text_obj: &OfdTextObject,
+    font_map: &HashMap<u32, OfdFont>,
+    color_spaces: &HashMap<u32, String>,
+    scale_x: f64,
+    scale_y: f64,
+) -> String {
+    if text_obj.segments.is_empty() {
+        return build_svg_text_line(
+            text_obj, &text_obj.text, text_obj.text_x, text_obj.text_y,
+            &text_obj.delta_x, &text_obj.delta_y, font_map, color_spaces, scale_x, scale_y,
+        );
+    }
+    let mut svg = String::new();
+    for seg in &text_obj.segments {
+        svg.push_str(&build_svg_text_line(
+            text_obj, &seg.text, seg.text_x, seg.text_y,
+            &seg.delta_x, &seg.delta_y, font_map, color_spaces, scale_x, scale_y,
+        ));
+    }
+    svg
+}
+
+/// 渲染单个 TextCode 段（一段 = 一个 <text>）：文本/坐标/ΔX 来自段，
+/// 字体、字号、Boundary、CTM、颜色、粗细等来自所属 TextObject。
+#[allow(clippy::too_many_arguments)]
+fn build_svg_text_line(
+    text_obj: &OfdTextObject,
+    text: &str,
+    text_x: f64,
+    text_y: f64,
+    delta_x: &[f64],
+    delta_y: &[f64],
     font_map: &HashMap<u32, OfdFont>,
     _color_spaces: &HashMap<u32, String>,
     scale_x: f64,
     scale_y: f64,
 ) -> String {
-    if text_obj.text.is_empty() {
+    if text.is_empty() {
         return String::new();
     }
 
@@ -472,35 +546,31 @@ fn build_svg_text(
     // Solution: use tspan x with absolute positions in the text element's coordinate system.
     // base_x = the x position of the first character (set on <text> element).
     // Subsequent chars: tspan x = base_x + accumulated DeltaX.
-    let chars: Vec<char> = text_obj.text.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
     // DeltaX or DeltaY alone is enough to require per-char positioning; a DeltaY-only
     // object (multi-line without horizontal increments) must not fall back to plain text.
-    let has_delta = (!text_obj.delta_x.is_empty() || !text_obj.delta_y.is_empty()) && chars.len() > 1;
+    let has_delta = (!delta_x.is_empty() || !delta_y.is_empty()) && chars.len() > 1;
     // 逐字定位的字符序列要与 DeltaX 对齐，各生成器口径不一：
-    // ① 空格参与定位（移动话费票样：'单··位' 4 字符配 3 个 ΔX，按含空格序列对齐）；
+    // ① 空格参与定位（规范口径：表45「文字内容中出现的空格也需要转义」，空格是内容的一部分；
+    //    移动话费票样 '单··位' 4 字符配 3 个 ΔX 即此口径）；
     // ② 空格是列分隔符（数电票表头把多列标题拼进一条 TextCode，如
-    //    "车牌号车辆类型 通行日期起…"，ΔX 按去空格后的序列对齐）。
-    // 主判据：Boundary 宽自校验——ΔX 累加和应≈文字总宽（残差为一个末字宽），
-    // 两口径误差通常差 2 倍以上，可靠区分；仅当 CTM 无缩放/旋转（ΔX 与 Boundary
-    // 同坐标尺度）时可用。判据不明确或 CTM 含缩放时退回长度拟合（保持旧行为）。
+    //    "车牌号车辆类型 通行日期起…"，ΔX 按去空格后的序列对齐，属厂商偏差）。
+    // 主判据：Boundary 宽自校验——ΔX 累加和应≈文字总宽（残差为一个末字宽），两口径误差
+    // 差 2 倍以上才切换。表46：X/Y 是「对象坐标系」下的坐标，ΔX/ΔY 与 Boundary 同处
+    // 该坐标系 → **CTM 含缩放不构成跳过本校验的理由**（issue #47 的不动产证就栽在这里：
+    // 恰好一个空格时两种口径的 ΔX 条数都能对上，长度拟合无区分力，只能靠本校验）。
+    // 两口径误差接近（数组与 Boundary 自身不自洽，如数电票表头样本）时判定不生效，
+    // 退回长度拟合（保持旧行为）。
     let vis: Vec<char> = chars.iter().copied().filter(|c| !c.is_whitespace()).collect();
-    let dx_len = text_obj.delta_x.len();
+    let dx_len = delta_x.len();
     let fits_vis = dx_len + 1 == vis.len() || dx_len == vis.len();
     let fits_all = dx_len + 1 == chars.len() || dx_len == chars.len();
-    // CTM 为平移/单位变换时坐标尺度一致可做 Boundary 校验；含缩放/旋转（如
-    // "0.2367 0 0 0.2367 0 0"）时 ΔX 在局部坐标、Boundary 在页面坐标，不可比。
-    let ctm_unit = match text_obj.ctm {
-        None => true,
-        Some((a, b, c, d, _, _)) => {
-            (a - 1.0).abs() < 0.01 && (d - 1.0).abs() < 0.01 && b.abs() < 0.01 && c.abs() < 0.01
-        }
-    };
     let boundary_w = text_obj.boundary.2;
     let seq: Vec<char> = {
         let mut chosen: Option<bool> = None; // true=口径①含空格, false=口径②去空格
-        if ctm_unit && boundary_w > 0.0 && !text_obj.delta_x.is_empty() && chars.len() != vis.len() {
-            let err_all = delta_sum_err(chars.len(), &text_obj.delta_x, boundary_w);
-            let err_vis = delta_sum_err(vis.len(), &text_obj.delta_x, boundary_w);
+        if boundary_w > 0.0 && !delta_x.is_empty() && chars.len() != vis.len() {
+            let err_all = delta_sum_err(chars.len(), delta_x, boundary_w);
+            let err_vis = delta_sum_err(vis.len(), delta_x, boundary_w);
             // 需一方误差有限且小于对方 70% 才切换，避免 Boundary 不精确时误判
             if err_all.is_finite() && err_all * 10.0 < err_vis * 7.0 {
                 chosen = Some(true);
@@ -520,21 +590,17 @@ fn build_svg_text(
     // CTM transform: translate to boundary origin, apply matrix, then text at local coords
     if let Some(ctm) = text_obj.ctm {
         // CTM text: x is in local coords (text_x * scale)
-        let base_x = text_obj.text_x * scale_x;
-        let base_y = text_obj.text_y * scale_y;
+        let base_x = text_x * scale_x;
+        let base_y = text_y * scale_y;
         let content = if has_delta && seq.len() > 1 {
             let mut s = format!("<tspan x=\"{:.4}\" y=\"{:.4}\">{}</tspan>", base_x, base_y, glyph_out(seq[0]));
             let mut x_pos = base_x;
             let mut y_pos = base_y;
             for (i, ch) in seq.iter().enumerate().skip(1) {
-                let dx = if i - 1 < text_obj.delta_x.len() {
-                    text_obj.delta_x[i - 1]
-                } else {
-                    *text_obj.delta_x.last().unwrap_or(&font_size)
-                };
+                let dx = char_dx(delta_x, i - 1);
                 x_pos += dx * scale_x;
-                let dy = if i - 1 < text_obj.delta_y.len() {
-                    text_obj.delta_y[i - 1]
+                let dy = if i - 1 < delta_y.len() {
+                    delta_y[i - 1]
                 } else {
                     0.0
                 };
@@ -544,7 +610,7 @@ fn build_svg_text(
             s
         } else {
             // 无逐字定位：整段输出，占位符同样不渲染
-            esc_xml(&text_obj.text.chars().filter(|c| *c != OFD_PLACEHOLDER).collect::<String>())
+            esc_xml(&text.chars().filter(|c| !is_placeholder(*c)).collect::<String>())
         };
         return format!(
             "<text transform=\"translate({bx},{by}) matrix({a},{b},{c},{d},{e},{f})\" x=\"{tx}\" y=\"{ty}\" font-family=\"{ff}\" font-size=\"{fs}\"{fc}{bw}>{ct}</text>",
@@ -563,21 +629,17 @@ fn build_svg_text(
     }
 
     // Normal: position = Boundary + TextCode offset (absolute SVG coords)
-    let base_x = (text_obj.boundary.0 + text_obj.text_x) * scale_x;
-    let base_y = (text_obj.boundary.1 + text_obj.text_y) * scale_y;
+    let base_x = (text_obj.boundary.0 + text_x) * scale_x;
+    let base_y = (text_obj.boundary.1 + text_y) * scale_y;
     let content = if has_delta && seq.len() > 1 {
         let mut s = format!("<tspan x=\"{:.4}\" y=\"{:.4}\">{}</tspan>", base_x, base_y, glyph_out(seq[0]));
         let mut x_pos = base_x;
         let mut y_pos = base_y;
         for (i, ch) in seq.iter().enumerate().skip(1) {
-            let dx = if i - 1 < text_obj.delta_x.len() {
-                text_obj.delta_x[i - 1]
-            } else {
-                *text_obj.delta_x.last().unwrap_or(&font_size)
-            };
+            let dx = char_dx(delta_x, i - 1);
             x_pos += dx * scale_x;
-            let dy = if i - 1 < text_obj.delta_y.len() {
-                text_obj.delta_y[i - 1]
+            let dy = if i - 1 < delta_y.len() {
+                delta_y[i - 1]
             } else {
                 0.0
             };
@@ -587,7 +649,7 @@ fn build_svg_text(
         s
     } else {
         // 无逐字定位：整段输出，占位符同样不渲染
-        esc_xml(&text_obj.text.chars().filter(|c| *c != OFD_PLACEHOLDER).collect::<String>())
+        esc_xml(&text.chars().filter(|c| !is_placeholder(*c)).collect::<String>())
     };
     format!(
         "<text x=\"{x}\" y=\"{y}\" font-family=\"{ff}\" font-size=\"{fs}\"{fc}{bw}>{ct}</text>",
@@ -762,6 +824,7 @@ fn parse_ofd_content(xml: &str) -> (Vec<OfdTextObject>, Vec<OfdPathObject>, Vec<
     let mut current_path: Option<OfdPathObject> = None;
     let mut current_img: Option<OfdImageObject> = None;
     let mut in_text_code = false;
+    let mut current_seg: Option<OfdTextSegment> = None; // 当前 TextCode（一个 TextObject 可含多个）
     let mut current_layer_dp: Option<u32> = None; // DrawParam of the current Layer
 
     loop {
@@ -821,14 +884,24 @@ fn parse_ofd_content(xml: &str) -> (Vec<OfdTextObject>, Vec<OfdPathObject>, Vec<
                     "TextCode" => {
                         in_text_code = true;
                         if let Some(ref mut t) = current_text {
-                            if let Some(v) = attr_val(&e, "X") { t.text_x = v.parse().unwrap_or(0.0); }
-                            if let Some(v) = attr_val(&e, "Y") { t.text_y = v.parse().unwrap_or(0.0); }
+                            let mut seg = OfdTextSegment::default();
+                            // 表46：X/Y 不出现时沿用上一个 TextCode 的坐标（对象内首个 TextCode 必需；
+                            // 镜像字段 t.text_x/t.text_y 即上一个已解析 TextCode 的坐标）
+                            seg.text_x = attr_val(&e, "X").and_then(|v| v.parse().ok()).unwrap_or(t.text_x);
+                            seg.text_y = attr_val(&e, "Y").and_then(|v| v.parse().ok()).unwrap_or(t.text_y);
                             if let Some(v) = attr_val(&e, "DeltaX") {
-                                t.delta_x = parse_delta_values(&v);
+                                seg.delta_x = parse_delta_values(&v);
                             }
                             if let Some(v) = attr_val(&e, "DeltaY") {
-                                t.delta_y = parse_delta_values(&v); // 与 DeltaX 相同格式
+                                seg.delta_y = parse_delta_values(&v); // 与 DeltaX 相同格式
                             }
+                            // 镜像到对象级字段：单 TextCode 时即本段参数；多 TextCode 时保留末段
+                            // （`extract_invoice_from_body_coords` 等提取路径按对象级 X/Y 定位）
+                            t.text_x = seg.text_x;
+                            t.text_y = seg.text_y;
+                            t.delta_x = seg.delta_x.clone();
+                            t.delta_y = seg.delta_y.clone();
+                            current_seg = Some(seg);
                         }
                     }
                     "AbbreviatedData" => {
@@ -930,8 +1003,13 @@ fn parse_ofd_content(xml: &str) -> (Vec<OfdTextObject>, Vec<OfdPathObject>, Vec<
             Ok(Event::Text(t)) => {
                 if in_text_code {
                     if let Ok(s) = t.unescape() {
+                        let decoded = decode_ofd_escapes(&s);
+                        // 段内文本供渲染；对象级文本保持拼接（提取路径沿用旧口径）
+                        if let Some(ref mut seg) = current_seg {
+                            seg.text.push_str(&decoded);
+                        }
                         if let Some(ref mut text_obj) = current_text {
-                            text_obj.text.push_str(&decode_ofd_escapes(&s));
+                            text_obj.text.push_str(&decoded);
                         }
                     }
                 }
@@ -960,6 +1038,11 @@ fn parse_ofd_content(xml: &str) -> (Vec<OfdTextObject>, Vec<OfdPathObject>, Vec<
                     }
                     "TextCode" => {
                         in_text_code = false;
+                        if let (Some(seg), Some(ref mut t)) = (current_seg.take(), current_text.as_mut()) {
+                            if !seg.text.is_empty() {
+                                t.segments.push(seg);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -3123,9 +3206,25 @@ mod tests {
     }
 
     #[test]
-    fn test_ofd_deltax_scaled_ctm_falls_back_to_length() {
-        // CTM 含缩放时 Boundary 与 ΔX 不同坐标尺度，Boundary 校验必须跳过、退回长度拟合
-        // （「车牌号…」式表头：ΔX 个数同时匹配两种口径 → 保持去空格口径，27 个 tspan）
+    fn test_ofd_deltax_included_with_scaled_ctm() {
+        // issue #47 场景：单空格 + 含空格口径 ΔX + CTM 含缩放（不动产证）。
+        // 表46 规定 ΔX/Boundary 同处对象坐标系 → CTM 缩放不影响 Boundary 自校验；
+        // 恰好一个空格时长度拟合无区分力（两种口径条数都对得上），只有本校验能救回来。
+        let mut dx = vec![3.175; 5];
+        dx.extend(std::iter::repeat(1.5875).take(18));
+        let t = ofd_text(
+            "缴费时间：2026-03-26 14:33:36", 46.0375, 3.175, dx,
+            Some((0.2367, 0.0, 0.0, 0.2367, 0.0, 0.0)),
+        );
+        let svg = build_svg_text(&t, &HashMap::new(), &HashMap::new(), 1.0, 1.0);
+        assert_eq!(svg.matches("<tspan").count(), 24, "含空格口径：空格占一个 ΔX 槽位");
+    }
+
+    #[test]
+    fn test_ofd_deltax_inconsistent_array_falls_back_to_length() {
+        // 「车牌号…」式表头样本：ΔX（27 条 ×12）与 Boundary（139.403）自身不自洽，
+        // 两种口径误差都很大（184.6 vs 172.6）→ 判定不生效、退回长度拟合
+        // （ΔX 条数同时匹配两种口径 → 保持去空格口径，27 个 tspan）
         let t = ofd_text(
             "车牌号车辆类型 通行日期起通行日期止金额税率/征收率税额",
             139.403, 12.0, vec![12.0; 27],
@@ -3146,6 +3245,45 @@ mod tests {
     }
 
     #[test]
+    fn test_ofd_placeholder_and_pua_not_rendered() {
+        // 占位符只认国标 ¤（表45）与 PUA 字形码位（系统字体渲染必乱码）：只占 ΔX 槽位、不渲染字形。
+        // Ø/∅/Φ 必须照常渲染——issue #47 的「月Ø」已查明是 ΔX 错位挤过去的数字 0，不是占位符
+        for ch in ['\u{A4}', '\u{E123}', '\u{F0001}'] {
+            let t = ofd_text(&format!("1月{ch}"), 6.35, 3.175, vec![3.175, 3.175], None);
+            let svg = build_svg_text(&t, &HashMap::new(), &HashMap::new(), 1.0, 1.0);
+            assert!(!svg.contains(ch), "占位符 {ch:?} 不应渲染字形: {svg}");
+            assert_eq!(svg.matches("<tspan").count(), 3, "占位符仍占 ΔX 槽位: {svg}");
+        }
+        for ch in ['\u{D8}', '\u{2205}', '\u{3A6}'] {
+            let t = ofd_text(&format!("1月{ch}"), 6.35, 3.175, vec![3.175, 3.175], None);
+            let svg = build_svg_text(&t, &HashMap::new(), &HashMap::new(), 1.0, 1.0);
+            assert!(svg.contains(ch), "圆圈类符号是正文，不能当占位符滤掉: {ch:?} {svg}");
+        }
+    }
+
+    #[test]
+    fn test_ofd_multi_textcode_renders_per_segment() {
+        // 国标 11.3：一个 TextObject 可含 1..N 个 TextCode（标准示例即两个，各带 X/ΔX）。
+        // 修复前把多段文本拼成一行、只用末段的 X/ΔX（ΔX 用尽后重复末值）→ 整行从末段位置铺开
+        let xml = r#"<ofd:Content xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Layer>
+            <ofd:TextObject ID="9" Font="1" Size="3.175" Boundary="10 20 100 10">
+                <ofd:TextCode X="0" Y="5" DeltaX="3.175 3.175 3.175">2025</ofd:TextCode>
+                <ofd:TextCode X="40" Y="5" DeltaX="3.175 3.175">年1月</ofd:TextCode>
+            </ofd:TextObject>
+        </ofd:Layer></ofd:Content>"#;
+        let (texts, _, _) = parse_ofd_content(xml);
+        assert_eq!(texts.len(), 1, "一个 TextObject 仍对应一个对象（提取路径语义不变）");
+        assert_eq!(texts[0].segments.len(), 2);
+        assert_eq!(texts[0].text, "2025年1月", "对象级文本按旧语义拼接");
+        assert_eq!(texts[0].text_x, 40.0, "对象级 X/Y 保留末段（body 坐标提取依赖）");
+        let svg = build_svg_text(&texts[0], &HashMap::new(), &HashMap::new(), 1.0, 1.0);
+        assert_eq!(svg.matches("<text ").count(), 2, "每段各一个 <text>: {svg}");
+        assert!(svg.contains("<text x=\"10\""), "段 1 用自身 X=0（+Boundary 10）: {svg}");
+        assert!(svg.contains("<text x=\"50\""), "段 2 用自身 X=40（+Boundary 10）: {svg}");
+        assert_eq!(svg.matches("<tspan").count(), 7, "两段各自逐字定位（4 + 3）: {svg}");
+    }
+
+    #[test]
     fn test_ofd_deltax_space_excluded_by_boundary() {
         // Boundary 校验选「去空格」口径的正例：ΔX 数须多于 vis-1，含空格口径才会
         // 多消费 ΔX 拉开误差——dx=[10,50]、bw=11 时 err_vis=1 vs err_all=49，
@@ -3155,6 +3293,35 @@ mod tests {
         assert_eq!(svg.matches("<tspan").count(), 2);
         assert!(svg.contains(">A</tspan>") && svg.contains(">B</tspan>"));
         assert!(!svg.contains("> </tspan>"), "空格不应渲染为字形");
+    }
+
+    #[test]
+    fn test_ofd_deltax_missing_keeps_x_fixed() {
+        // 表46：DeltaX 不出现时字型在 X 方向不做偏移。纯 ΔY 定位（竖排/垂直）文本此前
+        // 因 ΔX 为空被 font_size 顶替 → 每字右移一个字号、斜着排；现应 x 不动、y 递增
+        let mut t = ofd_text("ABC", 3.175, 3.175, vec![], None);
+        t.delta_y = vec![3.175, 3.175];
+        let svg = build_svg_text(&t, &HashMap::new(), &HashMap::new(), 1.0, 1.0);
+        assert_eq!(svg.matches("<tspan").count(), 3);
+        assert_eq!(svg.matches("x=\"0.0000\"").count(), 3, "ΔX 缺省时 x 不应推进: {svg}");
+        assert!(svg.contains("y=\"3.1750\"") && svg.contains("y=\"6.3500\""), "ΔY 应逐字递增: {svg}");
+    }
+
+    #[test]
+    fn test_ofd_textcode_inherits_prev_xy() {
+        // 表46：X/Y 不出现时沿用上一个 TextCode 的坐标（对象内首个 TextCode 必需）
+        let xml = r#"<ofd:Content xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Layer>
+            <ofd:TextObject ID="9" Font="1" Size="3.175" Boundary="10 20 100 10">
+                <ofd:TextCode X="7" Y="5" DeltaX="3.175 3.175 3.175">2025</ofd:TextCode>
+                <ofd:TextCode DeltaX="3.175 3.175">年1月</ofd:TextCode>
+            </ofd:TextObject>
+        </ofd:Layer></ofd:Content>"#;
+        let (texts, _, _) = parse_ofd_content(xml);
+        assert_eq!(texts[0].segments.len(), 2);
+        assert_eq!(texts[0].segments[1].text_x, 7.0, "缺省 X 沿用上一个 TextCode 的 X");
+        assert_eq!(texts[0].segments[1].text_y, 5.0, "缺省 Y 沿用上一个 TextCode 的 Y");
+        let svg = build_svg_text(&texts[0], &HashMap::new(), &HashMap::new(), 1.0, 1.0);
+        assert!(svg.contains("<text x=\"17\""), "段 2 用继承坐标（7 + Boundary 10）: {svg}");
     }
 }
 

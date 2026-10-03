@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue.svg)]()
 [![Tauri 2.x](https://img.shields.io/badge/Tauri-2.x-orange.svg)]()
-[![Version](https://img.shields.io/badge/Version-2.6.11-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-2.6.13-blue.svg)]()
 
 轻量桌面应用，专为批量打印电子发票设计。支持 PDF、OFD、图片等多格式导入，智能排版，一键打印或导出。
 
@@ -273,6 +273,7 @@ npm run bump 1.9.8   # 同步 package.json → Cargo.toml → tauri.conf.json
 - [x] OCR 链路提速（命令异步化 + 按目标像素渲染 + 文字层结算后再排队）+ 工具条按格子归位 + 跨页续页补齐合计金额徽章（v2.6.10）
 - [x] 老打印机兼容模式（整页栅格化，issue #46）+ OFD 文字定位三修（转义 / 占位符 / DeltaX 口径，issue #44）+ 预览页留白均分（issue #45）+ 批量加载提速（v2.6.11）
 - [x] OFD 多 TextCode 逐段渲染 + 表46 文字坐标缺省语义（ΔX 缺省不偏移 / X·Y 缺省继承上一段）+ 占位符判定收窄 + CSV 长数字（≥15 位）防 Excel 科学计数法（issue #47 #49）（v2.6.12）
+- [x] OFD 多行逐字定位（ΔX 含换行回退）按完整字符流渲染，修附记栏换行错位 + 诊断导出（右键一键生成脱敏结构报告，替代截图猜 + 反复要样本）（issue #47）（v2.6.13）
 
 ## 🤖 关于此项目
 

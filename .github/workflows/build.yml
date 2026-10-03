@@ -106,57 +106,33 @@ jobs:
             Write-Host "✅ $($_.Name) ($sizeMB MB)"
           }
 
-      # 兜底：NSIS 在 CI 上偶尔丢失中文文件名，强制改名
-      - name: Normalize artifact filenames (force Chinese)
+      # === KEY FIX =========================================================
+      # File naming is owned by build-all.js (Node; on Windows it uses UTF-16,
+      # independent of the console codepage). This step only VERIFIES, never renames.
+      #
+      # The old "Normalize artifact filenames" step embedded Chinese filename literals
+      # in the pwsh run: block, which the windows runner decoded with its default
+      # codepage (437/1252); the Chinese chars were dropped entirely, turning the
+      # Release assets into _2.6.x_x64... (Chinese lost). Here we instead detect
+      # Chinese via the CJK codepoint regex [\u4e00-\u9fff] with NO Chinese literals,
+      # eliminating the codepage problem at the root.
+      - name: Verify artifact filenames (Chinese preserved)
         shell: pwsh
         run: |
-          $dist    = "dist"
-          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          Write-Host "目标版本: $version"
-
-          # 不依赖中文前缀做匹配：CI 上中文可能被丢弃成空/点号。
-          # 只用「是否含 OCR」+「扩展名」两个 ASCII 特征归类，再强制写成中文名。
-          foreach ($f in @(Get-ChildItem -Path $dist -File)) {
-            $n     = $f.Name
-            $isOcr = $n -match 'OCR'
-            if ($isOcr -and $n -like '*-setup.exe') {
-              $target = "发票酱_${version}_x64_OCR版-setup.exe"
-            } elseif ($isOcr -and $n -like '*.zip') {
-              $target = "发票酱_${version}_x64_OCR绿色版.zip"
-            } elseif (-not $isOcr -and $n -like '*-setup.exe') {
-              $target = "发票酱_${version}_x64-setup.exe"
-            } elseif (-not $isOcr -and $n -like '*.exe') {
-              $target = "发票酱_${version}_x64_绿色版.exe"
-            } else {
-              $target = $null
-            }
-
-            if ($target -and $n -ne $target) {
-              Rename-Item -Path $f.FullName -NewName $target -Force
-              Write-Host "重命名: $n -> $target"
-            } elseif ($target) {
-              Write-Host "已是正确名称: $n"
-            }
-          }
-
-          Write-Host "`n=== 规范化后的文件名 ==="
-          Get-ChildItem -Path $dist -File | ForEach-Object { Write-Host "  $($_.Name)" }
-
-          $expected = @(
-            "发票酱_${version}_x64-setup.exe",
-            "发票酱_${version}_x64_绿色版.exe",
-            "发票酱_${version}_x64_OCR版-setup.exe",
-            "发票酱_${version}_x64_OCR绿色版.zip"
-          )
-          $actual = @(Get-ChildItem -Path $dist -File | Select-Object -ExpandProperty Name)
-          $missing = @($expected | Where-Object { $_ -notin $actual })
-          $unexpected = @($actual | Where-Object { $_ -notin $expected })
-          if ($missing.Count -or $unexpected.Count -or $actual.Count -ne $expected.Count) {
-            if ($missing.Count) { Write-Host "::error::缺少产物: $($missing -join ', ')" }
-            if ($unexpected.Count) { Write-Host "::error::存在未预期产物: $($unexpected -join ', ')" }
+          $files = @(Get-ChildItem -Path dist -File)
+          if ($files.Count -ne 4) {
+            Write-Host "::error::expect 4 artifacts, got $($files.Count)"
+            $files | ForEach-Object { Write-Host "  - $($_.Name)" }
             exit 1
           }
-          Write-Host "✅ 四个产物文件名校验通过"
+          foreach ($f in $files) {
+            if ($f.Name -notmatch '[\u4e00-\u9fff]') {
+              Write-Host "::error::artifact name missing Chinese (upstream naming lost): $($f.Name)"
+              exit 1
+            }
+          }
+          Write-Host "`n=== verified artifact filenames (all contain Chinese) ==="
+          $files | ForEach-Object { Write-Host "  OK $($_.Name)" }
 
       - name: List final artifacts
         shell: pwsh
@@ -172,7 +148,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: 发票酱-dist
+          name: fapiao-print-dist
           path: dist/*
           if-no-files-found: ignore
           retention-days: 7
@@ -233,24 +209,27 @@ jobs:
           Write-Host "`n=== Release Body Preview ==="
           Write-Host $body
 
-      # 用 runner 预装的 gh CLI 创建 Release 并上传（Go 实现，UTF-8 处理正确）。
-      # 上传时用「本地路径#远端资产名」语法显式指定中文文件名，配合上一步的产物名校验，
-      # 保证 Release 上 4 个中文名产物完整。
+      # Upload via the runner's preinstalled gh CLI (Go, correct UTF-8 handling).
+      # Asset names come straight from the on-disk filenames: dist/ is written by
+      # build-all.js using Node (UTF-16 on Windows, independent of the console
+      # codepage, so Chinese names are always correct). This step only asserts via
+      # a CJK regex: if any artifact name lacks Chinese it fails immediately, so the
+      # _2.6.x_x64... (Chinese-lost) assets can never reach the Release again.
       - name: Create Release & Upload (gh CLI)
         if: startsWith(github.ref, 'refs/tags/') || inputs.publish_release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 确保 PowerShell 以 UTF-8 与外部进程(gh)交换含中文的参数
+          $OutputEncoding         = [System.Text.Encoding]::UTF8
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          chcp 65001 | Out-Null
+
           $tag  = "${{ steps.resolve_tag.outputs.tag }}"
           $repo = "chenghaitao/fapiao-print"
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $expected = @(
-            "发票酱_${version}_x64-setup.exe",
-            "发票酱_${version}_x64_绿色版.exe",
-            "发票酱_${version}_x64_OCR版-setup.exe",
-            "发票酱_${version}_x64_OCR绿色版.zip"
-          )
+          $expected = @(Get-ChildItem -Path dist -File | Select-Object -ExpandProperty Name)
 
           # 带「-」的 tag（如 v2.6.12-beta.1）发布为预发布：GitHub 的 /releases/latest
           # 不含预发布，因此不会被应用内更新检查推送给所有用户（供指定用户试用验证）
@@ -283,13 +262,32 @@ jobs:
             }
           }
 
+          # Pre-check: every dist artifact must contain Chinese (assigned by build-all.js).
+          $distNames = @(Get-ChildItem -Path dist -File | Select-Object -ExpandProperty Name)
+          foreach ($dn in $distNames) {
+            if ($dn -notmatch '[\u4e00-\u9fff]') {
+              Write-Host "::error::dist 内存在非中文产物名(上游命名已丢失): $dn"
+              exit 1
+            }
+          }
+
           Get-ChildItem -Path dist -File | ForEach-Object {
             $mb = [math]::Round($_.Length / 1MB, 1)
             Write-Host "上传: $($_.Name)  ($mb MB)"
-            # Explicitly set the asset label to preserve the Chinese filename.
-            gh release upload "$tag" "$($_.FullName)#$($_.Name)" --repo $repo --clobber
+            # upload the file as-is; gh uses its (correct Chinese) basename as the asset name.
+            # (No path#label syntax needed.)
+            gh release upload "$tag" "$($_.FullName)" --repo $repo --clobber
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::上传失败: $($_.Name)"; exit 1 }
           }
 
           Write-Host "`n=== Release 最终资产 ==="
-          gh release view "$tag" --repo $repo --json assets --jq '.assets[].name'
+          $assetNames = @(gh release view "$tag" --repo $repo --json assets --jq '.assets[].name')
+          $assetNames | ForEach-Object { Write-Host "  $_" }
+          # 断言：每个资产名必须含中文产品名，否则说明上传环节仍丢失中文，立即失败。
+          foreach ($an in $assetNames) {
+            if ($an -notmatch '[\u4e00-\u9fff]') {
+              Write-Host "::error::资产名缺少中文(上传环节丢失): $an"
+              exit 1
+            }
+          }
+          Write-Host "✅ 全部资产名均含中文产品名"

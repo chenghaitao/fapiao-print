@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use tauri::{command, Emitter};
 
+mod diagnostics;
 mod pdf_engine;
 #[cfg(target_os = "windows")]
 mod pdfium_print;
@@ -1547,6 +1548,7 @@ pub fn run() {
         download_sumatrapdf,
         sumatrapdf_print,
         check_for_updates,
+        diagnostics::export_diagnostics,
     ]);
 
     #[cfg(not(feature = "ocr"))]
@@ -1587,6 +1589,7 @@ pub fn run() {
         download_sumatrapdf,
         sumatrapdf_print,
         check_for_updates,
+        diagnostics::export_diagnostics,
     ]);
 
     builder

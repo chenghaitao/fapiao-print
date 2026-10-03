@@ -2872,6 +2872,57 @@ function ctxCopyInfo() {
   }
 }
 
+// 导出诊断信息（issue #47 配套）：生成脱敏的结构/识别报告（不含原文），供开发者在 issue 中精确定位
+async function ctxExportDiagnostics() {
+  if (_ctxIdx < 0) return;
+  var f = S.files[_ctxIdx];
+  closeCtxMenu();
+  if (!f) return;
+  if (!isTauri || !invoke) { toast('诊断导出仅桌面版支持'); return; }
+  if (!f._filePath) { toast('该文件缺少本地路径，无法导出'); return; }
+  try {
+    toast('正在生成诊断报告...');
+    var report = await invoke('export_diagnostics', {
+      files: [{ path: f._filePath, summary: buildDiagSummary(f) }],
+      exportedAt: new Date().toLocaleString('zh-CN')
+    });
+    var defaultDir = '';
+    try { defaultDir = await invoke('get_downloads_dir'); } catch(e) {}
+    var ts = new Date();
+    var tsStr = ts.getFullYear() + String(ts.getMonth()+1).padStart(2,'0') + String(ts.getDate()).padStart(2,'0') + '_' + String(ts.getHours()).padStart(2,'0') + String(ts.getMinutes()).padStart(2,'0');
+    var defaultName = '诊断报告_' + tsStr + '.txt';
+    var savePath = await invoke('plugin:dialog|save', {
+      options: {
+        title: '保存诊断报告',
+        defaultPath: defaultDir ? (defaultDir + (defaultDir.endsWith('\\')||defaultDir.endsWith('/')?'':'\\') + defaultName) : defaultName,
+        filters: [{ name: '文本文件', extensions: ['txt'] }]
+      }
+    });
+    if (!savePath) return;
+    await invoke('write_text_file', { path: savePath, content: report });
+    var dirPath = savePath.substring(0, Math.max(savePath.lastIndexOf('\\'), savePath.lastIndexOf('/')));
+    try { await invoke('open_file', { path: dirPath }); } catch(e) {}
+    toast('已保存诊断报告: ' + savePath);
+  } catch(e) {
+    toast('导出失败: ' + e);
+  }
+}
+
+// 诊断摘要：仅固定词汇（布尔/枚举/计数，不含用户内容），报告中原样携带
+function buildDiagSummary(f) {
+  var parts = [];
+  parts.push('类型=' + (f._xmlInvoice ? 'XML数电票' : (resolveInvoiceType(f) || '未识别')));
+  parts.push('票号=' + (f.invoiceNo ? '有' : '无'));
+  parts.push('日期=' + (f.invoiceDate ? '有' : '无'));
+  parts.push('销方=' + (f.sellerName ? '有' : '无'));
+  parts.push('购方=' + (f.buyerName ? '有' : '无'));
+  parts.push('金额=' + (f.amountTax > 0 ? '有' : '无'));
+  parts.push('PDF文字层=' + (f._pdfTextExtracted ? '有' : '无'));
+  parts.push('份数=' + (f.copies || 1));
+  parts.push('旋转=' + (f.rotation || 0));
+  return parts.join(' ');
+}
+
 // 右键分发：列表项/预览槽位弹自定义菜单（内容不同）；输入框保留原生菜单（复制/粘贴）；其余区域屏蔽 webview 默认菜单
 document.addEventListener('contextmenu', function(e) {
   var item = e.target.closest('.file-item, .file-card');

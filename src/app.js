@@ -4314,6 +4314,11 @@ function buildPages(files, settings) {
 // Preview & Navigation
 // =====================================================
 var _saveTimer = null;
+var _importingSettings = false; // 导入写入后到 reload 之间禁止自动保存，防止内存旧配置覆盖刚导入的内容
+function saveSettings() {
+  if (_importingSettings) return;
+  try { localStorage.setItem('ticketchan-settings', JSON.stringify(collectSettings())); } catch(e) {}
+}
 function updatePreview() {
   if (_saveTimer) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(saveSettings, 500);
@@ -4426,7 +4431,8 @@ function updateSummaryBtn() { var btn = document.getElementById('summaryBtn'); i
 // =====================================================
 // Save settings & Preferences
 // =====================================================
-function saveSettings() {
+// 汇总当前全部持久化配置 — saveSettings 与「导出设置」共用同一份数据，保证导出内容 = 软件实际配置
+function collectSettings() {
   var o = {
     layout: { cols: S.layout.cols, rows: S.layout.rows },
     paperSize: document.getElementById('paperSize').value,
@@ -4526,7 +4532,7 @@ function saveSettings() {
   } else {
     o.filePaths = [];
   }
-  try { localStorage.setItem('ticketchan-settings', JSON.stringify(o)); } catch(e) {}
+  return o;
 }
 
 function loadSettings() {
@@ -4786,24 +4792,124 @@ function applyTheme() {
   try { localStorage.setItem('ticketchan-theme', theme); } catch(e) {}
 }
 
-function exportSettings() {
+// 导出完整配置（issue #50）：内容与持久化同源（collectSettings + localStorage 独立偏好项），
+// Tauri 下弹原生「另存为」对话框自选保存路径；浏览器开发环境回退 Blob 下载
+async function exportSettings() {
+  var ts = new Date();
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  var tsStr = ts.getFullYear() + pad2(ts.getMonth()+1) + pad2(ts.getDate()) + '_' + pad2(ts.getHours()) + pad2(ts.getMinutes());
   var data = {
-    layout: S.layout,
-    feat: S.feat,
-    ocrPrecision: S.ocrPrecision,
-    paperSize: document.getElementById('paperSize').value,
-    orientation: document.getElementById('orientation').value,
-    copies: document.getElementById('copies').value,
-    colorMode: document.getElementById('colorMode').value,
-    printMode: document.getElementById('printMode').value,
-    saveDir: getSaveDir(),
-    quickLayouts: cloneQuickLayouts(S.quickLayouts),
-    quickLayoutMax: normalizeQuickLayoutMax(S.quickLayoutMax)
+    _meta: {
+      app: '发票酱',
+      version: APP_VERSION || '',
+      exportedAt: ts.getFullYear() + '-' + pad2(ts.getMonth()+1) + '-' + pad2(ts.getDate()) + ' ' + pad2(ts.getHours()) + ':' + pad2(ts.getMinutes()) + ':' + pad2(ts.getSeconds())
+    }
   };
-  var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-  a.download = '发票酱设置.json'; a.click();
-  toast('设置已导出');
+  var o = collectSettings();
+  Object.keys(o).forEach(function(k) { data[k] = o[k]; });
+  data.theme = document.getElementById('themeMode').value;
+  data.amtMode = S.amtMode;
+  data.ocrEnabled = !!S.feat.ocrEnabled;
+  data.pdfTextEnabled = !!S.feat.pdfTextEnabled;
+  data.ocrPrecision = S.ocrPrecision;
+  data.saveDir = getSaveDir();
+  var json = JSON.stringify(data, null, 2);
+  if (isTauri && invoke) {
+    try {
+      var defaultDir = '';
+      try { defaultDir = await invoke('get_downloads_dir'); } catch(e) {}
+      var defaultName = '发票酱设置_' + tsStr + '.json';
+      var savePath = await invoke('plugin:dialog|save', {
+        options: {
+          title: '导出设置',
+          defaultPath: defaultDir ? (defaultDir + (defaultDir.endsWith('\\')||defaultDir.endsWith('/')?'':'\\') + defaultName) : defaultName,
+          filters: [{ name: 'JSON 文件', extensions: ['json'] }]
+        }
+      });
+      if (!savePath) return;
+      await invoke('write_text_file', { path: savePath, content: json });
+      toast('设置已导出: ' + savePath);
+    } catch(e) {
+      toast('导出失败: ' + e);
+    }
+  } else {
+    var blob = new Blob([json], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a'); a.href = url; a.download = '发票酱设置_' + tsStr + '.json';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('设置已导出');
+  }
+}
+
+// 导入设置（issue #50，与导出配对）：读 JSON → 校验 → 覆盖写入本地存储 → 重载生效。
+// 与导出对称、全量还原（含本地记忆）；写完必须重载，否则内存中的旧配置会在下次自动保存时覆盖回去
+async function importSettings() {
+  var content = null;
+  if (isTauri && invoke) {
+    try {
+      var picked = await invoke('plugin:dialog|open', {
+        options: {
+          multiple: false,
+          title: '导入设置',
+          filters: [{ name: 'JSON 文件', extensions: ['json'] }]
+        }
+      });
+      if (!picked) return;
+      var filePath = typeof picked === 'string' ? picked : (Array.isArray(picked) ? picked[0] : '');
+      if (!filePath) return;
+      content = await invoke('read_text_file', { path: filePath });
+    } catch(e) {
+      toast('导入失败: ' + e);
+      return;
+    }
+  } else {
+    // 浏览器开发环境回退：FileReader 读取本地文件
+    content = await new Promise(function(resolve) {
+      var input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.json,application/json';
+      input.onchange = function() {
+        var f = input.files && input.files[0];
+        if (!f) { resolve(null); return; }
+        var reader = new FileReader();
+        reader.onload = function() { resolve(reader.result); };
+        reader.onerror = function() { resolve(null); };
+        reader.readAsText(f);
+      };
+      input.click();
+    });
+    if (content == null) return;
+  }
+  var data;
+  try { data = JSON.parse(content); } catch(e) { toast('导入失败：文件不是有效的 JSON'); return; }
+  if (!data || typeof data !== 'object' || (!(data._meta && data._meta.app === '发票酱') && !(data.layout && data.feat))) {
+    toast('导入失败：不是发票酱的设置文件');
+    return;
+  }
+  if (!confirm('导入将覆盖当前全部设置与本地记忆（已打印标记 / 文件列表 / 单票调整 / 备注），并重新加载界面，确认继续？')) return;
+  // 设置主体写回 ticketchan-settings；独立存储的偏好项写回各自的 key
+  var extraKeys = ['_meta', 'theme', 'amtMode', 'ocrEnabled', 'pdfTextEnabled', 'ocrPrecision', 'saveDir'];
+  var settings = {};
+  Object.keys(data).forEach(function(k) { if (extraKeys.indexOf(k) < 0) settings[k] = data[k]; });
+  _importingSettings = true; // 写入期间起锁：清挂起的防抖保存 + 拦截重载窗口内新触发的自动保存
+  try {
+    localStorage.setItem('ticketchan-settings', JSON.stringify(settings));
+    if (data.theme === 'dark' || data.theme === 'light') localStorage.setItem('ticketchan-theme', data.theme);
+    if (data.amtMode === 'tax' || data.amtMode === 'notax' || data.amtMode === 'both') localStorage.setItem('ticketchan-amt-mode', data.amtMode);
+    if (typeof data.ocrEnabled === 'boolean') localStorage.setItem('ticketchan-ocr-enabled', data.ocrEnabled ? '1' : '0');
+    if (typeof data.pdfTextEnabled === 'boolean') localStorage.setItem('ticketchan-pdf-text-enabled', data.pdfTextEnabled ? '1' : '0');
+    if (data.ocrPrecision === 'fast' || data.ocrPrecision === 'standard' || data.ocrPrecision === 'precise') localStorage.setItem('ticketchan-ocr-precision', data.ocrPrecision);
+    if (typeof data.saveDir === 'string') localStorage.setItem('ticketchan-save-dir', data.saveDir);
+  } catch(e) {
+    _importingSettings = false; // 写入失败解锁，恢复自动保存
+    toast('导入失败: ' + e);
+    return;
+  }
+  // 清掉挂起的防抖自动保存，否则它会在重载前把内存里的旧配置写回去（覆盖刚导入的内容）
+  if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+  toast('设置已导入，正在重新加载…');
+  setTimeout(function() { location.reload(); }, 600);
 }
 
 function resetSettings(scope) {

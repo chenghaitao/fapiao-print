@@ -298,7 +298,11 @@ jobs:
             }
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::创建 Release 失败"; exit 1 }
           } else {
-            Write-Host "Release $tag 已存在，仅覆盖更新资产"
+            Write-Host "Release $tag 已存在，覆盖更新说明与资产"
+            # 重跑（补发资产 / 修 CI 后重发）时说明也要跟着刷新，
+            # 否则新增的「中文说明 ↔ 文件名」对照表不会出现在已有 Release 上
+            gh release edit "$tag" --repo $repo --notes-file release_body.txt
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::更新 Release 说明失败"; exit 1 }
             if ($isPre) {
               gh release edit "$tag" --repo $repo --prerelease
               if ($LASTEXITCODE -ne 0) { Write-Host "::error::设置预发布标记失败"; exit 1 }

@@ -29,6 +29,13 @@ npm run bump <版本号>    # 同步版本号
 
 - **编译缓存**: 只改 HTML/JS/CSS 不触发 Rust 重编译；改 Rust 文件才会完整重编译
 - **CI/CD**: GitHub Actions，push tag `v*` 触发，产出 4 个安装包（轻量/OCR × setup/绿色版）
+  - 产物命名唯一来源是 `scripts/build-all.js`：`dist/` 用中文名，并同源生成仓库根目录的
+    `release-assets.json`（中文说明 / 中文文件名 / Release 用的 ASCII 别名），CI 读它上传并渲染对照表
+  - ⛔ **GitHub Release 资产名不支持非 ASCII**（服务端把中文替换成 `.`，平台限制，gh CLI #8580 已 blocked）
+    → CI 上传前把产物复制成 ASCII 别名上传：`TicketChan_<版本>_x64-setup.exe` /
+    `_x64_portable.exe` / `_x64_ocr-setup.exe` / `_x64_ocr-portable.zip`（沿用 v2.6.5 的约定），
+    并在 Release 说明末尾附「中文说明 ↔ 实际文件名」对照表。
+    **不要再加「资产名必须含中文」这类断言**——平台不支持，加了必然每次发版都红
 
 ## 架构总览
 

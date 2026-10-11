@@ -6,6 +6,9 @@
  *   3. 发票酱_x64_OCR版-setup.exe    OCR 版安装包 (NSIS)
  *   4. 发票酱_x64_OCR绿色版.zip      OCR 版绿色便携 (exe + models/)
  *
+ * 另在仓库根目录写 release-assets.json：4 个产物的「中文说明 / 中文文件名 /
+ * Release 用的 ASCII 别名」清单（同源生成，CI 读取后复制别名上传并渲染对照表）。
+ *
  * 用法: node scripts/build-all.js
  *        npm run build:all
  */
@@ -34,6 +37,42 @@ const FINAL_FILES = {
   ocrInstaller: `${PRODUCT_NAME}_${VERSION}_${ARCH}_OCR版-setup.exe`,
   ocrPortable:  `${PRODUCT_NAME}_${VERSION}_${ARCH}_OCR绿色版.zip`,
 };
+
+// Release 上传用的 ASCII 别名。GitHub 的 Release 资产名不支持非 ASCII 字符
+// （平台限制：服务端把中文替换成「.」，gh CLI issue #8580 已确认 webui 同样如此），
+// 用中文名上传只会得到 `_2.6.x_x64-.exe` 这类残缺名，所以上传时改用 ASCII 名。
+// 命名沿用 v2.6.5 的既定约定 `TicketChan_<版本>_x64[-_ocr][-_portable]`（见 CHANGELOG）——
+// 「TicketChan」是内部代码名（Cargo 包 / 可执行文件都叫它），程序对用户的显示名仍是「发票酱」。
+// 本地 dist/ 保留中文名供分发，两者关系写进 release-assets.json 与 Release 说明。
+const ASCII_PRODUCT = 'TicketChan';
+const ASCII_RULES = [
+  [PRODUCT_NAME, ASCII_PRODUCT],   // 发票酱 → TicketChan
+  ['OCR绿色版', 'ocr-portable'],
+  ['OCR版', 'ocr'],
+  ['绿色版', 'portable'],
+];
+
+/**
+ * 把中文产物名转成等价的 ASCII 别名
+ * 兜底剔除任何残留非 ASCII 字符，保证结果一定是纯 ASCII（CI 断言依赖这一点）
+ * @param {string} name 中文产物文件名
+ * @returns {string} ASCII 别名
+ */
+function toAsciiName(name) {
+  let out = name;
+  for (const [from, to] of ASCII_RULES) out = out.split(from).join(to);
+  out = out.replace(/[^\x20-\x7e]/g, '');          // 兜底：剔除残留非 ASCII
+  out = out.replace(/__+/g, '_').replace(/^[_\-.]+/, '');
+  return out;
+}
+
+// 产物清单（唯一来源）：构建汇总、release-assets.json、CI 上传都从这里取
+const ARTIFACTS = [
+  { label: '轻量版安装包',   file: FINAL_FILES.lwInstaller },
+  { label: '轻量版绿色便携', file: FINAL_FILES.lwPortable },
+  { label: 'OCR 版安装包',   file: FINAL_FILES.ocrInstaller },
+  { label: 'OCR 版绿色便携', file: FINAL_FILES.ocrPortable },
+].map(a => ({ ...a, ascii: toAsciiName(a.file) }));
 
 // ─── 工具函数 ───────────────────────────────────────
 function run(cmd, opts = {}) {
@@ -249,23 +288,34 @@ async function main() {
   console.log('  [4/4] 产物汇总');
   console.log(`${'─'.repeat(60)}\n`);
 
-  const artifacts = [
-    { name: '轻量版安装包',   file: FINAL_FILES.lwInstaller },
-    { name: '轻量版绿色便携', file: FINAL_FILES.lwPortable },
-    { name: 'OCR 版安装包',   file: FINAL_FILES.ocrInstaller },
-    { name: 'OCR 版绿色便携', file: FINAL_FILES.ocrPortable },
-  ];
+  const artifacts = ARTIFACTS;
 
   let allOk = true;
   for (const a of artifacts) {
     const fullPath = path.join(DIST, a.file);
     if (fs.existsSync(fullPath)) {
-      console.log(`  ✅ ${a.name}: ${a.file} (${sizeMB(fullPath)} MB)`);
+      console.log(`  ✅ ${a.label}: ${a.file} (${sizeMB(fullPath)} MB)`);
+      console.log(`     └ Release 别名: ${a.ascii}`);
     } else {
-      console.log(`  ❌ ${a.name}: 未找到! (${a.file})`);
+      console.log(`  ❌ ${a.label}: 未找到! (${a.file})`);
       allOk = false;
     }
   }
+
+  // 写 Release 清单：CI 据此把产物复制成 ASCII 别名上传，并渲染「说明 ↔ 文件名」对照表
+  const manifestPath = path.join(ROOT, 'release-assets.json');
+  fs.writeFileSync(manifestPath, JSON.stringify({
+    version: VERSION,
+    product: PRODUCT_NAME,
+    generatedAt: new Date().toISOString(),
+    assets: artifacts.map(a => ({
+      label: a.label,
+      file: a.file,
+      ascii: a.ascii,
+      size: fs.existsSync(path.join(DIST, a.file)) ? fs.statSync(path.join(DIST, a.file)).size : null,
+    })),
+  }, null, 2) + '\n', 'utf8');
+  console.log(`\n📄 Release 清单: ${manifestPath}`);
 
   const elapsed = ((Date.now() - t0) / 1000 / 60).toFixed(1);
   console.log(`\n⏱  总耗时: ${elapsed} 分钟`);

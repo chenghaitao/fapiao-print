@@ -37,6 +37,8 @@ desktop.ini
 screenshot_*.png
 
 dist/
+dist-upload/
+release-assets.json
 .claude/
 .trae/
 portable-git.7z.exe

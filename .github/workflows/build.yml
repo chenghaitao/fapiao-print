@@ -110,12 +110,13 @@ jobs:
       # File naming is owned by build-all.js (Node; on Windows it uses UTF-16,
       # independent of the console codepage). This step only VERIFIES, never renames.
       #
-      # The old "Normalize artifact filenames" step embedded Chinese filename literals
-      # in the pwsh run: block, which the windows runner decoded with its default
-      # codepage (437/1252); the Chinese chars were dropped entirely, turning the
-      # Release assets into _2.6.x_x64... (Chinese lost). Here we instead detect
-      # Chinese via the CJK codepoint regex [\u4e00-\u9fff] with NO Chinese literals,
-      # eliminating the codepage problem at the root.
+      # Note: the old "Normalize artifact filenames" step embedded Chinese filename
+      # literals in the pwsh run: block, which got mangled by the runner codepage.
+      # Here we detect Chinese via the CJK codepoint regex [\u4e00-\u9fff] with NO
+      # Chinese literals. This check guards the LOCAL dist/ naming (a local build is
+      # what users get when they build from source). It is NOT about Release asset
+      # names — GitHub forbids non-ASCII asset names entirely, so the Release upload
+      # uses separate ASCII aliases; see the "Create Release & Upload" step.
       - name: Verify artifact filenames (Chinese preserved)
         shell: pwsh
         run: |
@@ -199,22 +200,42 @@ jobs:
           }
 
           $body = ($bodyLines -join "`n").Trim()
-          if ([string]::IsNullOrWhiteSpace($body)) {
-            $body = "发布 $tag`n`n详见 [CHANGELOG](https://github.com/chenghaitao/fapiao-print/blob/master/CHANGELOG.md)"
+          if ([string]::IsNullOrWhiteSpace($body)) { $body = "发布 $tag" }
+
+          # 「中文说明 ↔ 实际文件名」对照表：Release 资产名只能用 ASCII（平台限制，见下），
+          # 这里把 dist/ 的中文名与上传用的 ASCII 别名一一列出，方便用户选对文件。
+          # 清单由 build-all.js 同源生成（唯一来源），本步只读取渲染，不猜命名规则。
+          if (Test-Path release-assets.json) {
+            $manifest = Get-Content release-assets.json -Raw -Encoding UTF8 | ConvertFrom-Json
+            $rows = @()
+            $rows += ''
+            $rows += '### 📦 下载文件'
+            $rows += ''
+            $rows += '| 说明 | 实际文件名 |'
+            $rows += '| --- | --- |'
+            foreach ($a in $manifest.assets) {
+              $rows += '| ' + $a.label + ' | `' + $a.ascii + '` |'
+            }
+            $rows += ''
+            $rows += '> GitHub Release 的资产名不支持非 ASCII 字符（平台限制，gh CLI #8580），'
+            $rows += '> 中文名会被服务端替换成 `.`，故 Release 上一律使用上表的 ASCII 别名。'
+            $rows += '> 本地源码构建（`npm run build:all`）得到的仍是中文文件名，例如 `' + $manifest.assets[0].file + '`。'
+            $body += "`n" + ($rows -join "`n")
           } else {
-            $body += "`n`n---`n详见 [CHANGELOG](https://github.com/chenghaitao/fapiao-print/blob/master/CHANGELOG.md)"
+            Write-Host "::warning::未找到 release-assets.json，Release 说明将不含「中文说明 ↔ 文件名」对照表"
           }
+
+          $body += "`n`n---`n详见 [CHANGELOG](https://github.com/chenghaitao/fapiao-print/blob/master/CHANGELOG.md)"
 
           $body | Out-File -FilePath release_body.txt -Encoding UTF8 -NoNewline
           Write-Host "`n=== Release Body Preview ==="
           Write-Host $body
 
-      # Upload via the runner's preinstalled gh CLI (Go, correct UTF-8 handling).
-      # Asset names come straight from the on-disk filenames: dist/ is written by
-      # build-all.js using Node (UTF-16 on Windows, independent of the console
-      # codepage, so Chinese names are always correct). This step only asserts via
-      # a CJK regex: if any artifact name lacks Chinese it fails immediately, so the
-      # _2.6.x_x64... (Chinese-lost) assets can never reach the Release again.
+      # Release 资产名不支持非 ASCII —— 这是 GitHub 平台限制（服务端把中文替换成「.」，
+      # gh CLI issue #8580 已确认 webui 同样如此），不是编码问题，改 PowerShell/gh 参数无用。
+      # 做法：上传前把 dist/ 的 4 个中文产物复制成 ASCII 别名（别名由 build-all.js 与中文名
+      # 同源生成，清单落在 release-assets.json），dist/ 保留中文名供本地分发；
+      # 「中文说明 ↔ 实际文件名」对照表已写进 Release 说明（见上一步）。
       - name: Create Release & Upload (gh CLI)
         if: startsWith(github.ref, 'refs/tags/') || inputs.publish_release
         shell: pwsh
@@ -229,7 +250,39 @@ jobs:
           $tag  = "${{ steps.resolve_tag.outputs.tag }}"
           $repo = "chenghaitao/fapiao-print"
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $expected = @(Get-ChildItem -Path dist -File | Select-Object -ExpandProperty Name)
+
+          # 读取 build-all.js 生成的清单（中文说明 / 中文名 / ASCII 别名 的唯一来源）
+          if (-not (Test-Path release-assets.json)) {
+            Write-Host "::error::未找到 release-assets.json（应由 build-all.js 生成，检查 Build all 步骤）"
+            exit 1
+          }
+          $manifest = Get-Content release-assets.json -Raw -Encoding UTF8 | ConvertFrom-Json
+
+          # 准备上传目录：把 dist/ 的中文产物复制成 ASCII 别名。
+          # GitHub 的 Release 资产名不支持非 ASCII（平台限制，gh CLI #8580），
+          # 直接用中文名上传只会得到 `_2.6.x_x64-.exe` 这类残缺名；dist/ 保留中文供本地分发。
+          $uploadDir = "dist-upload"
+          if (Test-Path $uploadDir) { Remove-Item $uploadDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $uploadDir | Out-Null
+
+          $expected = @()
+          foreach ($a in $manifest.assets) {
+            $src = Join-Path "dist" $a.file
+            if (-not (Test-Path $src)) {
+              Write-Host "::error::产物缺失: $($a.file)"
+              exit 1
+            }
+            Copy-Item -LiteralPath $src -Destination (Join-Path $uploadDir $a.ascii) -Force
+            $expected += $a.ascii
+            Write-Host "别名: $($a.file)  ->  $($a.ascii)"
+            if ($a.file -notmatch '[\u4e00-\u9fff]') {
+              Write-Host "::warning::dist 产物名缺少中文（仅影响本地分发命名）: $($a.file)"
+            }
+          }
+          if ($expected.Count -ne 4) {
+            Write-Host "::error::期望 4 个上传产物，实际 $($expected.Count)"
+            exit 1
+          }
 
           # 带「-」的 tag（如 v2.6.12-beta.1）发布为预发布：GitHub 的 /releases/latest
           # 不含预发布，因此不会被应用内更新检查推送给所有用户（供指定用户试用验证）
@@ -252,30 +305,22 @@ jobs:
             }
           }
 
-          # 删除当前版本历史上传的错误命名资产，避免新旧文件同时显示。
+          # 清理同版本历史上传的旧资产：含更早上传时被服务端吞掉中文的 _2.6.x_x64-.exe
+          # 以及旧别名，避免新旧文件同时显示在 Release 页面上。
+          $versionPattern = "_" + [Regex]::Escape($version) + "_"
           $oldAssets = @(gh release view "$tag" --repo $repo --json assets --jq '.assets[].name')
           foreach ($asset in $oldAssets) {
-            if ($asset -match "_${version}_x64" -and $asset -notin $expected) {
+            if ($asset -match $versionPattern -and $asset -notin $expected) {
               Write-Host "删除旧资产: $asset"
               gh release delete-asset "$tag" $asset --repo $repo --yes
               if ($LASTEXITCODE -ne 0) { Write-Host "::error::删除旧资产失败: $asset"; exit 1 }
             }
           }
 
-          # Pre-check: every dist artifact must contain Chinese (assigned by build-all.js).
-          $distNames = @(Get-ChildItem -Path dist -File | Select-Object -ExpandProperty Name)
-          foreach ($dn in $distNames) {
-            if ($dn -notmatch '[\u4e00-\u9fff]') {
-              Write-Host "::error::dist 内存在非中文产物名(上游命名已丢失): $dn"
-              exit 1
-            }
-          }
-
-          Get-ChildItem -Path dist -File | ForEach-Object {
+          Get-ChildItem -Path $uploadDir -File | ForEach-Object {
             $mb = [math]::Round($_.Length / 1MB, 1)
             Write-Host "上传: $($_.Name)  ($mb MB)"
-            # upload the file as-is; gh uses its (correct Chinese) basename as the asset name.
-            # (No path#label syntax needed.)
+            # 上传的就是 ASCII 别名文件，gh 取 basename 作为资产名 → 结果确定且干净
             gh release upload "$tag" "$($_.FullName)" --repo $repo --clobber
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::上传失败: $($_.Name)"; exit 1 }
           }
@@ -283,11 +328,22 @@ jobs:
           Write-Host "`n=== Release 最终资产 ==="
           $assetNames = @(gh release view "$tag" --repo $repo --json assets --jq '.assets[].name')
           $assetNames | ForEach-Object { Write-Host "  $_" }
-          # 断言：每个资产名必须含中文产品名，否则说明上传环节仍丢失中文，立即失败。
+
+          # 断言（可满足）：资产名必须与清单里的 ASCII 别名逐一吻合。
+          # 注意：不要断言「资产名含中文」—— GitHub 服务端不支持非 ASCII 资产名
+          # （平台限制，gh CLI #8580 已 blocked），那条断言永远不可能通过。
+          if ($assetNames.Count -ne $expected.Count) {
+            Write-Host "::error::Release 资产数不符: 期望 $($expected.Count)，实际 $($assetNames.Count)"
+            exit 1
+          }
           foreach ($an in $assetNames) {
-            if ($an -notmatch '[\u4e00-\u9fff]') {
-              Write-Host "::error::资产名缺少中文(上传环节丢失): $an"
+            if ($an -notin $expected) {
+              Write-Host "::error::出现非预期资产名: $an"
+              exit 1
+            }
+            if ($an -match '[^\x20-\x7e]') {
+              Write-Host "::error::资产名含非 ASCII 字符: $an"
               exit 1
             }
           }
-          Write-Host "✅ 全部资产名均含中文产品名"
+          Write-Host "OK 4 个资产名均为 ASCII 别名，与 release-assets.json 一致"

@@ -113,12 +113,14 @@ OFD（开放版式文档）是国家标准电子发票格式，本工具提供�
 
 从 [Releases](../../releases) 下载最新版本：
 
-| 文件 | 说明 |
+| Release 里的文件名 | 说明 |
 |------|------|
-| `发票酱_x64-setup.exe` | 轻量版安装包 |
-| `发票酱_x64_绿色版.exe` | 轻量版便携（单文件 exe，无需安装） |
-| `发票酱_x64_OCR版-setup.exe` | OCR 版安装包（含 PP-OCRv6） |
-| `发票酱_x64_OCR绿色版.zip` | OCR 版便携（exe + models/） |
+| `TicketChan_<版本>_x64-setup.exe` | 轻量版安装包 |
+| `TicketChan_<版本>_x64_portable.exe` | 轻量版便携（单文件 exe，无需安装） |
+| `TicketChan_<版本>_x64_ocr-setup.exe` | OCR 版安装包（含 PP-OCRv6） |
+| `TicketChan_<版本>_x64_ocr-portable.zip` | OCR 版便携（exe + models/） |
+
+> 💡 **为什么下载到的文件名是英文？** GitHub 的 Release 资产名不支持非 ASCII 字符（平台限制），中文名上传后会被服务端替换成 `.`，变成 `_2.6.14_x64-.exe` 这类残名。所以 Release 上一律用 ASCII 文件名，程序安装后的显示名仍是「发票酱」。本地源码构建（`npm run build:all`）产出的 `dist/` 里依旧是中文名，两种命名的对应关系也会附在每个 Release 的说明里。
 
 > 💡 文字型 PDF / OFD 发票选轻量版即可自动提取金额和销售方信息；图片型 PDF 和图片需 OCR 版。
 

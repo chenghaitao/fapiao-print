@@ -41,10 +41,12 @@
             </div>
             <button class="ib" id="ocrAllBtn" onclick="ocrAll()" title="一键识别"><img src="icons/ocr_32.png" alt="识别" class="ib-icon"></button>
             <div class="copy-ctrl">
-              <button class="ib" onclick="toggleSortMenu()" title="按日期排序"><img src="icons/date_order_32.png" alt="排序" class="ib-icon"></button>
+              <button class="ib" onclick="toggleSortMenu()" title="排序"><img src="icons/date_order_32.png" alt="排序" class="ib-icon"></button>
               <div class="copy-menu hidden" id="sortMenu">
                 <div class="copy-menu-item" onclick="sortByDate(1)">↑ 旧→新</div>
                 <div class="copy-menu-item" onclick="sortByDate(-1)">↓ 新→旧</div>
+                <div class="copy-menu-sep"></div>
+                <div class="copy-menu-item" onclick="sortByType()" title="专票一堆、普票一堆，跨页票整组不拆散">按发票类型分组</div>
               </div>
             </div>
             <button class="ib" id="selectToggleBtn" onclick="toggleSelectAll()" title="全选 / 取消全选">☑ 全选</button>

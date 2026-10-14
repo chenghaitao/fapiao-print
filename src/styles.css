@@ -643,6 +643,12 @@ input[type="range"] { flex: 1; height: 5px; accent-color: var(--accent); cursor:
 .print-confirm-modal .modal-val { flex: 1; text-align: right; font-size: 13px; color: var(--text-primary); font-weight: 500; }
 .print-confirm-modal .modal-row.highlight { background: var(--accent-light); }
 .print-confirm-modal .modal-row.highlight .modal-val { font-weight: 700; color: var(--accent); }
+.print-confirm-modal .modal-val.range-opts { text-align: left; display: flex; flex-direction: column; gap: 5px; font-weight: 500; }
+.print-confirm-modal .range-opt { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.print-confirm-modal .range-opt input { accent-color: var(--accent); cursor: pointer; }
+.print-confirm-modal .range-box { display: none; align-items: center; gap: 4px; font-size: 13px; color: var(--text-secondary); }
+.print-confirm-modal .range-box.on { display: flex; }
+.print-confirm-modal .range-box input { width: 52px; text-align: center; font-size: 13px; padding: 5px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text-primary); }
 
 /* ===== Loading ===== */
 .loading { position: fixed; inset: 0; background: rgba(255,255,255,0.88); z-index: 300; display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 15px; color: var(--accent); transition: opacity 0.2s; }

@@ -67,7 +67,7 @@ function fileSpecKey(fileObj) {
     : (fileObj.previewUrl || '');
 }
 
-function buildLayoutRequest(files, settings) {
+function buildLayoutRequest(files, settings, pageRange) {
   // 1. Collect unique file specs
   var fileMap = {};
   var fileSpecs = [];
@@ -147,6 +147,11 @@ function buildLayoutRequest(files, settings) {
   // 2. Build pages (per-file copies already expanded in getActiveFiles,
   // global copies handled by SumatraPDF -print-settings Nx, not expanded here)
   var pages = buildPages(files, settings);
+  // 页码范围（1 起、闭区间，与预览页码一致：同一套 getActiveFiles + buildPages）。
+  // 页码属内容参数，切片后 pages 结构变化会让缓存自然失效，无需加入 _cacheExclude。
+  if (pageRange && pageRange.from >= 1 && pageRange.from <= pageRange.to && pageRange.to <= pages.length) {
+    pages = pages.slice(pageRange.from - 1, pageRange.to);
+  }
   var expanded = pages;
 
   // 3. Build page specs with effective rotation
@@ -577,11 +582,73 @@ async function doPdfReaderPrint(files, s) {
 }
 
 /**
- * Save invoices as PDF file — Rust does layout + PDF generation.
+ * Save invoices as PDF — pop a dialog to pick the page range first
+ * (全部 / 当前页 / 指定范围), then Rust does layout + PDF generation.
+ * 单页文档无需选择，直接保存。
  */
-async function savePdf() {
+function savePdf() {
   var files = getActiveFiles();
   if (!files.length) { toast('请先添加发票！'); return; }
+  var totalPages = buildPages(files, getSettings()).length;
+  if (totalPages <= 1) { doSavePdf(1, totalPages || 1); return; }
+  showSavePdfDialog(totalPages);
+}
+
+function showSavePdfDialog(totalPages) {
+  var cur = Math.min(S.currentPage + 1, totalPages);
+  var opt = function(val, label, checked) {
+    return '<label class="range-opt"><input type="radio" name="savePdfRange" value="' + val + '"'
+      + (checked ? ' checked' : '') + ' onchange="syncSavePdfRangeUI()">' + label + '</label>';
+  };
+  var html = '<div class="modal-row compact highlight"><span class="modal-lbl">页数</span><span class="modal-val">共 ' + totalPages + ' 页</span></div>'
+    + '<div class="modal-row"><span class="modal-lbl">范围</span><span class="modal-val range-opts">'
+    + opt('all', '全部页面', true)
+    + opt('current', '当前页（第 ' + cur + ' 页）', false)
+    + opt('range', '指定页码范围', false)
+    + '<div class="range-box" id="savePdfRangeBox">第 <input type="number" min="1" max="' + totalPages + '" id="savePdfFrom" value="1"> 页 至 第 <input type="number" min="1" max="' + totalPages + '" id="savePdfTo" value="' + totalPages + '"> 页</div>'
+    + '</span></div>';
+  document.getElementById('savePdfBody').innerHTML = html;
+  document.getElementById('savePdfModal').classList.remove('hidden');
+  syncSavePdfRangeUI();
+}
+
+function syncSavePdfRangeUI() {
+  var sel = document.querySelector('input[name="savePdfRange"]:checked');
+  var box = document.getElementById('savePdfRangeBox');
+  if (!box) return;
+  box.classList[sel && sel.value === 'range' ? 'add' : 'remove']('on');
+}
+
+function closeSavePdfDialog() {
+  document.getElementById('savePdfModal').classList.add('hidden');
+}
+
+function confirmSavePdf() {
+  var totalPages = buildPages(getActiveFiles(), getSettings()).length;
+  if (!totalPages) { closeSavePdfDialog(); toast('请先添加发票！'); return; }
+  var sel = document.querySelector('input[name="savePdfRange"]:checked');
+  var mode = sel ? sel.value : 'all';
+  var fromPage = 1, toPage = totalPages;
+  if (mode === 'current') {
+    fromPage = toPage = Math.min(S.currentPage + 1, totalPages);
+  } else if (mode === 'range') {
+    fromPage = parseInt(document.getElementById('savePdfFrom').value, 10);
+    toPage = parseInt(document.getElementById('savePdfTo').value, 10);
+    fromPage = isNaN(fromPage) ? 1 : Math.max(1, Math.min(totalPages, fromPage));
+    toPage = isNaN(toPage) ? totalPages : Math.max(1, Math.min(totalPages, toPage));
+    if (fromPage > toPage) { var tmp = fromPage; fromPage = toPage; toPage = tmp; }
+  }
+  closeSavePdfDialog();
+  doSavePdf(fromPage, toPage);
+}
+
+async function doSavePdf(fromPage, toPage) {
+  var files = getActiveFiles();
+  if (!files.length) { toast('请先添加发票！'); return; }
+  // 页范围属内容参数：切片后 pages 结构变化，缓存（deepEqual）自然失效
+  var pageRange = (fromPage > 1 || toPage < buildPages(files, getSettings()).length)
+    ? { from: fromPage, to: toPage } : null;
+  var rangeSuffix = pageRange ? ('（第 ' + fromPage + '-' + toPage + ' 页）') : '';
 
   var savePath = null;
   var savedDir = getSaveDir();
@@ -626,7 +693,7 @@ async function savePdf() {
   }
 
   var s = getSettings();
-  var currentRequest = buildLayoutRequest(files, s);
+  var currentRequest = buildLayoutRequest(files, s, pageRange);
   // 检查是否可以利用缓存
   if (canUseCachedPdf(currentRequest) && isTauri && invoke) {
     try {
@@ -647,7 +714,7 @@ async function savePdf() {
         });
         hideLoading();
         if (copyResult && copyResult.success) {
-          toast('\u2705 PDF已保存（利用缓存）: ' + savePath);
+          toast('\u2705 PDF已保存（利用缓存）' + rangeSuffix + ': ' + savePath);
           if (S.feat.autoOpenPdf && savePath) {
             try { invoke('open_file', { path: savePath }); } catch(e) {}
           }
@@ -690,7 +757,7 @@ async function savePdf() {
           destPath: savePath
         });
         
-        toast('\u2705 PDF已保存: ' + savePath);
+        toast('\u2705 PDF已保存' + rangeSuffix + ': ' + savePath);
         // Auto-open using ShellExecute (more reliable than open_url + file:///)
         if (S.feat.autoOpenPdf && savePath) {
           try { invoke('open_file', { path: savePath }); } catch(e) {}

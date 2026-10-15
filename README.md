@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue.svg)]()
 [![Tauri 2.x](https://img.shields.io/badge/Tauri-2.x-orange.svg)]()
-[![Version](https://img.shields.io/badge/Version-2.6.14-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-2.6.16-blue.svg)]()
 
 轻量桌面应用，专为批量打印电子发票设计。支持 PDF、OFD、图片等多格式导入，智能排版，一键打印或导出。
 
@@ -87,7 +87,7 @@ OFD（开放版式文档）是国家标准电子发票格式，本工具提供�
 - **PDF 统一直通**（v1.9.0+）：lopdf Form XObject + JPEG DCTDecode 直通，PDF 页面以原始质量嵌入合成 PDF，无二次压缩
 - **印章烘焙**（v2.0.4）：生成 PDF 时自动将原票印章/签章标注烘焙到输出，印章位置/大小与原票一致
 - **份数控制**：全局 + 单张份数，逐份 / 逐页打印，双面打印，彩色 / 灰度 / 黑白
-- **PDF 导出**：自动打开或自定义保存目录
+- **PDF 导出**（v2.6.12）：自动打开或自定义保存目录；导出前弹窗自选页码范围——全部页面 / 当前页 / 指定第几页到第几页，只把所选页面写成 PDF
 - **老打印机兼容模式**（v2.6.10，issue #46，默认关）：开启后打印 / 保存的 PDF 整页栅格化为纯位图 PDF（PDF 1.4 + 经典 xref 表，无透明 / 无嵌入字体），老式打印机不再丢字、丢章，等效「Ghostscript 重写为 PDF 1.3」；需 PDFium 组件
 - **确认弹窗**：打印前显示发票数量 / 版面 / 纸张 / 打印机 / 引擎 / 份数，防止误操作
 
@@ -280,6 +280,7 @@ npm run bump 1.9.8   # 同步 package.json → Cargo.toml → tauri.conf.json
 - [x] OFD 多行逐字定位（ΔX 含换行回退）按完整字符流渲染，修附记栏换行错位 + 诊断导出（右键一键生成脱敏结构报告，替代截图猜 + 反复要样本）（issue #47）（v2.6.13）
 - [x] 设置导出改为原生「另存为」+ 导出完整配置（含已打印标记 / 文件列表 / 单票调整 / 备注等本地记忆）+ 新增「📂 导入设置」与导出配对（导入后重载生效，导入期自动保存加锁防覆盖竞态）（issue #50）（v2.6.14）
 - [x] 排序菜单新增「按发票类型分组」（专票/普票归堆，跨页票整组不拆散）+ 列表金额徽章优先完整显示（不再被续页徽章挤出裁掉）+ 跨页票明细页金额徽章改淡绿（issue #40）（v2.6.15）
+- [x] 保存 PDF 页码范围自选（全部页面 / 当前页 / 指定第几页到第几页，单页文档不弹窗；页码与预览页一致，属内容参数走缓存区分）（issue #51）（v2.6.16）
 
 ## 🤖 关于此项目
 

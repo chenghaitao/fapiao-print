@@ -493,6 +493,9 @@
 <!-- Print confirm modal -->
 <div class="modal-bg hidden" id="printConfirmModal" onclick="closePrintConfirm()"><div class="modal print-confirm-modal" onclick="event.stopPropagation()"><div class="modal-title">🖨 确认打印</div><div class="modal-body" id="printConfirmBody"></div><div class="modal-actions"><button class="btn" onclick="closePrintConfirm()">取消</button><button class="btn btn-success" id="printConfirmBtn" onclick="confirmPrint()">确认打印</button></div></div></div>
 
+<!-- Save PDF range modal -->
+<div class="modal-bg hidden" id="savePdfModal" onclick="closeSavePdfDialog()"><div class="modal print-confirm-modal" onclick="event.stopPropagation()"><div class="modal-title">📥 保存为PDF</div><div class="modal-body" id="savePdfBody"></div><div class="modal-actions"><button class="btn" onclick="closeSavePdfDialog()">取消</button><button class="btn btn-warning" id="savePdfConfirmBtn" onclick="confirmSavePdf()">保存</button></div></div></div>
+
 <!-- Update available modal -->
 <div class="modal-bg hidden" id="updateModal" onclick="closeUpdateModal()">
   <div class="modal update-modal" onclick="event.stopPropagation()">

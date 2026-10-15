@@ -105,7 +105,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 **智能 PDF 缓存**（`print.js`）：
 
 - `deepEqual()` 深比较整个 `LayoutRenderRequest`，`canUseCachedPdf()` 判断复用——统一三个打印渠道 + 保存 PDF
-- `savePdf` 先生成到临时目录 → `updatePdfCache()` → `copy_file` 到用户路径；布局不变时直接复制缓存
+- `savePdf` 先生成到临时目录 → `updatePdfCache()` → `copy_file` 到用户路径；布局不变时直接复制缓存。v2.6.16 起保存前先弹窗选页码范围（全部 / 当前页 / 指定范围，单页不弹），范围经 `buildLayoutRequest(files, settings, pageRange)` 第三参切片 `pages`——属内容参数，缓存按范围自然失效
 - 缓存比较排除纯打印机参数（printerName/copies/duplex/collate），避免切打印机误判缓存失效
 
 ### 旋转与适配语义（全链路约定，issue #29）

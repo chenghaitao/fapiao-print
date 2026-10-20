@@ -4116,6 +4116,7 @@ function getSettings() {
     colorMode: document.getElementById('colorMode').value,
     globalRotation: document.getElementById('globalRotation').value,
     // 清晰度优化（issue #39）：自动增强开关与参数（threshold 无 UI，Rust 用默认 8）
+    // enhanceMinDpi 现仅用于「检查清晰度」的 ⚠ 提示阈值，不再筛选要增强的图片（issue #52）
     autoEnhance: !!S.feat.autoEnhance,
     enhanceMinDpi: parseFloat(document.getElementById('enhanceMinDpi').value) || 250,
     enhanceGamma: parseFloat(document.getElementById('enhanceGamma').value) || null,

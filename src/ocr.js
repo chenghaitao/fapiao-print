@@ -2123,8 +2123,8 @@ function _extractByText(fullText, words) {
     }
   }
 
-  // --- 项目名称（文字正则优先，坐标兜底在 extractByCoordinates 里）---
-  // 数电票明细自带 *类别*品名 星号结构，是最稳的文字信号；多条明细全部收集后合并。
+  // --- 项目名称（文字正则兜底；坐标路优先，见 extractByCoordinates）---
+  // 数电票明细自带 *类别*品名 星号结构；坐标路找不到列边界时才用这里的结果。
   // 文字层里整行明细常被压成一个串（列间空格在 _normTextForExtract 里被合并），
   // 故星号段之后裁到下一个表头关键词，避免把 规格型号/单位/单价… 一起吞进来。
   if (!result.itemName) {
@@ -3078,24 +3078,26 @@ function _extractItemNameRemarkByCoords(words, imgW, imgH) {
   var out = { itemName: '', invoiceRemark: '' };
   if (!words || !words.length || !imgH) return out;
 
-  // ---------- 项目名称：明细表头「项目名称」正下方的第一行明细（最左列） ----------
+  // ---------- 项目名称：明细表头「项目名称」下方、且落在品名列内的文字 ----------
+  // 必须同时找到「项目名称」表头与右侧列边界（规格型号/单位/数量），否则交文字正则兜底
   var header = null;
   for (var i = 0; i < words.length; i++) {
     if (/项\s*目\s*名\s*称/.test(words[i].normText)) {
       if (!header || words[i].ny < header.ny) header = words[i];
     }
   }
+  var colRight = null;
   if (header) {
-    // 明细列右边界：取同一行「规格型号 / 单位 / 数量」表头的左边缘（品名列在它们左边）
-    var colRight = null;
+    // 明细列右边界：取同一行「规格型号 / 单位 / 数量 / 单价」表头的左边缘（品名列在它们左边）
     for (var j = 0; j < words.length; j++) {
       var wj = words[j];
       if (Math.abs(wj.cy - header.cy) > header.h * 0.8) continue;
-      if (/规\s*格\s*型\s*号|单\s*位|数\s*量/.test(wj.normText) && wj.x > header.x) {
+      if (/规\s*格\s*型\s*号|单\s*位|数\s*量|单\s*价/.test(wj.normText) && wj.x > header.x) {
         if (colRight === null || wj.x < colRight) colRight = wj.x;
       }
     }
-    if (colRight === null) colRight = header.x + Math.max(header.w, imgW * 0.35);
+  }
+  if (header && colRight !== null) {
     // 明细行下界：合计 / 价税合计 / 备注 等下方锚点（没有则退到表头下方 25% 图高）
     var rowBottom = null;
     for (var k = 0; k < words.length; k++) {
@@ -3106,31 +3108,61 @@ function _extractItemNameRemarkByCoords(words, imgW, imgH) {
       }
     }
     if (rowBottom === null) rowBottom = header.y + imgH * 0.25;
-    var cand = words.filter(function(w) {
-      return w.confidence >= 0.3
-        && w.y > header.y + header.h * 0.5
-        && w.y < rowBottom
-        && (w.x + w.w) <= colRight + 2;
-    });
+    // 左缘落在品名列内即可纳入（右缘越界说明该词与「规格型号」值同处一个文本串，稍后裁尾部）
+    var cand = [];
+    for (var ci = 0; ci < words.length; ci++) {
+      var cw = words[ci];
+      if (cw.confidence < 0.3) continue;
+      if (cw.y <= header.y + header.h * 0.5) continue;
+      if (cw.y >= rowBottom) continue;
+      if (cw.x >= colRight - 0.5) continue;
+      var ct = cw.normText;
+      if (cw.x + cw.w > colRight + 0.5) {
+        // 跨列词：尾部属于「规格型号」列，裁掉尾部的型号串（如 KP826）
+        ct = String(ct).replace(/[A-Za-z0-9][A-Za-z0-9\-\.\/_]+$/, '');
+      }
+      if (!ct) continue;
+      cand.push({ w: cw, t: ct });
+    }
     if (cand.length) {
-      cand.sort(function(a, b) { return a.y - b.y || a.x - b.x; });
-      // 按行分组（行高 * 0.6 的窗口），再逐行拼出品名——多条明细全部收集后合并
-      var rows = [], cur = [], lastY = null, lastH = 0;
-      cand.forEach(function(w) {
-        var h = Math.max(w.h || 0, 8);
-        if (lastY !== null && Math.abs(w.y - lastY) > Math.max(lastH, 8) * 0.6) {
-          rows.push(cur); cur = [];
+      cand.sort(function(a, b) { return a.w.y - b.w.y || a.w.x - b.w.x; });
+      // 按行分组（行高 * 0.6 的窗口）
+      var rows = [], curRow = [], lastY = null, lastH = 0;
+      cand.forEach(function(it) {
+        var h = Math.max(it.w.h || 0, 8);
+        if (lastY !== null && Math.abs(it.w.y - lastY) > Math.max(lastH, 8) * 0.6) {
+          rows.push(curRow); curRow = [];
         }
-        cur.push(w);
-        lastY = w.y; lastH = h;
+        curRow.push(it);
+        lastY = it.w.y; lastH = h;
       });
-      if (cur.length) rows.push(cur);
+      if (curRow.length) rows.push(curRow);
+      // 数电票每条明细以 * 开头；不以 * 开头的行是上一行品名的换行续行，需并回上一条
+      var starStyle = rows.some(function(rw) {
+        return rw.some(function(it) { return /[*＊]/.test(it.t); });
+      });
       var itemList = [];
-      rows.forEach(function(rowWords) {
-        rowWords.sort(function(a, b) { return a.x - b.x; });
-        var one = _cleanItemName(rowWords.map(function(w) { return w.normText; }).join(''));
-        if (one && itemList.indexOf(one) < 0) itemList.push(one);
+      var buf = '';
+      rows.forEach(function(rw) {
+        rw.sort(function(a, b) { return a.w.x - b.w.x; });
+        var lineText = rw.map(function(it) { return it.t; }).join('');
+        // 结构性行（合计 / 价税合计 / 表头 / 落款…）不是品名，直接跳过。
+        // 注意：部分发票的「合 计」被拆成两个单字词，落在品名列内，必须在这里滤掉
+        if (_isStructuralItemRow(lineText.replace(/\s+/g, ''))) return;
+        if (starStyle && buf && !/^[*＊]/.test(lineText)) {
+          buf += lineText;           // 续行：直接拼接（换行处是同一个品名的截断）
+        } else {
+          if (buf) {
+            var done = _cleanItemName(buf);
+            if (done && itemList.indexOf(done) < 0) itemList.push(done);
+          }
+          buf = lineText;
+        }
       });
+      if (buf) {
+        var doneLast = _cleanItemName(buf);
+        if (doneLast && itemList.indexOf(doneLast) < 0) itemList.push(doneLast);
+      }
       if (itemList.length) out.itemName = _joinItems(itemList);
     }
   }
@@ -3224,6 +3256,14 @@ function _findRemarkLabel(words) {
 
 // 项目名称合并后的总长上限（多条明细用「、」连接时的截断阈值）
 var ITEM_NAME_MAX = 120;
+
+/** 明细栏里属于表头 / 合计 / 落款的结构性文本（不是品名）；入参需先去空格 */
+function _isStructuralItemRow(s) {
+  if (!s) return true;
+  // 「合 计」常被拆成两个单字词，单字/双字组合也一并滤掉
+  if (/^[合计]{1,4}$/.test(s)) return true;
+  return /^(?:价\s*税\s*合\s*计|金\s*额\s*合\s*计|大\s*写|小\s*写|备\s*注|开\s*票\s*人|收\s*款\s*人|复\s*核\s*人|单\s*价|数\s*量|单\s*位|金\s*额|税\s*额|税\s*率|征\s*收\s*率|规\s*格\s*型\s*号|项\s*目\s*名\s*称)$/.test(s);
+}
 
 /** 清洗项目名称：去掉数电票的 *类别* 星号包裹，过滤明显的表头文本 */
 function _cleanItemName(raw) {
@@ -4180,14 +4220,14 @@ function extractByCoordinates(ocrResult) {
   // 电子通行费发票销售方为路桥公司（保留真实名称），纸质票无销售方时给标签
   if (isToll && !sellerName) sellerName = '通行费发票';
 
-  // 项目名称 / 备注：文字正则（_extractByText 里已提取）优先，坐标兜底补空
-  var _itemName = textInfo.itemName || '';
-  var _invoiceRemark = textInfo.invoiceRemark || '';
-  if (!_itemName || !_invoiceRemark) {
-    var _extra = _extractItemNameRemarkByCoords(words, imgW, imgH);
-    if (!_itemName) _itemName = _extra.itemName;
-    if (!_invoiceRemark) _invoiceRemark = _extra.invoiceRemark;
-  }
+  // 项目名称 / 备注：两路互补——
+  //   项目名称：**坐标优先**（有严格列边界，能剔掉「规格型号」列、并把换行续行并回上一条），
+  //             文字正则（星号模式）兜底；
+  //   备注：**文字优先**（大区域无列边界，正则更稳），坐标兜底。
+  // 任一路缺失由另一路补空。
+  var _extra = _extractItemNameRemarkByCoords(words, imgW, imgH);
+  var _itemName = _extra.itemName || textInfo.itemName || '';
+  var _invoiceRemark = textInfo.invoiceRemark || _extra.invoiceRemark || '';
 
   console.log('[坐标提取] 结果:', { amountTax: amountTax, amountNoTax: amountNoTax, taxAmount: taxAmount,
     sellerName: sellerName || '(空)', sellerCreditCode: sellerCreditCode || '(空)',

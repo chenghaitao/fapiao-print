@@ -3265,15 +3265,18 @@ function _isStructuralItemRow(s) {
   return /^(?:价\s*税\s*合\s*计|金\s*额\s*合\s*计|大\s*写|小\s*写|备\s*注|开\s*票\s*人|收\s*款\s*人|复\s*核\s*人|单\s*价|数\s*量|单\s*位|金\s*额|税\s*额|税\s*率|征\s*收\s*率|规\s*格\s*型\s*号|项\s*目\s*名\s*称)$/.test(s);
 }
 
-/** 清洗项目名称：去掉数电票的 *类别* 星号包裹，过滤明显的表头文本 */
+/** 清洗项目名称：数电票的 *类别*品名 还原成【类别】品名，过滤明显的表头文本 */
 function _cleanItemName(raw) {
   if (!raw) return '';
   var s = raw.replace(/\s+/g, '');
-  s = s.replace(/^[*＊]+/, '').replace(/[*＊]+/g, ' ');
+  // *类别*品名 → 【类别】品名（分类保留，用括号体现，避免与品名连成一片看不清）
+  var m = s.match(/^[*＊]+([^*＊\n]{1,24})[*＊]+/);
+  if (m) s = '【' + m[1] + '】' + s.substring(m[0].length);
+  s = s.replace(/[*＊]+/g, '');   // 去掉其余零散星号
   s = s.replace(/\s+/g, ' ').trim();
   if (/^(?:项目名称|规格型号|单位|数量|单价|金额|税率|征收率|税额|合计|价税合计|税率\/征收率)$/.test(s)) return '';
   if (s.length < 2) return '';
-  if (s.length > 60) s = s.substring(0, 60);
+  if (s.length > 80) s = s.substring(0, 80);
   return s;
 }
 

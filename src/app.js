@@ -1813,6 +1813,8 @@ function loadFileFromDataUrlFast(fd) {
           buyerCreditCode: info.buyerTaxId || '',
           invoiceType: info.invoiceType || '',
           _isToll: !!info.isToll,
+          itemName: info.itemName || '',
+          invoiceRemark: info.remark || '',
           // OFD page dimensions for layout
           ow: payload.img.naturalWidth,
           oh: payload.img.naturalHeight,
@@ -1868,6 +1870,8 @@ function loadFileFromDataUrlFast(fd) {
           buyerCreditCode: info.buyerTaxId || '',
           invoiceType: info.invoiceType || '',
           _isToll: !!info.isToll,
+          itemName: info.itemName || '',
+          invoiceRemark: info.remark || '',
           // XML has no preview image — use placeholder dimensions
           ow: 0, oh: 0,
           _xmlInvoice: true

@@ -189,7 +189,8 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - **项目名称 · 文字路**（`_extractByText` 内）：兜底用——`*类别*品名` 星号模式全局收集（星号段后裁到下一个表头关键词），再退到「项目名称」标签后换行内容。
 - **备注 · 文字路**：取「备注」标签之后、截到页脚（开票人/收款人/复核人）之前，`_cleanRemark()` 清洗；**坐标路**：取左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上区域。
 - **多条项目名称用「、」去重合并**（`_joinItems()`，总长上限 `ITEM_NAME_MAX=120`，按整条边界截断）；**备注多行合并为一行**（空格分隔，上限 200 字）。`_cleanItemName()` 把数电票的 `*类别*品名` 还原成 **`【类别】品名`**（分类保留、不与品名连成一片），单条上限 80 字。
-- **版式不固定，取不到就留空、绝不猜测**，故两字段仅作参考；在发票弹窗、汇总表内可人工修正，并已加入批量重命名可选字段。**仅覆盖 OCR / PDF 文字层路径**（车票、非税票分支不调用；OFD/XML 结构化路径暂未覆盖）。
+- **结构化路径（OFD / XML 数电票）**（`invoice-engine`）：XML 直接取 `IssuItemInformation/ItemName`（多条合并）+ `Remark`；OFD 在模板层/数据层文本对象里挑 `*类别*品名` 形态的对象（`star_item_from_text()`），备注按坐标取（`extract_ofd_remark()`：左下角「备注」标签右侧、页脚行之上的文字，**无样本可验证、属 best-effort**）。两侧共用 Rust 清洗 `normalize_item_name()`（`*类别*品名` → `【类别】品名`）/ `join_item_names()`（「、」去重合并、上限 120）/ `normalize_remark()`，与 JS 侧口径一致；前端 OFD/XML 加载路径直接把 `info.itemName` / `info.remark` 写进 fileObj。
+- **版式不固定，取不到就留空、绝不猜测**，故两字段仅作参考；在发票弹窗、汇总表内可人工修正，并已加入批量重命名可选字段。**覆盖 图片 OCR / PDF 文字层 / OFD / XML 数电票**（车票、非税票分支不调用）。
 
 **多页发票逻辑票聚合**（v2.6.7，issue #40）：**物理层逐页输出不变**，逻辑层新增分组——`rebuildPdfInvoiceGroups()` 把同批次同 PDF（`getPdfBatchKey` = `_pdfPath|_batchId`）且组内非空发票号去重后**唯一**的多页归为一张逻辑票，写回 `_invoiceGroupId`（= 批次 key）+ `_multiPageInvoice{total,pageNo,isSummary}`；**合计页** = 组内最后一个识别到含税金额的页（无则取末页），统计口径（底部汇总 / 汇总表合计行 / CSV）经 `isMultiPageDetail()` 跳过非合计页，明细页仅回填合计页票种（只补空不覆盖，金额不回填）；去重 `updateDuplicateMarks()` / `removeDuplicates` 按 `getLogicalInvoiceId()` **整组计数 + 整组删除**，杜绝续页被当成重复自动删除导致打印缺页；续页徽章 `buildMultiPageBadge()`「续 n/N」「共 N 页」列表 / 卡片双视图共用。分组**幂等**，依赖已识别的 `invoiceNo`，识别异步完成后须重跑；`_placeholder` / `_xmlInvoice` 不参与。
 

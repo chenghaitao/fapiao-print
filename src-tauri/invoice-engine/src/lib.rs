@@ -33,6 +33,10 @@ pub struct OfdInvoiceInfo {
     pub invoice_type: Option<String>,
     /// 通行费电子发票标记（销售方保留真实路桥公司名）
     pub is_toll: Option<bool>,
+    /// 项目名称（明细行；数电票 `*类别*品名` 还原成 `【类别】品名`，多条用「、」连接）
+    pub item_name: Option<String>,
+    /// 票面备注（多行合并为一行）
+    pub remark: Option<String>,
 }
 
 /// Result returned by `parse_ofd_file`: SVG rendering + structured invoice data.
@@ -72,6 +76,10 @@ pub struct XmlInvoiceInfo {
     pub invoice_type: Option<String>,
     /// 通行费电子发票标记（ItemName 含「通行费」）
     pub is_toll: Option<bool>,
+    /// 项目名称（明细行；数电票 `*类别*品名` 还原成 `【类别】品名`，多条用「、」连接）
+    pub item_name: Option<String>,
+    /// 票面备注（多行合并为一行）
+    pub remark: Option<String>,
 }
 
 // =====================================================
@@ -2851,6 +2859,20 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
         if invoice_info.invoice_type.is_none() { invoice_info.invoice_type = extracted.invoice_type; }
     }
 
+    // 11c. 项目名称 / 备注（文本层 best-effort）
+    // 项目名称：模板层 + 数据层里形如 `*类别*品名` 的文本对象，多条用「、」连接
+    if invoice_info.item_name.is_none() {
+        let items: Vec<String> = tpl_texts.iter().chain(page_texts.iter())
+            .filter_map(|t| star_item_from_text(&t.text))
+            .collect();
+        invoice_info.item_name = join_item_names(&items);
+    }
+    // 备注：左下角「备注」标签右侧、页脚（开票人/收款人/复核人）行之上的文字
+    if invoice_info.remark.is_none() {
+        let all: Vec<&OfdTextObject> = tpl_texts.iter().chain(page_texts.iter()).collect();
+        invoice_info.remark = extract_ofd_remark(&all, page_h);
+    }
+
     // 12. Build SVG
     let svg = build_ofd_svg(
         page_w, page_h,
@@ -2882,6 +2904,194 @@ pub fn extract_ofd_images_raw(ofd_path: &str) -> Result<Vec<OfdExtractedImage>, 
         width: w,
         height: h,
     }).collect())
+}
+
+// =====================================================
+// 项目名称 / 备注 清洗与合并（OFD / XML 共用）
+// =====================================================
+
+/// 数电票 `*类别*品名` → `【类别】品名`；去掉零散星号与空白；单条上限 80 字符
+fn normalize_item_name(raw: &str) -> String {
+    let s: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let is_star = |c: char| c == '*' || c == '＊';
+    let out: String = if is_star(chars[0]) {
+        match chars[1..].iter().position(|c| is_star(*c)) {
+            Some(close) => {
+                let cat: String = chars[1..1 + close].iter().collect();
+                let rest: String = chars[1 + close + 1..].iter().filter(|c| !is_star(**c)).collect();
+                if !cat.is_empty() && cat.chars().count() <= 24 {
+                    format!("【{}】{}", cat, rest)
+                } else {
+                    rest
+                }
+            }
+            None => chars[1..].iter().filter(|c| !is_star(**c)).collect(),
+        }
+    } else {
+        chars.iter().filter(|c| !is_star(**c)).collect()
+    };
+    let out = out.trim();
+    if out.chars().count() > 80 {
+        out.chars().take(80).collect()
+    } else {
+        out.to_string()
+    }
+}
+
+/// 多条项目名称去重合并：「、」连接，按整条边界截断（总长上限 120 字符）
+fn join_item_names(items: &[String]) -> Option<String> {
+    let mut uniq: Vec<String> = Vec::new();
+    for it in items {
+        let it = it.trim();
+        if it.is_empty() {
+            continue;
+        }
+        if !uniq.iter().any(|u| u == it) {
+            uniq.push(it.to_string());
+        }
+    }
+    if uniq.is_empty() {
+        return None;
+    }
+    const MAX: usize = 120;
+    let mut out: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for it in &uniq {
+        let add = it.chars().count() + if out.is_empty() { 0 } else { 1 };
+        if len + add > MAX {
+            break;
+        }
+        len += add;
+        out.push(it.clone());
+    }
+    if out.is_empty() {
+        return Some(uniq[0].chars().take(MAX).collect());
+    }
+    Some(out.join("、"))
+}
+
+/// 备注清洗：去掉紧跟标签的冒号/空白、压平换行，剔掉结构性标签与页脚；上限 200 字符
+fn normalize_remark(raw: &str) -> Option<String> {
+    let mut s = raw.replace('\r', "");
+    s = s.split('\n')
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = s.trim_start_matches(['：', ':', '.', '-', '—', ' ']).trim();
+    if s.is_empty() {
+        return None;
+    }
+    let nos: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    for kw in ["价税合计", "大写", "小写", "开票人", "收款人", "复核人"] {
+        if nos.contains(kw) {
+            return None;
+        }
+    }
+    for kw in ["备注", "开票人", "收款人", "复核人", "合计"] {
+        if nos.starts_with(kw) {
+            return None;
+        }
+    }
+    if !nos.chars().any(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return None;
+    }
+    if s.chars().count() > 200 {
+        Some(s.chars().take(200).collect())
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// OFD 文本对象里形如 `*类别*品名` 的明细名（整个对象即一条明细；与「规格型号」同串时裁尾部）
+fn star_item_from_text(text: &str) -> Option<String> {
+    let t = text.trim();
+    let chars: Vec<char> = t.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let is_star = |c: char| c == '*' || c == '＊';
+    if !is_star(chars[0]) || !chars[1..].iter().any(|c| is_star(*c)) {
+        return None;
+    }
+    let body = match t.find("规格型号") {
+        Some(i) => &t[..i],
+        None => t,
+    };
+    let n = normalize_item_name(body);
+    if n.chars().count() < 2 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// OFD 备注：左下角「备注」标签右侧、页脚（开票人/收款人/复核人）行之上的文本（best-effort）
+fn extract_ofd_remark(texts: &[&OfdTextObject], page_h: f64) -> Option<String> {
+    // 标签取最靠下的「备注」文本对象
+    let mut label: Option<(f64, f64, f64, f64)> = None; // (x, y, w, h)
+    for t in texts {
+        let s: String = t.text.chars().filter(|c| !c.is_whitespace()).collect();
+        if s != "备注" {
+            continue;
+        }
+        let b = t.boundary;
+        if label.map_or(true, |(_, ly, _, _)| b.1 > ly) {
+            label = Some(b);
+        }
+    }
+    let (lx, ly, lw, lh) = label?;
+    // 下界：标签下方最近的 开票人 / 收款人 / 复核人（没有则退到 97% 页高）
+    let mut bottom = page_h * 0.97;
+    for t in texts {
+        let s: String = t.text.chars().filter(|c| !c.is_whitespace()).collect();
+        if !(s.contains("开票人") || s.contains("收款人") || s.contains("复核人")) {
+            continue;
+        }
+        if t.boundary.1 > ly && t.boundary.1 < bottom {
+            bottom = t.boundary.1;
+        }
+    }
+    let rx = lx + lw * 0.5;
+    let mut rows: Vec<(f64, Vec<(f64, String)>)> = Vec::new(); // (y, [(x, text)])
+    for t in texts {
+        let s = t.text.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let b = t.boundary;
+        if b.1 < ly - lh || b.1 > bottom || b.0 < rx {
+            continue;
+        }
+        let nos: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        if nos == "备注" || nos.starts_with("开票人") || nos.starts_with("收款人") || nos.starts_with("复核人") {
+            continue;
+        }
+        if nos.contains("价税合计") || nos.contains("大写") || nos.contains("小写") {
+            continue;
+        }
+        match rows.last_mut() {
+            Some(row) if (b.1 - row.0).abs() < (b.3.max(1.0)) * 0.6 => row.1.push((b.0, s.to_string())),
+            _ => rows.push((b.1, vec![(b.0, s.to_string())])),
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let joined = rows
+        .iter_mut()
+        .map(|(_, ws)| {
+            ws.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            ws.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalize_remark(&joined)
 }
 
 // =====================================================
@@ -2928,6 +3138,8 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
     let mut general_or_special_code: Option<String> = None;
     // Item names (IssuItemInformation) — used for toll detection
     let mut item_names: Vec<String> = Vec::new();
+    // 票面备注（Remark）
+    let mut remark_text: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -2991,6 +3203,8 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
                         },
                         // Item names — used for toll detection (通行费)
                         "ItemName" => item_names.push(text.to_string()),
+                        // 票面备注
+                        "Remark" => remark_text = Some(text.to_string()),
                         _ => {}
                     }
                 }
@@ -3022,6 +3236,13 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
 
     // Toll detection: item name contains 通行费 (e.g. "*生产生活服务*通行费")
     info.is_toll = Some(item_names.iter().any(|s| s.contains("通行费")));
+
+    // 项目名称 / 备注：数电票明细 *类别*品名 还原成【类别】品名，多条用「、」连接
+    let names: Vec<String> = item_names.iter().map(|s| normalize_item_name(s)).collect();
+    info.item_name = join_item_names(&names);
+    if let Some(r) = remark_text.as_deref() {
+        info.remark = normalize_remark(r);
+    }
 
     // Fallback: if amount_tax still empty, try alternate tag name
     if info.amount_tax.is_none() {
@@ -3488,6 +3709,58 @@ mod tests {
         assert!(dump.contains("DeltaX="), "应含 DeltaX 数组");
         assert!(dump.contains("汉"), "文本应经脱敏输出");
         assert!(!dump.contains("通行费"), "原始文本不得出现在诊断输出中");
+    }
+
+    #[test]
+    fn normalizes_star_item_name() {
+        assert_eq!(normalize_item_name("*生产生活服务*培训费"), "【生产生活服务】培训费");
+        assert_eq!(normalize_item_name("*环境监测仪器*外置泵"), "【环境监测仪器】外置泵");
+        assert_eq!(normalize_item_name("培训费"), "培训费");
+        assert_eq!(normalize_item_name("  *电子计算机* 路由器 "), "【电子计算机】路由器");
+        assert_eq!(normalize_item_name(""), "");
+    }
+
+    #[test]
+    fn joins_item_names_with_dedupe_and_cap() {
+        let items = vec![
+            normalize_item_name("*公共安全设备*防火泥"),
+            normalize_item_name("*塑料制品*PVC电线管"),
+            normalize_item_name("*公共安全设备*防火泥"),
+        ];
+        assert_eq!(join_item_names(&items).unwrap(), "【公共安全设备】防火泥、【塑料制品】PVC电线管");
+        assert!(join_item_names(&[]).is_none());
+    }
+
+    #[test]
+    fn cleans_remark() {
+        assert_eq!(normalize_remark("业务号码:13156770132;账期:202604").unwrap(), "业务号码:13156770132;账期:202604");
+        assert_eq!(normalize_remark(": 第一行\n第二行 ").unwrap(), "第一行 第二行");
+        assert!(normalize_remark("开票人: 张三").is_none());
+        assert!(normalize_remark("   ").is_none());
+    }
+
+    #[test]
+    fn parses_star_item_from_text_object() {
+        assert_eq!(star_item_from_text("*电信服务*通信服务费").unwrap(), "【电信服务】通信服务费");
+        assert!(star_item_from_text("项目名称").is_none());
+        assert!(star_item_from_text("*没有闭合星号").is_none());
+    }
+
+    #[test]
+    fn parses_xml_item_name_and_remark() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EInvoice>
+  <EInvoiceData>
+    <SellerInformation><SellerName>某某公司</SellerName></SellerInformation>
+    <BasicInformation><TotalTax-includedAmount>400.00</TotalTax-includedAmount></BasicInformation>
+    <IssuItemInformation><ItemName>*生产生活服务*餐费</ItemName><Amount>377.36</Amount></IssuItemInformation>
+    <IssuItemInformation><ItemName>*住宿服务*住宿费</ItemName><Amount>200.00</Amount></IssuItemInformation>
+    <Remark>业务号码:13156770132;账期:202604</Remark>
+  </EInvoiceData>
+</EInvoice>"#;
+        let info = parse_xml_invoice_content(xml).unwrap();
+        assert_eq!(info.item_name.as_deref(), Some("【生产生活服务】餐费、【住宿服务】住宿费"));
+        assert_eq!(info.remark.as_deref(), Some("业务号码:13156770132;账期:202604"));
     }
 }
 

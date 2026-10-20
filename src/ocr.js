@@ -2124,15 +2124,18 @@ function _extractByText(fullText, words) {
   }
 
   // --- 项目名称（文字正则优先，坐标兜底在 extractByCoordinates 里）---
-  // 数电票明细自带 *类别*品名 星号结构，是最稳的文字信号。
+  // 数电票明细自带 *类别*品名 星号结构，是最稳的文字信号；多条明细全部收集后合并。
   // 文字层里整行明细常被压成一个串（列间空格在 _normTextForExtract 里被合并），
   // 故星号段之后裁到下一个表头关键词，避免把 规格型号/单位/单价… 一起吞进来。
   if (!result.itemName) {
-    var _itemM = text.match(/[*＊][^*＊\n]{1,24}[*＊][^*＊\n]{1,40}/);
-    if (_itemM) {
+    var _itemMRe = /[*＊][^*＊\n]{1,24}[*＊][^*＊\n]{1,40}/g;
+    var _itemM, _items = [];
+    while ((_itemM = _itemMRe.exec(text)) !== null) {
       var _itemRaw = _itemM[0].replace(/(规\s*格\s*型\s*号|单\s*位|数\s*量|单\s*价|金\s*额|税\s*率|征\s*收\s*率|税\s*额)[\s\S]*$/, '');
-      result.itemName = _cleanItemName(_itemRaw);
+      var _oneItem = _cleanItemName(_itemRaw);
+      if (_oneItem && _items.indexOf(_oneItem) < 0) _items.push(_oneItem);
     }
+    if (_items.length) result.itemName = _joinItems(_items);
   }
   // 退而求其次：「项目名称」标签后换行处的内容
   if (!result.itemName) {
@@ -3111,12 +3114,24 @@ function _extractItemNameRemarkByCoords(words, imgW, imgH) {
     });
     if (cand.length) {
       cand.sort(function(a, b) { return a.y - b.y || a.x - b.x; });
-      var firstY = cand[0].y;
-      // 只取同一行：行高 * 0.6 的窗口，避免把相邻的下一行明细一起并进来
-      var lineH = Math.max(cand[0].h || 0, 8);
-      var lineWords = cand.filter(function(w) { return Math.abs(w.y - firstY) < lineH * 0.6; });
-      lineWords.sort(function(a, b) { return a.x - b.x; });
-      out.itemName = _cleanItemName(lineWords.map(function(w) { return w.normText; }).join(''));
+      // 按行分组（行高 * 0.6 的窗口），再逐行拼出品名——多条明细全部收集后合并
+      var rows = [], cur = [], lastY = null, lastH = 0;
+      cand.forEach(function(w) {
+        var h = Math.max(w.h || 0, 8);
+        if (lastY !== null && Math.abs(w.y - lastY) > Math.max(lastH, 8) * 0.6) {
+          rows.push(cur); cur = [];
+        }
+        cur.push(w);
+        lastY = w.y; lastH = h;
+      });
+      if (cur.length) rows.push(cur);
+      var itemList = [];
+      rows.forEach(function(rowWords) {
+        rowWords.sort(function(a, b) { return a.x - b.x; });
+        var one = _cleanItemName(rowWords.map(function(w) { return w.normText; }).join(''));
+        if (one && itemList.indexOf(one) < 0) itemList.push(one);
+      });
+      if (itemList.length) out.itemName = _joinItems(itemList);
     }
   }
 
@@ -3207,6 +3222,9 @@ function _findRemarkLabel(words) {
   return best;
 }
 
+// 项目名称合并后的总长上限（多条明细用「、」连接时的截断阈值）
+var ITEM_NAME_MAX = 120;
+
 /** 清洗项目名称：去掉数电票的 *类别* 星号包裹，过滤明显的表头文本 */
 function _cleanItemName(raw) {
   if (!raw) return '';
@@ -3217,6 +3235,22 @@ function _cleanItemName(raw) {
   if (s.length < 2) return '';
   if (s.length > 60) s = s.substring(0, 60);
   return s;
+}
+
+/** 合并多条项目名称：用「、」连接，超过总长上限则按整条的边界截断（不截半条） */
+function _joinItems(items) {
+  if (!items || !items.length) return '';
+  var MAX = ITEM_NAME_MAX;
+  var out = [];
+  var len = 0;
+  for (var i = 0; i < items.length; i++) {
+    var add = items[i].length + (out.length ? 1 : 0);
+    if (len + add > MAX) break;
+    out.push(items[i]);
+    len += add;
+  }
+  if (!out.length) return items[0].substring(0, MAX);
+  return out.join('、');
 }
 
 /** 清洗发票备注：去掉紧跟标签的冒号/空白，压平换行，过滤结构性标签与页脚 */

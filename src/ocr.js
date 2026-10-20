@@ -3112,7 +3112,9 @@ function _extractItemNameRemarkByCoords(words, imgW, imgH) {
     if (cand.length) {
       cand.sort(function(a, b) { return a.y - b.y || a.x - b.x; });
       var firstY = cand[0].y;
-      var lineWords = cand.filter(function(w) { return Math.abs(w.y - firstY) < header.h * 1.6; });
+      // 只取同一行：行高 * 0.6 的窗口，避免把相邻的下一行明细一起并进来
+      var lineH = Math.max(cand[0].h || 0, 8);
+      var lineWords = cand.filter(function(w) { return Math.abs(w.y - firstY) < lineH * 0.6; });
       lineWords.sort(function(a, b) { return a.x - b.x; });
       out.itemName = _cleanItemName(lineWords.map(function(w) { return w.normText; }).join(''));
     }

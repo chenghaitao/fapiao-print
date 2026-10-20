@@ -184,7 +184,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **金额提取**：含税价 → 数学验证配对 → 区域解析三阶段；中文大写 `parseChineseNumeral()` 兜底；金额求和校验失败时卡片 ⚠ 徽章 + hover 详情 + 汇总栏计数。
 
-**项目名称 / 发票备注提取**（v2.6.13，best-effort）：`_extractItemNameRemark()` 走坐标锚点近似——项目名称取明细表头「项目名称」正下方首行、最左列文字（清洗 `*类别*品名` 星号包裹）；发票备注取左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚「开票人/收款人/复核人」行之上的区域。**版式不固定，取不到就留空、绝不猜测**，故两字段仅作参考；在发票弹窗、汇总表内可人工修正，并已加入批量重命名可选字段。**仅覆盖 OCR / PDF 文字层路径**（车票、非税票分支不调用；OFD/XML 结构化路径暂未覆盖）。
+**项目名称 / 发票备注提取**（v2.6.13，best-effort）：**两层模式，与 invoiceNo/sellerName 同路径**——文字正则优先，坐标兜底。文字层：`_extractByText` 内先用 `*类别*品名` 星号模式（星号段后裁到下一个表头关键词，因 `_normTextForExtract` 会合并列间空格），再退到「项目名称」标签后换行内容；备注取「备注」标签之后、截到页脚（开票人/收款人/复核人）之前，`_cleanRemark()` 清洗。坐标兜底：文字没提到时才跑 `_extractItemNameRemarkByCoords()`——项目名称取明细表头「项目名称」正下方首行、最左列（右界=同排「规格型号/单位/数量」表头左缘，下界=「合计/价税合计/备注」锚点）；备注取左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上区域。**版式不固定，取不到就留空、绝不猜测**，故两字段仅作参考；在发票弹窗、汇总表内可人工修正，并已加入批量重命名可选字段。**仅覆盖 OCR / PDF 文字层路径**（车票、非税票分支不调用；OFD/XML 结构化路径暂未覆盖）。
 
 **多页发票逻辑票聚合**（v2.6.7，issue #40）：**物理层逐页输出不变**，逻辑层新增分组——`rebuildPdfInvoiceGroups()` 把同批次同 PDF（`getPdfBatchKey` = `_pdfPath|_batchId`）且组内非空发票号去重后**唯一**的多页归为一张逻辑票，写回 `_invoiceGroupId`（= 批次 key）+ `_multiPageInvoice{total,pageNo,isSummary}`；**合计页** = 组内最后一个识别到含税金额的页（无则取末页），统计口径（底部汇总 / 汇总表合计行 / CSV）经 `isMultiPageDetail()` 跳过非合计页，明细页仅回填合计页票种（只补空不覆盖，金额不回填）；去重 `updateDuplicateMarks()` / `removeDuplicates` 按 `getLogicalInvoiceId()` **整组计数 + 整组删除**，杜绝续页被当成重复自动删除导致打印缺页；续页徽章 `buildMultiPageBadge()`「续 n/N」「共 N 页」列表 / 卡片双视图共用。分组**幂等**，依赖已识别的 `invoiceNo`，识别异步完成后须重跑；`_placeholder` / `_xmlInvoice` 不参与。
 

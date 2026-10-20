@@ -2860,17 +2860,16 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
     }
 
     // 11c. 项目名称 / 备注（文本层 best-effort）
-    // 项目名称：模板层 + 数据层里形如 `*类别*品名` 的文本对象，多条用「、」连接
-    if invoice_info.item_name.is_none() {
-        let items: Vec<String> = tpl_texts.iter().chain(page_texts.iter())
-            .filter_map(|t| star_item_from_text(&t.text))
-            .collect();
-        invoice_info.item_name = join_item_names(&items);
-    }
-    // 备注：左下角「备注」标签右侧、页脚（开票人/收款人/复核人）行之上的文字
-    if invoice_info.remark.is_none() {
+    {
         let all: Vec<&OfdTextObject> = tpl_texts.iter().chain(page_texts.iter()).collect();
-        invoice_info.remark = extract_ofd_remark(&all, page_h);
+        // 项目名称：按「项目名称」列边界取明细（不做全局星号扫描）
+        if invoice_info.item_name.is_none() {
+            invoice_info.item_name = extract_ofd_item_name(&all, page_h);
+        }
+        // 备注：左下角「备注」标签右侧、页脚行之上的文字
+        if invoice_info.remark.is_none() {
+            invoice_info.remark = extract_ofd_remark(&all, page_h);
+        }
     }
 
     // 12. Build SVG
@@ -2984,6 +2983,7 @@ fn normalize_remark(raw: &str) -> Option<String> {
         .join(" ");
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     let s = s.trim_start_matches(['：', ':', '.', '-', '—', ' ']).trim();
+    let s = s.trim_end_matches([';', '；', '、', ',']).trim();
     if s.is_empty() {
         return None;
     }
@@ -3008,76 +3008,260 @@ fn normalize_remark(raw: &str) -> Option<String> {
     }
 }
 
-/// OFD 文本对象里形如 `*类别*品名` 的明细名（整个对象即一条明细；与「规格型号」同串时裁尾部）
-fn star_item_from_text(text: &str) -> Option<String> {
-    let t = text.trim();
-    let chars: Vec<char> = t.chars().collect();
-    if chars.is_empty() {
-        return None;
-    }
-    let is_star = |c: char| c == '*' || c == '＊';
-    if !is_star(chars[0]) || !chars[1..].iter().any(|c| is_star(*c)) {
-        return None;
-    }
-    let body = match t.find("规格型号") {
-        Some(i) => &t[..i],
-        None => t,
-    };
-    let n = normalize_item_name(body);
-    if n.chars().count() < 2 {
-        None
-    } else {
-        Some(n)
-    }
+/// OFD 文本对象在页面坐标系里的位置：Boundary 原点 + CTM 作用于 TextCode 的 X/Y
+/// （无 CTM 时即 Boundary + X/Y，与渲染路径的 Normal 分支一致）
+fn ofd_page_pos(t: &OfdTextObject) -> (f64, f64) {
+    let (a, b, c, d, e, f) = t.ctm.unwrap_or((1.0, 0.0, 0.0, 1.0, 0.0, 0.0));
+    (
+        t.boundary.0 + a * t.text_x + c * t.text_y + e,
+        t.boundary.1 + b * t.text_x + d * t.text_y + f,
+    )
 }
 
-/// OFD 备注：左下角「备注」标签右侧、页脚（开票人/收款人/复核人）行之上的文本（best-effort）
-fn extract_ofd_remark(texts: &[&OfdTextObject], page_h: f64) -> Option<String> {
-    // 标签取最靠下的「备注」文本对象
-    let mut label: Option<(f64, f64, f64, f64)> = None; // (x, y, w, h)
+/// 去空白后的文本，用于标签比对
+fn ofd_compact(t: &OfdTextObject) -> String {
+    t.text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// 明细栏里的结构性文本（表头 / 合计 / 落款），不是品名
+fn is_ofd_structural(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    // 「合 计」常被拆成两个单字对象，单字/双字组合也滤掉
+    if s.chars().all(|c| c == '合' || c == '计') {
+        return true;
+    }
+    const KEYS: [&str; 17] = [
+        "价税合计", "金额合计", "大写", "小写", "备注", "开票人", "收款人", "复核人",
+        "单价", "数量", "单位", "金额", "税额", "税率", "征收率", "规格型号", "项目名称",
+    ];
+    KEYS.iter().any(|k| s.starts_with(k))
+}
+
+/// 表头行判定的纵向容差（mm）
+const OFD_ROW_TOL: f64 = 1.8;
+/// 明细数据值相对其表头左缘可能左偏的量（mm），用于把列右界往里收，避免收进邻列的数值
+const OFD_COL_MARGIN: f64 = 2.0;
+
+/// OFD 项目名称：**按列边界取**，与 JS 坐标路同一口径。
+/// 用「项目名称」表头 + 同排右侧最近表头的左缘定出品名列，只取列内、表头下方的文字；
+/// `*` 开头为新条目、否则为换行续行并回上一条。不做全局星号扫描（会误收其它区域的星号文本）。
+fn extract_ofd_item_name(texts: &[&OfdTextObject], page_h: f64) -> Option<String> {
+    // 1. 表头：最靠上的「项目名称」
+    let mut header: Option<(f64, f64, f64)> = None; // (x, y, w)
     for t in texts {
-        let s: String = t.text.chars().filter(|c| !c.is_whitespace()).collect();
-        if s != "备注" {
+        if ofd_compact(t) != "项目名称" {
             continue;
         }
-        let b = t.boundary;
-        if label.map_or(true, |(_, ly, _, _)| b.1 > ly) {
-            label = Some(b);
+        let (x, y) = ofd_page_pos(t);
+        let better = match header {
+            Some((_, hy, _)) => y < hy - 0.5 || ((y - hy).abs() <= 0.5 && x < header.unwrap().0),
+            None => true,
+        };
+        if better {
+            header = Some((x, y, t.boundary.2));
         }
     }
-    let (lx, ly, lw, lh) = label?;
-    // 下界：标签下方最近的 开票人 / 收款人 / 复核人（没有则退到 97% 页高）
-    let mut bottom = page_h * 0.97;
+    let (hx, hy, hw) = header?;
+    // 2. 同一表头行里、表头右侧最近的一个非空对象左缘（往里收 OFD_COL_MARGIN）= 品名列右界
+    let mut col_right: Option<f64> = None;
     for t in texts {
-        let s: String = t.text.chars().filter(|c| !c.is_whitespace()).collect();
-        if !(s.contains("开票人") || s.contains("收款人") || s.contains("复核人")) {
+        if ofd_compact(t).is_empty() {
             continue;
         }
-        if t.boundary.1 > ly && t.boundary.1 < bottom {
-            bottom = t.boundary.1;
+        let (x, y) = ofd_page_pos(t);
+        if (y - hy).abs() > OFD_ROW_TOL {
+            continue;
+        }
+        if x <= hx + 0.5 {
+            continue;
+        }
+        col_right = Some(col_right.map_or(x, |c| c.min(x)));
+    }
+    // 找不到同排表头时退到一个保守值（表头自身右边 + 1mm）
+    let col_right = col_right.map_or(hx + hw + 1.0, |c| c - OFD_COL_MARGIN);
+    // 3. 下界：表头下方最近的 合计 / 价税合计 / 备注 锚点（找不到退到表头 + 35% 页高）
+    let mut bottom = hy + page_h * 0.35;
+    for t in texts {
+        let s = ofd_compact(t);
+        let is_anchor = !s.is_empty()
+            && !s.starts_with("单价") && !s.starts_with("数量") && !s.starts_with("单位")
+            && !s.starts_with("规格型号") && !s.starts_with("项目名称")
+            && (s.starts_with("合计") || s.contains("价税合计") || s.starts_with("大写")
+                || s.starts_with("小写") || s.starts_with("备注"));
+        if !is_anchor {
+            continue;
+        }
+        let (_, y) = ofd_page_pos(t);
+        if y > hy + 0.5 && y < bottom {
+            bottom = y;
         }
     }
-    let rx = lx + lw * 0.5;
-    let mut rows: Vec<(f64, Vec<(f64, String)>)> = Vec::new(); // (y, [(x, text)])
+    // 4. 品名列内、表头下方的文字对象
+    let mut cand: Vec<(f64, f64, String)> = Vec::new(); // (x, y, text)
     for t in texts {
         let s = t.text.trim();
         if s.is_empty() {
             continue;
         }
-        let b = t.boundary;
-        if b.1 < ly - lh || b.1 > bottom || b.0 < rx {
+        let (x, y) = ofd_page_pos(t);
+        if y <= hy + 0.5 || y >= bottom {
             continue;
         }
-        let nos: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        if nos == "备注" || nos.starts_with("开票人") || nos.starts_with("收款人") || nos.starts_with("复核人") {
+        if x >= col_right - 0.5 {
             continue;
         }
-        if nos.contains("价税合计") || nos.contains("大写") || nos.contains("小写") {
+        if is_ofd_structural(&ofd_compact(t)) {
+            continue;
+        }
+        // 与「规格型号」同串时裁掉尾部（同 JS 口径）
+        let body = match s.find("规格型号") {
+            Some(i) => &s[..i],
+            None => s,
+        };
+        if body.trim().is_empty() {
+            continue;
+        }
+        cand.push((x, y, body.to_string()));
+    }
+    if cand.is_empty() {
+        return None;
+    }
+    cand.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    // 5. 按 y 分行，`*` 开头为新条目、否则并回上一条
+    let mut rows: Vec<(f64, Vec<(f64, String)>)> = Vec::new();
+    for (x, y, txt) in cand {
+        match rows.last_mut() {
+            Some(r) if (y - r.0).abs() < OFD_ROW_TOL => r.1.push((x, txt)),
+            _ => rows.push((y, vec![(x, txt)])),
+        }
+    }
+    let star_style = rows.iter().any(|(_, ws)| {
+        ws.iter().any(|(_, t)| t.starts_with('*') || t.starts_with('＊'))
+    });
+    let mut items: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for (_, mut ws) in rows {
+        ws.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let line: String = ws.iter().map(|(_, t)| t.as_str()).collect();
+        let is_new = line.starts_with('*') || line.starts_with('＊');
+        if star_style && !buf.is_empty() && !is_new {
+            buf.push_str(&line); // 换行续行：同一品名被折行的后半段
+        } else {
+            if !buf.is_empty() {
+                let n = normalize_item_name(&buf);
+                if n.chars().count() >= 2 {
+                    items.push(n);
+                }
+            }
+            buf = line;
+        }
+    }
+    if !buf.is_empty() {
+        let n = normalize_item_name(&buf);
+        if n.chars().count() >= 2 {
+            items.push(n);
+        }
+    }
+    join_item_names(&items)
+}
+
+/// OFD 备注：左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上的文字（best-effort）
+fn extract_ofd_remark(texts: &[&OfdTextObject], page_h: f64) -> Option<String> {
+    // 标签：整词「备注」或竖排「备」+「注」，取最靠下的一组；记录 (左缘, 顶, 底)
+    let mut label: Option<(f64, f64, f64)> = None;
+    for t in texts {
+        let c = ofd_compact(t);
+        let (x, y) = ofd_page_pos(t);
+        if c == "备注" {
+            if label.map_or(true, |(_, top, _)| y > top) {
+                label = Some((x, y, y + 3.2));
+            }
+            continue;
+        }
+        if c != "备" {
+            continue;
+        }
+        for t2 in texts {
+            if ofd_compact(t2) != "注" {
+                continue;
+            }
+            let (x2, y2) = ofd_page_pos(t2);
+            if (x2 - x).abs() > 2.0 || y2 <= y || y2 > y + 14.0 {
+                continue;
+            }
+            if label.map_or(true, |(_, top, _)| y > top) {
+                label = Some((x, y, y2 + 3.2));
+            }
+            break;
+        }
+    }
+    let (lx, ltop, _lbot) = label?;
+    // 上界：标签上方最近的 价税合计/大写/小写/合计 行之下（标签常在框内垂直居中，
+    // 不能只从标签顶部算，否则会漏掉比标签更高的备注行）
+    let mut top = ltop - 6.0;
+    for t in texts {
+        let s = ofd_compact(t);
+        if !(s.contains("价税合计") || s.starts_with("大写") || s.starts_with("小写")
+            || s.starts_with("合计") || s.starts_with("金额合计")) {
+            continue;
+        }
+        let (_, y) = ofd_page_pos(t);
+        if y < ltop && y + 3.2 > top {
+            top = y + 3.2;
+        }
+    }
+    if top < 0.0 {
+        top = 0.0;
+    }
+    // 下界：标签下方最近的 开票人/收款人/复核人（没有则退到 97% 页高）
+    // 同时记录这些落款行的 y，用于剔除「与落款标签同行」的落款值（如「开票人:」旁边的姓名）
+    let mut bottom = page_h * 0.97;
+    let mut footer_rows: Vec<f64> = Vec::new();
+    for t in texts {
+        let s = ofd_compact(t);
+        if !(s.starts_with("开票人") || s.starts_with("收款人") || s.starts_with("复核人")) {
+            continue;
+        }
+        let (_, y) = ofd_page_pos(t);
+        footer_rows.push(y);
+        if y > ltop && y < bottom {
+            bottom = y;
+        }
+    }
+    let rx = lx + 1.6;
+    let mut rows: Vec<(f64, Vec<(f64, String)>)> = Vec::new();
+    for t in texts {
+        let s = t.text.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let (x, y) = ofd_page_pos(t);
+        if y < top || y > bottom || x < rx {
+            continue;
+        }
+        let nos = ofd_compact(t);
+        if nos == "备注" || nos == "备" || nos == "注" {
+            continue;
+        }
+        if nos.starts_with("开票人") || nos.starts_with("收款人") || nos.starts_with("复核人") {
+            continue;
+        }
+        if nos.contains("价税合计") || nos.starts_with("大写") || nos.starts_with("小写") {
+            continue;
+        }
+        // 与落款标签同行的文字是落款值，不是备注内容
+        if footer_rows.iter().any(|fy| (y - fy).abs() < 3.0) {
             continue;
         }
         match rows.last_mut() {
-            Some(row) if (b.1 - row.0).abs() < (b.3.max(1.0)) * 0.6 => row.1.push((b.0, s.to_string())),
-            _ => rows.push((b.1, vec![(b.0, s.to_string())])),
+            Some(r) if (y - r.0).abs() < OFD_ROW_TOL => r.1.push((x, s.to_string())),
+            _ => rows.push((y, vec![(x, s.to_string())])),
         }
     }
     if rows.is_empty() {
@@ -3740,10 +3924,54 @@ mod tests {
     }
 
     #[test]
-    fn parses_star_item_from_text_object() {
-        assert_eq!(star_item_from_text("*电信服务*通信服务费").unwrap(), "【电信服务】通信服务费");
-        assert!(star_item_from_text("项目名称").is_none());
-        assert!(star_item_from_text("*没有闭合星号").is_none());
+    fn extracts_ofd_item_name_by_column() {
+        let mk = |text: &str, b: (f64, f64, f64, f64), tx: f64, ty: f64| {
+            let mut t = OfdTextObject::default();
+            t.text = text.to_string();
+            t.boundary = b;
+            t.ctm = Some((1.0, 0.0, 0.0, 1.0, 0.0, 0.0));
+            t.text_x = tx;
+            t.text_y = ty;
+            t
+        };
+        // 单层模板版式（移动话费）：表头同一行，品名列右界 = 右侧表头左缘 - 2mm
+        let tpl = vec![
+            mk("项目名称 ", (15.5063, 52.7882, 14.2875, 3.175), 0.0, 0.0),
+            mk("规格型号", (40.9, 52.7882, 12.7, 3.175), 0.0, 0.0),
+            mk("单  位", (67.4375, 52.7882, 9.525, 3.175), 0.0, 0.0),
+            mk("*电信服务*通信服务费", (4.4, 56.9277, 31.75, 3.175), 0.0, 0.0),
+            mk("项", (70.6125, 56.6632, 3.175, 3.175), 0.0, 0.0),
+            mk("合        计 ", (20.3313, 92.7631, 20.6375, 3.175), 0.0, 0.0),
+        ];
+        let tpl_refs: Vec<&OfdTextObject> = tpl.iter().collect();
+        assert_eq!(
+            extract_ofd_item_name(&tpl_refs, 270.0).as_deref(),
+            Some("【电信服务】通信服务费")
+        );
+
+        // 数电票数据层版式（高速通行费）：值用 TextCode 的 X/Y，表头在模板层；
+        // 邻列数值（车牌号 x=41.9）比其表头（x=43.17）略偏左，必须靠列边界排除
+        let mut data_item = OfdTextObject::default();
+        data_item.text = "*生产生活服务*通行费".to_string();
+        data_item.boundary = (0.0, 0.0, 210.0, 297.0);
+        data_item.text_x = 8.0;
+        data_item.text_y = 57.0;
+        let mut plate = OfdTextObject::default();
+        plate.text = "苏B3A70G".to_string();
+        plate.boundary = (0.0, 0.0, 210.0, 297.0);
+        plate.text_x = 41.9;
+        plate.text_y = 57.0;
+        let mix = vec![
+            mk("项目名称", (15.1313, 47.1513, 13.4245, 2.8377), 0.0, 0.0),
+            mk("车牌号车辆类型", (43.1745, 47.1513, 139.403, 2.8377), 0.0, 0.0),
+            data_item,
+            plate,
+        ];
+        let mix_refs: Vec<&OfdTextObject> = mix.iter().collect();
+        assert_eq!(
+            extract_ofd_item_name(&mix_refs, 297.0).as_deref(),
+            Some("【生产生活服务】通行费")
+        );
     }
 
     #[test]

@@ -2436,6 +2436,9 @@ function runClarityAudit() {
   var req;
   try { req = buildLayoutRequest(files, getSettings()); }
   catch (e) { toast('构建版式失败：' + e); return; }
+  // enhanceMinDpi 是纯提示参数、不进 PDF 缓存比较（见 print.js 的 _cacheExclude），
+  // 这里补回 request 供 Rust 的清晰度体检判定 ⚠ 徽章
+  req.settings.enhanceMinDpi = parseFloat(document.getElementById('enhanceMinDpi').value) || 250;
 
   invoke('audit_clarity', { request: req }).then(function (list) {
     var keys = req._specKeys || [];

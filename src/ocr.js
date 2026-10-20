@@ -441,6 +441,8 @@ function applyOcrResult(fileObj, ocrResult) {
       if (info.invoiceDate && !fileObj.invoiceDate) fileObj.invoiceDate = info.invoiceDate;
       if (info.buyerName && !fileObj.buyerName) fileObj.buyerName = info.buyerName;
       if (info.buyerCreditCode && !fileObj.buyerCreditCode) fileObj.buyerCreditCode = info.buyerCreditCode;
+      if (info.itemName && !fileObj.itemName) fileObj.itemName = info.itemName;
+      if (info.invoiceRemark && !fileObj.invoiceRemark) fileObj.invoiceRemark = info.invoiceRemark;
       return;
     }
 
@@ -493,6 +495,8 @@ function applyOcrResult(fileObj, ocrResult) {
     if (info.invoiceDate && !fileObj.invoiceDate) fileObj.invoiceDate = info.invoiceDate;
     if (info.buyerName && !fileObj.buyerName) fileObj.buyerName = info.buyerName;
     if (info.buyerCreditCode && !fileObj.buyerCreditCode) fileObj.buyerCreditCode = info.buyerCreditCode;
+    if (info.itemName && !fileObj.itemName) fileObj.itemName = info.itemName;
+    if (info.invoiceRemark && !fileObj.invoiceRemark) fileObj.invoiceRemark = info.invoiceRemark;
   } catch(e) {
     console.warn('[OCR] 结果应用失败:', e);
   }
@@ -589,6 +593,8 @@ function applyPdfTextResult(fileObj, pdfTextResult) {
     if (!info.isTicket && !info.isNonTax) {
       if (info.sellerCreditCode && !fileObj.sellerCreditCode) fileObj.sellerCreditCode = info.sellerCreditCode;
     }
+    if (info.itemName && !fileObj.itemName) fileObj.itemName = info.itemName;
+    if (info.invoiceRemark && !fileObj.invoiceRemark) fileObj.invoiceRemark = info.invoiceRemark;
 
     // Amounts — same guard logic as applyOcrResult
     var effAmt = info.amountTax > 0 ? info.amountTax : info.amountNoTax;
@@ -3024,6 +3030,162 @@ function _extractSeller(words, imgW, imgH) {
 }
 
 /**
+ * 提取发票「项目名称」与「备注」——best-effort，版式不固定，取不到就留空，绝不猜测。
+ * 结果可在发票弹窗 / 汇总表内人工修正（用户已确认对准确率有顾虑）。
+ * 仅适用于增值税 / 通行费等主路径；车票、非税票走各自分支，不调用本函数。
+ *
+ * @param {Array} words - _buildWords() 输出的词数组（含 nx/ny/x/y/w/h/cx/cy/normText/confidence）
+ * @param {number} imgW - 图像宽度（px）
+ * @param {number} imgH - 图像高度（px）
+ * @returns {{itemName: string, invoiceRemark: string}}
+ */
+function _extractItemNameRemark(words, imgW, imgH) {
+  var out = { itemName: '', invoiceRemark: '' };
+  if (!words || !words.length || !imgH) return out;
+
+  // ---------- 项目名称：明细表头「项目名称」正下方的第一行明细（最左列） ----------
+  var header = null;
+  for (var i = 0; i < words.length; i++) {
+    if (/项\s*目\s*名\s*称/.test(words[i].normText)) {
+      if (!header || words[i].ny < header.ny) header = words[i];
+    }
+  }
+  if (header) {
+    // 明细列右边界：取同一行「规格型号 / 单位 / 数量」表头的左边缘（品名列在它们左边）
+    var colRight = null;
+    for (var j = 0; j < words.length; j++) {
+      var wj = words[j];
+      if (Math.abs(wj.cy - header.cy) > header.h * 0.8) continue;
+      if (/规\s*格\s*型\s*号|单\s*位|数\s*量/.test(wj.normText) && wj.x > header.x) {
+        if (colRight === null || wj.x < colRight) colRight = wj.x;
+      }
+    }
+    if (colRight === null) colRight = header.x + Math.max(header.w, imgW * 0.35);
+    // 明细行下界：合计 / 价税合计 / 备注 等下方锚点（没有则退到表头下方 25% 图高）
+    var rowBottom = null;
+    for (var k = 0; k < words.length; k++) {
+      var wk = words[k];
+      if (wk.cy <= header.cy) continue;
+      if (/合\s*计|价\s*税\s*合\s*计|备\s*注|小\s*写|大\s*写/.test(wk.normText)) {
+        if (rowBottom === null || wk.y < rowBottom) rowBottom = wk.y;
+      }
+    }
+    if (rowBottom === null) rowBottom = header.y + imgH * 0.25;
+    var cand = words.filter(function(w) {
+      return w.confidence >= 0.3
+        && w.y > header.y + header.h * 0.5
+        && w.y < rowBottom
+        && (w.x + w.w) <= colRight + 2;
+    });
+    if (cand.length) {
+      cand.sort(function(a, b) { return a.y - b.y || a.x - b.x; });
+      var firstY = cand[0].y;
+      var lineWords = cand.filter(function(w) { return Math.abs(w.y - firstY) < header.h * 1.6; });
+      lineWords.sort(function(a, b) { return a.x - b.x; });
+      out.itemName = _cleanItemName(lineWords.map(function(w) { return w.normText; }).join(''));
+    }
+  }
+
+  // ---------- 备注：左下角「备注」标签右侧、发票底部开票人/收款人行之上的区域 ----------
+  var remarkLabel = _findRemarkLabel(words);
+  if (remarkLabel) {
+    // 下界：备注标签下方最近的 开票人 / 收款人 / 复核人 行（没有则退到 97% 图高）
+    var bottomLimit = imgH * 0.97;
+    for (var m = 0; m < words.length; m++) {
+      var wm = words[m];
+      if (wm.cy <= remarkLabel.cy) continue;
+      if (/开\s*票\s*人|收\s*款\s*人|复\s*核\s*人/.test(wm.normText)) {
+        if (wm.y < bottomLimit) bottomLimit = wm.y;
+      }
+    }
+    var parts = remarkLabel._parts || [];
+    var rx = remarkLabel.x + remarkLabel.w * 0.5;
+    var rcand = words.filter(function(w) {
+      if (w.confidence < 0.3) return false;
+      if (w === remarkLabel || parts.indexOf(w) >= 0) return false;
+      // 必须在标签顶部或以下（避免抓到上方的 价税合计 / 大写 / 小写 行）
+      if (w.cy < remarkLabel.y) return false;
+      if (w.cy > bottomLimit) return false;
+      if (w.cx < rx) return false;
+      if (/^备\s*注$/.test(w.normText.replace(/\s+/g, ''))) return false;
+      if (/(?:开\s*票\s*人|收\s*款\s*人|复\s*核\s*人)/.test(w.normText)) return false;
+      // 结构性标签（价税合计/大写/小写）不是备注内容
+      if (/价\s*税\s*合\s*计|大\s*写|小\s*写/.test(w.normText)) return false;
+      return true;
+    });
+    if (rcand.length) {
+      // 按行分组（按 cy 排序后相邻合并），行内按 x 排序拼接
+      rcand.sort(function(a, b) { return a.cy - b.cy || a.x - b.x; });
+      var lines = [];
+      var cur = [];
+      var lastCy = null;
+      rcand.forEach(function(w) {
+        if (lastCy !== null && Math.abs(w.cy - lastCy) > Math.max(w.h, 8) * 0.6) {
+          lines.push(cur); cur = [];
+        }
+        cur.push(w);
+        lastCy = w.cy;
+      });
+      if (cur.length) lines.push(cur);
+      out.invoiceRemark = lines.map(function(ln) {
+        ln.sort(function(a, b) { return a.x - b.x; });
+        return ln.map(function(w) { return w.text; }).join('');
+      }).join(' ').trim();
+    }
+  }
+
+  return out;
+}
+
+/** 定位「备注」标签：可能是整词（备注），也可能是上下拆开的两词（备 / 注） */
+function _findRemarkLabel(words) {
+  var best = null;
+  for (var i = 0; i < words.length; i++) {
+    var w = words[i];
+    var t = w.normText.replace(/\s+/g, '');
+    if (t === '备注') {
+      if (!best || w.cy > best.cy) {
+        w._parts = [w];
+        best = w; // 取最靠下的「备注」（左下角那块）
+      }
+      continue;
+    }
+    if (t !== '备') continue;
+    // 竖排拆字：同一 x 附近、紧邻下方有「注」
+    for (var j = 0; j < words.length; j++) {
+      var w2 = words[j];
+      if (w2 === w) continue;
+      if (w2.normText.replace(/\s+/g, '') !== '注') continue;
+      if (Math.abs(w2.cx - w.cx) > w.h * 0.8) continue;
+      if (w2.cy <= w.cy || w2.cy > w.cy + w.h * 2.2) continue;
+      // 合成一个虚拟标签，覆盖两词范围
+      var label = {
+        text: '备注', normText: '备注',
+        x: Math.min(w.x, w2.x), y: w.y,
+        w: Math.max(w.w, w2.w), h: w2.y + w2.h - w.y,
+        cx: (w.cx + w2.cx) / 2, cy: (w.cy + w2.cy) / 2,
+        confidence: 1, _parts: [w, w2]
+      };
+      if (!best || label.cy > best.cy) best = label;
+      break;
+    }
+  }
+  return best;
+}
+
+/** 清洗项目名称：去掉数电票的 *类别* 星号包裹，过滤明显的表头文本 */
+function _cleanItemName(raw) {
+  if (!raw) return '';
+  var s = raw.replace(/\s+/g, '');
+  s = s.replace(/^[*＊]+/, '').replace(/[*＊]+/g, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  if (/^(?:项目名称|规格型号|单位|数量|单价|金额|税率|征收率|税额|合计|价税合计|税率\/征收率)$/.test(s)) return '';
+  if (s.length < 2) return '';
+  if (s.length > 60) s = s.substring(0, 60);
+  return s;
+}
+
+/**
  * v1.7.0 — Coordinate-first invoice info extraction.
  * Uses PP-OCR's accurate bbox to locate fields directly by position,
  * with simple regex fallback for edge cases.
@@ -3934,15 +4096,20 @@ function extractByCoordinates(ocrResult) {
   // 电子通行费发票销售方为路桥公司（保留真实名称），纸质票无销售方时给标签
   if (isToll && !sellerName) sellerName = '通行费发票';
 
+  // 项目名称 / 备注（best-effort，版式不固定，取不到留空）
+  var _extra = _extractItemNameRemark(words, imgW, imgH);
+
   console.log('[坐标提取] 结果:', { amountTax: amountTax, amountNoTax: amountNoTax, taxAmount: taxAmount,
     sellerName: sellerName || '(空)', sellerCreditCode: sellerCreditCode || '(空)',
     invoiceNo: invoiceNo || '(空)', invoiceDate: invoiceDate || '(空)',
-    buyerName: buyerName || '(空)', buyerCreditCode: buyerCreditCode || '(空)' });
+    buyerName: buyerName || '(空)', buyerCreditCode: buyerCreditCode || '(空)',
+    itemName: _extra.itemName || '(空)', invoiceRemark: _extra.invoiceRemark || '(空)' });
 
   return { amountTax: amountTax, amountNoTax: amountNoTax, taxAmount: taxAmount,
            sellerName: sellerName, sellerCreditCode: sellerCreditCode,
            invoiceNo: invoiceNo, invoiceDate: invoiceDate,
            buyerName: buyerName, buyerCreditCode: buyerCreditCode,
+           itemName: _extra.itemName, invoiceRemark: _extra.invoiceRemark,
            invoiceType: vatSubtype,
            _ocrText: fullText, isTicket: false, isNonTax: false, isToll: isToll };
 }

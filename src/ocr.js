@@ -2128,7 +2128,7 @@ function _extractByText(fullText, words) {
   // 文字层里整行明细常被压成一个串（列间空格在 _normTextForExtract 里被合并），
   // 故星号段之后裁到下一个表头关键词，避免把 规格型号/单位/单价… 一起吞进来。
   if (!result.itemName) {
-    var _itemMRe = /[*＊][^*＊\n]{1,24}[*＊][^*＊\n]{1,40}/g;
+    var _itemMRe = /[*＊][^*＊\n]{1,24}[*＊][^*＊\n]{1,60}/g;
     var _itemM, _items = [];
     while ((_itemM = _itemMRe.exec(text)) !== null) {
       var _itemRaw = _itemM[0].replace(/(规\s*格\s*型\s*号|单\s*位|数\s*量|单\s*价|金\s*额|税\s*率|征\s*收\s*率|税\s*额)[\s\S]*$/, '');

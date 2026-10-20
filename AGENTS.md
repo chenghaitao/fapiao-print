@@ -167,7 +167,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **图片文本增强**（`toggleTextEnhance`，纯本地）：Rust `enhance_image()` 读原图全分辨率 → EXIF 烘焙 → 直方图 1%/99% 色阶拉伸 + gamma 1.4 + USM 锐化 → JPEG q92；同一 LUT 应用 RGB 三通道（红章保色），退化图恒等映射防噪点放大。`f._enhanced` + 备份可还原；打印链路走 dataUrl 分支（去重 key 改用 previewUrl）；限图片文件且有 `_filePath`（web 未移植）。**核心 `enhance_rgb_inplace()` 与打印自动增强共用（单一真源）**，`normalize_for_jpeg()` 统一 16 位/32F 高精度图。
 
-**清晰度体检与打印自动增强**（v2.6.6，issue #39）：`audit_clarity`（`async fn` + `spawn_blocking`）只读文件头毫秒级算每张发票折算打印 DPI（矢量电子发票 `kind='vector'` 与分辨率无关刻意不参与），低于阈值前端打 `clarity-badge` ⚠ 徽章；`S.feat.autoEnhance` 开启后打印/保存时对**全部图片源**自动增强（v2.6.13 起取消 DPI 阈值筛选，issue #52——不再替用户判断「够清晰就不用增强」，`enhanceMinDpi` 仅作体检 ⚠ 徽章阈值），读原图全分辨率、预览缩略图永不作增强源。
+**清晰度体检与打印自动增强**（v2.6.6，issue #39）：`audit_clarity`（`async fn` + `spawn_blocking`）只读文件头毫秒级算每张发票折算打印 DPI（矢量电子发票 `kind='vector'` 与分辨率无关刻意不参与），低于阈值前端打 `clarity-badge` ⚠ 徽章；`S.feat.autoEnhance` 开启后打印/保存时对**全部图片源**自动增强（v2.6.13 按用户反馈调整：原先按 DPI 阈值筛选是**有意设计**、阈值亦可自定义，现改为一律增强，`enhanceMinDpi` 仅作体检 ⚠ 徽章阈值），读原图全分辨率、预览缩略图永不作增强源。
 
 **白边裁剪坐标换算**（v2.6.6，issue #38）：`trimmedBox` 基于预览缩略图（`THUMB_MAX_DIM=600`）坐标，而图片文件 `ow/oh` 是原图尺寸——进 `SlotSpec.trimBox` 前必须按 `ow/tw`、`oh/th` 比例换算到原图坐标（否则 Rust 读全分辨率原图执行裁剪时整体偏移，打印与预览不一致）；PDF/OFD 页面 `ow/oh` 即渲染位图尺寸，无需换算。裁剪走 `trim_images_batch`（`async fn` + `spawn_blocking`，Rust 内 rayon 并行，一次 IPC 返回整批 `[Option<TrimImageResult>]`，单张失败为 `null` 由前端跳过）。
 

@@ -2746,11 +2746,20 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
     };
 
     // 10. Parse CustomTag.xml for semantic field mapping
-    let custom_tag_path = format!("{}/Tags/CustomTag.xml", base_dir);
-    let tag_map = if let Some(xml) = zip_read_str(&mut archive, &custom_tag_path) {
-        parse_custom_tag(&xml)
-    } else {
-        HashMap::new()
+    // 标准结构是 Tags/CustomTag.xml；少数生成器把标签直接写进 Tags/CustomTags.xml
+    // （多数情况该文件只是索引，解析结果为空 map，无副作用），故作为兜底再读一次。
+    let tag_map = {
+        let single = format!("{}/Tags/CustomTag.xml", base_dir);
+        match zip_read_str(&mut archive, &single) {
+            Some(xml) => parse_custom_tag(&xml),
+            None => {
+                let plural = format!("{}/Tags/CustomTags.xml", base_dir);
+                match zip_read_str(&mut archive, &plural) {
+                    Some(xml) => parse_custom_tag(&xml),
+                    None => HashMap::new(),
+                }
+            }
+        }
     };
 
     // 11. Extract invoice info from structured data

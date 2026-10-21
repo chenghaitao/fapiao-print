@@ -3430,11 +3430,6 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
     let mut item_names: Vec<String> = Vec::new();
     // 票面备注（Remark）——可能拆成多个标签，全部收集后合并
     let mut remark_texts: Vec<String> = Vec::new();
-    // 开户行/账号（专票备注栏固定内容）
-    let mut buyer_bank: Option<String> = None;
-    let mut buyer_acc: Option<String> = None;
-    let mut seller_bank: Option<String> = None;
-    let mut seller_acc: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -3498,11 +3493,6 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
                         },
                         // Item names — used for toll detection (通行费)
                         "ItemName" => item_names.push(text.to_string()),
-                        // 开户行 / 账号：专票必印在备注栏，XML 无 <Remark> 时用它还原备注
-                        "BuyerBankName" => buyer_bank = Some(text.to_string()),
-                        "BuyerBankAccNum" => buyer_acc = Some(text.to_string()),
-                        "SellerBankName" => seller_bank = Some(text.to_string()),
-                        "SellerBankAccNum" => seller_acc = Some(text.to_string()),
                         // 票面备注
                         "Remark" => remark_texts.push(text.to_string()),
                         _ => {}
@@ -3542,20 +3532,6 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
     info.item_name = join_item_names(&names);
     if !remark_texts.is_empty() {
         info.remark = normalize_remark(&remark_texts.join(" "));
-    } else if info.invoice_type.as_deref().map_or(false, |t| t.contains("专用发票")) {
-        // 专票的备注栏固定印「购/销方开户银行 + 银行账号」，但 XML 把它们放在
-        // BuyerBankName / SellerBankAccNum 等结构化字段里，没有 <Remark> 标签。
-        // 不还原的话，同一张票的 OFD 有备注、XML 备注为空（issue 反馈）。
-        // 仅对专票还原：普票的银行信息不一定印在票面（如通行费普票备注栏是空的），
-        // 统一还原会臆造出票面上并不存在的内容。
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(b) = &buyer_bank { parts.push(format!("购方开户银行:{};", b)); }
-        if let Some(a) = &buyer_acc { parts.push(format!("银行账号:{};", a)); }
-        if let Some(b) = &seller_bank { parts.push(format!("销方开户银行:{};", b)); }
-        if let Some(a) = &seller_acc { parts.push(format!("银行账号:{};", a)); }
-        if !parts.is_empty() {
-            info.remark = normalize_remark(&parts.join(" "));
-        }
     }
 
     // Fallback: if amount_tax still empty, try alternate tag name
@@ -4150,36 +4126,6 @@ mod tests {
         let info = parse_xml_invoice_content(xml).unwrap();
         assert_eq!(info.item_name.as_deref(), Some("【生产生活服务】餐费、【住宿服务】住宿费"));
         assert_eq!(info.remark.as_deref(), Some("业务号码:13156770132;账期:202604"));
-    }
-
-    #[test]
-    fn synthesizes_special_invoice_remark_from_bank_fields() {
-        // 专票：备注栏固定印开户行/账号，XML 用结构化字段承载 → 还原成备注
-        let xml = r#"<EInvoice><EInvoiceData>
-    <SellerInformation>
-      <SellerName>某某公司</SellerName>
-      <SellerBankName>中国工商银行南京市城东支行</SellerBankName>
-      <SellerBankAccNum>4301012019100491861</SellerBankAccNum>
-    </SellerInformation>
-    <BuyerInformation>
-      <BuyerName>某买方</BuyerName>
-      <BuyerBankName>江苏银行天惠支行</BuyerBankName>
-      <BuyerBankAccNum>23340188000001222</BuyerBankAccNum>
-    </BuyerInformation>
-    <IssuItemInformation><ItemName>*生产生活服务*技术服务费</ItemName></IssuItemInformation>
-  </EInvoiceData>
-  <Header><InherentLabel><GeneralOrSpecialVAT><LabelName>增值税专用发票</LabelName></GeneralOrSpecialVAT></InherentLabel></Header>
-</EInvoice>"#;
-        let info = parse_xml_invoice_content(xml).unwrap();
-        assert_eq!(
-            info.remark.as_deref(),
-            Some("购方开户银行:江苏银行天惠支行; 银行账号:23340188000001222; 销方开户银行:中国工商银行南京市城东支行; 银行账号:4301012019100491861")
-        );
-
-        // 普票：银行信息不一定印在票面（如通行费普票备注栏为空）→ 不还原，避免臆造
-        let xml2 = xml.replace("增值税专用发票", "普通发票");
-        let info2 = parse_xml_invoice_content(&xml2).unwrap();
-        assert!(info2.remark.is_none());
     }
 
     #[test]

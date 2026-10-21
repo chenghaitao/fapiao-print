@@ -3368,8 +3368,8 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
     let mut general_or_special_code: Option<String> = None;
     // Item names (IssuItemInformation) — used for toll detection
     let mut item_names: Vec<String> = Vec::new();
-    // 票面备注（Remark）
-    let mut remark_text: Option<String> = None;
+    // 票面备注（Remark）——可能拆成多个标签，全部收集后合并
+    let mut remark_texts: Vec<String> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -3434,7 +3434,7 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
                         // Item names — used for toll detection (通行费)
                         "ItemName" => item_names.push(text.to_string()),
                         // 票面备注
-                        "Remark" => remark_text = Some(text.to_string()),
+                        "Remark" => remark_texts.push(text.to_string()),
                         _ => {}
                     }
                 }
@@ -3470,8 +3470,8 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
     // 项目名称 / 备注：数电票明细 *类别*品名 还原成【类别】品名，多条用「、」连接
     let names: Vec<String> = item_names.iter().map(|s| normalize_item_name(s)).collect();
     info.item_name = join_item_names(&names);
-    if let Some(r) = remark_text.as_deref() {
-        info.remark = normalize_remark(r);
+    if !remark_texts.is_empty() {
+        info.remark = normalize_remark(&remark_texts.join(" "));
     }
 
     // Fallback: if amount_tax still empty, try alternate tag name
@@ -4052,6 +4052,19 @@ mod tests {
         let info = parse_xml_invoice_content(xml).unwrap();
         assert_eq!(info.item_name.as_deref(), Some("【生产生活服务】餐费、【住宿服务】住宿费"));
         assert_eq!(info.remark.as_deref(), Some("业务号码:13156770132;账期:202604"));
+    }
+
+    #[test]
+    fn merges_multiple_xml_remark_tags() {
+        // 备注被拆成多个 <Remark> 标签时全部合并（此前只保留最后一个）
+        let xml = r#"<EInvoice><EInvoiceData>
+    <SellerInformation><SellerName>某某公司</SellerName></SellerInformation>
+    <IssuItemInformation><ItemName>*生产生活服务*餐费</ItemName></IssuItemInformation>
+    <Remark>第一行 合同号 HT2025-0912</Remark>
+    <Remark>第二行 报销人 张三</Remark>
+</EInvoiceData></EInvoice>"#;
+        let info = parse_xml_invoice_content(xml).unwrap();
+        assert_eq!(info.remark.as_deref(), Some("第一行 合同号 HT2025-0912 第二行 报销人 张三"));
     }
 }
 

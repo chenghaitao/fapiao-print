@@ -2859,7 +2859,44 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
         if invoice_info.invoice_type.is_none() { invoice_info.invoice_type = extracted.invoice_type; }
     }
 
-    // 11c. 项目名称 / 备注（文本层 best-effort）
+    // 11c. 项目名称 / 备注
+    // 首选 CustomTag.xml 语义标签（最精准，税局标准 OFD 均带）：
+    //   <Item> → 明细文字对象 ID；<Note> → 备注文字对象 ID。
+    // 缺失时才退到坐标推断（数电票 OFD 无 CustomTag）。
+    {
+        let by_id = |id: &u32| -> Option<&OfdTextObject> {
+            page_texts.iter().find(|t| t.id == *id)
+                .or_else(|| tpl_texts.iter().find(|t| t.id == *id))
+        };
+        if invoice_info.item_name.is_none() {
+            if let Some(ids) = tag_map.get("Item") {
+                let items: Vec<String> = ids.iter()
+                    .filter_map(by_id)
+                    .map(|t| normalize_item_name(&t.text))
+                    .collect();
+                invoice_info.item_name = join_item_names(&items);
+            }
+        }
+        if invoice_info.remark.is_none() {
+            if let Some(ids) = tag_map.get("Note") {
+                // 备注框里可能夹着落款行（复核人/收款人/开票人），单独成条的不算备注内容
+                let lines: Vec<String> = ids.iter()
+                    .filter_map(by_id)
+                    .map(|t| t.text.trim().to_string())
+                    .filter(|s| {
+                        let c: String = s.chars().filter(|ch| !ch.is_whitespace()).collect();
+                        !(c.starts_with("复核人") || c.starts_with("收款人") || c.starts_with("开票人"))
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !lines.is_empty() {
+                    invoice_info.remark = normalize_remark(&lines.join(" "));
+                }
+            }
+        }
+    }
+
+    // 11d. 项目名称 / 备注坐标兜底（无 CustomTag 时）
     {
         let all: Vec<&OfdTextObject> = tpl_texts.iter().chain(page_texts.iter()).collect();
         // 项目名称：按「项目名称」列边界取明细（不做全局星号扫描）
@@ -3921,6 +3958,23 @@ mod tests {
         assert_eq!(normalize_remark(": 第一行\n第二行 ").unwrap(), "第一行 第二行");
         assert!(normalize_remark("开票人: 张三").is_none());
         assert!(normalize_remark("   ").is_none());
+    }
+
+    #[test]
+    fn maps_custom_tag_item_and_note() {
+        // 税局标准 OFD：CustomTag 用语义标签直接指向明细 / 备注文字对象
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ofd:root xmlns:ofd="http://www.ofdspec.org/2016">
+  <ofd:InvoiceNo><ofd:ObjectRef PageRef="61">6922</ofd:ObjectRef></ofd:InvoiceNo>
+  <ofd:Item><ofd:ObjectRef PageRef="61">6939</ofd:ObjectRef></ofd:Item>
+  <ofd:Item><ofd:ObjectRef PageRef="61">6940</ofd:ObjectRef></ofd:Item>
+  <ofd:Note><ofd:ObjectRef PageRef="61">6946</ofd:ObjectRef></ofd:Note>
+  <ofd:Note><ofd:ObjectRef PageRef="61">6947</ofd:ObjectRef></ofd:Note>
+</ofd:root>"#;
+        let map = parse_custom_tag(xml);
+        assert_eq!(map.get("Item"), Some(&vec![6939u32, 6940u32]));
+        assert_eq!(map.get("Note"), Some(&vec![6946u32, 6947u32]));
+        assert_eq!(map.get("InvoiceNo"), Some(&vec![6922u32]));
     }
 
     #[test]

@@ -1183,6 +1183,53 @@ fn parse_custom_tag(xml: &str) -> HashMap<String, Vec<u32>> {
     map
 }
 
+/// Parse Tags/CustomTag.xml 的 `<Item>` 分组：一个 Item 内的 ObjectRef 序列 = 一条明细。
+/// 生成器会把长品名拆成多个文字对象（如「*生产生活服务*技术服务」+「费」），
+/// 这些段必须按组内顺序拼成一条，不能逐段当成独立明细。
+fn parse_custom_tag_item_groups(xml: &str) -> Vec<Vec<u32>> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_item = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match local_tag_name(&e.name()).as_str() {
+                "Item" => {
+                    in_item = true;
+                    groups.push(Vec::new());
+                }
+                "ObjectRef" if in_item => {
+                    let text = read_element_text(&mut reader);
+                    if let Ok(id) = text.trim().parse::<u32>() {
+                        if let Some(g) = groups.last_mut() {
+                            g.push(id);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => {
+                if local_tag_name(&e.name()) == "Item" {
+                    in_item = false;
+                    if groups.last().map_or(false, |g| g.is_empty()) {
+                        groups.pop(); // 无 ObjectRef 的空组丢弃
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    groups
+}
+
 /// Parse PublicRes.xml for font definitions
 fn parse_fonts(xml: &str) -> (HashMap<u32, OfdFont>, HashMap<u32, String>, HashMap<u32, OfdDrawParam>) {
     use quick_xml::events::Event;
@@ -2748,19 +2795,19 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
     // 10. Parse CustomTag.xml for semantic field mapping
     // 标准结构是 Tags/CustomTag.xml；少数生成器把标签直接写进 Tags/CustomTags.xml
     // （多数情况该文件只是索引，解析结果为空 map，无副作用），故作为兜底再读一次。
-    let tag_map = {
+    let tag_xml = {
         let single = format!("{}/Tags/CustomTag.xml", base_dir);
         match zip_read_str(&mut archive, &single) {
-            Some(xml) => parse_custom_tag(&xml),
+            Some(xml) => Some(xml),
             None => {
                 let plural = format!("{}/Tags/CustomTags.xml", base_dir);
-                match zip_read_str(&mut archive, &plural) {
-                    Some(xml) => parse_custom_tag(&xml),
-                    None => HashMap::new(),
-                }
+                zip_read_str(&mut archive, &plural)
             }
         }
     };
+    let tag_map = tag_xml.as_deref().map(parse_custom_tag).unwrap_or_default();
+    // 明细分组：长品名会被拆成多个文字对象，必须按 <Item> 组拼接
+    let item_groups = tag_xml.as_deref().map(parse_custom_tag_item_groups).unwrap_or_default();
 
     // 11. Extract invoice info from structured data
     let mut invoice_info = OfdInvoiceInfo::default();
@@ -2878,7 +2925,20 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
                 .or_else(|| tpl_texts.iter().find(|t| t.id == *id))
         };
         if invoice_info.item_name.is_none() {
-            if let Some(ids) = tag_map.get("Item") {
+            if !item_groups.is_empty() {
+                // 每个 <Item> 组 = 一条明细；组内多段按顺序拼成完整品名
+                let items: Vec<String> = item_groups.iter()
+                    .map(|g| {
+                        let joined: String = g.iter()
+                            .filter_map(|id| by_id(id))
+                            .map(|t| t.text.trim())
+                            .collect();
+                        normalize_item_name(&joined)
+                    })
+                    .collect();
+                invoice_info.item_name = join_item_names(&items);
+            } else if let Some(ids) = tag_map.get("Item") {
+                // 无分组信息时退回扁平处理（各 ObjectRef 视为独立明细）
                 let items: Vec<String> = ids.iter()
                     .filter_map(by_id)
                     .map(|t| normalize_item_name(&t.text))
@@ -3984,6 +4044,20 @@ mod tests {
         assert_eq!(map.get("Item"), Some(&vec![6939u32, 6940u32]));
         assert_eq!(map.get("Note"), Some(&vec![6946u32, 6947u32]));
         assert_eq!(map.get("InvoiceNo"), Some(&vec![6922u32]));
+    }
+
+    #[test]
+    fn groups_custom_tag_items() {
+        // 一个 <Item> 内的多个 ObjectRef 属于同一条明细（长品名被拆成多段）
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ofd:root xmlns:ofd="http://www.ofdspec.org/2016">
+  <ofd:Item><ofd:ObjectRef PageRef="61">6939</ofd:ObjectRef><ofd:ObjectRef PageRef="61">6940</ofd:ObjectRef></ofd:Item>
+  <ofd:Item><ofd:ObjectRef PageRef="61">6947</ofd:ObjectRef><ofd:ObjectRef PageRef="61">6948</ofd:ObjectRef></ofd:Item>
+  <ofd:Item><ofd:ObjectRef PageRef="61">6957</ofd:ObjectRef></ofd:Item>
+  <ofd:Note><ofd:ObjectRef PageRef="61">6966</ofd:ObjectRef></ofd:Note>
+</ofd:root>"#;
+        let groups = parse_custom_tag_item_groups(xml);
+        assert_eq!(groups, vec![vec![6939u32, 6940u32], vec![6947u32, 6948u32], vec![6957u32]]);
     }
 
     #[test]

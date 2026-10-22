@@ -151,7 +151,7 @@
               <div class="row"><label class="lbl">填写行高</label><div class="ctrl"><input type="number" id="pasteSigBodyH" value="14" min="4" max="60" step="0.5" style="width:64px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:12px">mm</span></div></div>
               <div class="row"><label class="lbl">区间距</label><div class="ctrl"><input type="number" id="pasteSigGap" value="2" min="0" max="20" step="0.5" style="width:64px;text-align:center" onchange="updatePreview()"><span style="color:var(--text-muted);font-size:12px">mm</span></div></div>
             </div>
-            <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">票据只排版在装订线下方、签字栏上方；上边距即装订区高度。本模式使用独立边距，排版页的「边距」与页脚（页码/日期/自定义页脚）不生效。签字栏留空，打印后手写。</div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">票据排在装订线下方、签字栏上方；上边距即装订区高度。本模式独立边距，页码 / 日期 / 自定义页脚不生效，签字栏留空手写。</div>
           </div>
         </div>
         <div class="sec" id="quickLayoutSec">
@@ -269,12 +269,12 @@
           </div>
           <div style="margin-top: 12px;"></div>
           <div class="row"><label class="lbl">打印模式</label><div class="ctrl"><select id="printMode" onchange="saveSettings()"><option value="confirm">弹窗确认</option><option value="pdfium">静默打印（PDFium）⭐</option><option value="direct">静默打印（SumatraPDF 备用）</option><option value="pdf">PDF阅读器</option></select></div></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">弹窗确认：确认后打印；PDFium：推荐，打印清晰（需下载）；SumatraPDF：备用（需下载）；PDF阅读器：通过默认阅读器打印（不支持选择打印机）。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">需要指定打印机请用 PDFium（推荐）；「PDF阅读器」不支持选择打印机。</div>
         </div>
         <div class="sec">
           <div class="sec-title">🧩 兼容模式</div>
           <div class="trow"><label class="tlbl">老打印机兼容</label><button class="tgl" id="toggleCompatFlat" onclick="toggleFeature('compatFlat',this)"></button></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">开启后打印 / 保存的 PDF 会整页转成 300dpi 位图（无透明、无嵌入字体），老打印机不再丢字、丢章；代价是清晰度略降、文件变大。需要 PDFium 组件（与「静默打印 PDFium」同一个，未下载时会提示）。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">整页转 300dpi 位图打印 / 保存，老打印机不再丢字丢章（清晰度略降、文件变大，需 PDFium 组件）。</div>
         </div>
         <div class="sec">
           <div class="sec-title">🔢 打印份数</div>
@@ -314,26 +314,26 @@
           <div class="sec-title">🔍 OCR 识别</div>
           <div class="trow"><label class="tlbl">自动识别</label><button class="tgl" id="toggleOcrEnabled" onclick="togglePref('ocrEnabled',this)"></button></div>
           <div class="row" style="margin-top:8px"><label class="lbl">识别精度</label><div class="ctrl"><select id="ocrPrecision" onchange="setOcrPrecision(this.value)"><option value="fast">快速（1280px）</option><option value="standard" selected>标准（1920px）</option><option value="precise">精确（2800px）</option></select></div></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">开启后添加发票时自动 OCR 识别金额、销售方等信息；关闭后可手动点击识别按钮触发。快速模式速度最快但小字可能模糊；标准模式兼顾速度与准确度；精确模式最准但速度较慢。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">添加发票时自动识别金额、销售方等信息；精度越高越准、越慢。关闭后可手动点「识别」触发。</div>
         </div>
         <div class="sec" id="pdfTextSection">
           <div class="sec-title">📝 PDF 文字提取</div>
           <div class="trow"><label class="tlbl">自动提取</label><button class="tgl on" id="togglePdfText" onclick="togglePref('pdfTextEnabled',this)"></button></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">开启后从 PDF 文字层提取发票字段（销售方、金额等），无需 OCR。对扫描件/图片 PDF 无效。默认关闭以提高加载速度；需要结构化字段时再开启。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">从 PDF 文字层直接读取发票字段，比 OCR 更快更准；对扫描件 / 图片 PDF 无效。</div>
         </div>
         <div class="sec">
           <div class="sec-title">🔍 清晰度优化</div>
           <div class="trow"><label class="tlbl">打印时自动增强</label><button class="tgl" id="toggleAutoEnhance" onclick="toggleFeature('autoEnhance',this)"></button></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.4">开启后打印 / 保存 PDF 时，折算 DPI 低于阈值的图片自动加深文字并锐化（矢量电子发票不受影响）。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.4">打印 / 保存 PDF 时，图片发票自动加深文字并锐化，改善浅色 / 模糊打印效果（矢量 PDF 不受影响）。</div>
           <div id="enhanceOpts" style="display:none;margin-top:8px">
-            <div class="row"><label class="lbl">触发阈值</label><div class="rr ctrl"><input type="range" id="enhanceMinDpi" min="100" max="400" step="10" value="250" oninput="syncSlider(this,'enhanceMinDpiN');saveSettings()"><input type="number" id="enhanceMinDpiN" min="100" max="400" step="10" value="250" style="width:52px" onchange="syncRange(this,'enhanceMinDpi');saveSettings()"></div></div>
             <div class="row"><label class="lbl">加深 γ</label><div class="rr ctrl"><input type="range" id="enhanceGamma" min="0.8" max="2.5" step="0.1" value="1.4" oninput="syncSlider(this,'enhanceGammaN');saveSettings()"><input type="number" id="enhanceGammaN" min="0.8" max="2.5" step="0.1" value="1.4" style="width:52px" onchange="syncRange(this,'enhanceGamma');saveSettings()"></div></div>
             <div class="row"><label class="lbl">锐化%</label><div class="rr ctrl"><input type="range" id="enhanceAmount" min="0" max="150" step="5" value="60" oninput="syncSlider(this,'enhanceAmountN');saveSettings()"><input type="number" id="enhanceAmountN" min="0" max="150" step="5" value="60" style="width:52px" onchange="syncRange(this,'enhanceAmount');saveSettings()"></div></div>
             <div class="row"><label class="lbl">输出质量</label><div class="rr ctrl"><input type="range" id="enhanceQuality" min="70" max="100" step="1" value="90" oninput="syncSlider(this,'enhanceQualityN');saveSettings()"><input type="number" id="enhanceQualityN" min="70" max="100" step="1" value="90" style="width:52px" onchange="syncRange(this,'enhanceQuality');saveSettings()"></div></div>
           </div>
+          <div class="row" style="margin-top:8px"><label class="lbl">⚠ 提示阈值</label><div class="rr ctrl"><input type="range" id="enhanceMinDpi" min="100" max="400" step="10" value="250" oninput="syncSlider(this,'enhanceMinDpiN');saveSettings()"><input type="number" id="enhanceMinDpiN" min="100" max="400" step="10" value="250" style="width:52px" onchange="syncRange(this,'enhanceMinDpi');saveSettings()"></div></div>
           <button class="btn btn-sm" style="width:100%;margin-top:8px" onclick="runClarityAudit()" title="只读文件头算出每张发票折算后的实际打印 DPI，不解码像素">🔍 检查清晰度</button>
           <div id="claritySummary" style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4"></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">只对像素不足的扫描件 / 截图生效：折算打印 DPI 低于阈值的发票会在列表打 ⚠ 徽章提示（打印会偏糊）。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">折算打印 DPI 低于阈值的发票在列表打 ⚠ 徽章，仅作提示、不影响打印。</div>
         </div>
         <div class="sec">
           <div class="sec-title">✅ 发票查验</div>
@@ -341,7 +341,7 @@
             <button class="btn btn-sm" style="flex:1" onclick="verifyInvoice(false)">🔍 官方查验平台</button>
             <button class="btn btn-sm" style="flex:1" onclick="verifyInvoice(true)">🔍 备用查验平台</button>
           </div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">主平台为国家税务总局全国增值税发票查验平台，备用平台为仿真平台（官方证书异常时可使用）。🚧 自动查验功能规划中。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">官方查验平台 + 仿真备用平台（官方证书异常时可用）。🚧 自动查验规划中。</div>
         </div>
         <div class="sec">
           <div class="sec-title">📄 PDF 设置</div>
@@ -352,12 +352,12 @@
         <div class="sec">
           <div class="sec-title">💰 金额统计</div>
           <div class="row"><label class="lbl">统计模式</label><div class="ctrl"><select id="amtMode" onchange="S.amtMode=this.value;try{localStorage.setItem('ticketchan-amt-mode',this.value)}catch(e){};updateAmountSummary()"><option value="tax">含税总价</option><option value="notax">不含税金额</option><option value="both">同时显示</option></select></div></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">自动识别发票价税合计（含税）和合计金额（不含税），火车票识别票价。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">自动识别含税价税合计与不含税金额；火车票识别票价。</div>
         </div>
         <div class="sec">
           <div class="sec-title">🎯 单票调整</div>
           <div class="trow"><label class="tlbl">记忆调整配置</label><button class="tgl" id="toggleSlotAdjMemory" onclick="togglePref('slotAdjMemory',this)"></button></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">开启后关闭软件重新打开时，自动恢复每张发票的缩放、偏移和对齐设置（按文件名匹配）。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">重开软件时自动恢复每张发票的缩放 / 偏移 / 对齐（按文件名匹配）。</div>
         </div>
         <div class="sec">
           <div class="sec-title">📋 发票管理</div>
@@ -367,9 +367,7 @@
           <div class="trow"><label class="tlbl">添加时自动去重</label>
             <button class="tgl" id="toggleAutoDedup" onclick="togglePref('autoDedup',this)"></button>
           </div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">
-            记忆列表会在下次启动时恢复；自动去重仅在识别出发票号码后每组保留最先加入的一份，同销售方+金额+日期的疑似重复仅标记不自动删。
-          </div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">记忆列表：下次启动自动恢复；自动去重：识别出发票号码后每组保留最先加入的一份（同销售方+金额+日期仅标记不删）。</div>
         </div>
         <div class="sec">
           <div class="sec-title">🎨 外观</div>
@@ -381,7 +379,7 @@
           <div class="about-row"><span class="about-label">更新源</span><span class="about-value">GitHub Release</span></div>
           <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="checkForUpdates(false)">🔄 检查更新</button>
           <div class="trow" style="margin-top:8px"><label class="tlbl">自动检查更新</label><button class="tgl on" id="toggleAutoUpdate" onclick="toggleAutoUpdateCheck(this)"></button></div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">启动时自动检查更新（每小时最多一次），发现新版本时弹出提示。关闭后不再自动提醒，仍可手动点击「检查更新」。</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:6px;line-height:1.4">启动时自动检查（每小时最多一次），有新版弹窗提示；关闭后仍可手动检查。</div>
         </div>
       </div>
       <div class="sidebar-panel-footer">

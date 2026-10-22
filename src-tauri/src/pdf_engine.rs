@@ -3974,7 +3974,7 @@ fn audit_image_dims(f: &FileSpec) -> Option<(u32, u32)> {
 /// 矢量电子发票标记 vector 且不判 low（与分辨率无关，打了才清晰）。
 pub fn audit_clarity(request: &LayoutRenderRequest) -> Vec<ClarityInfo> {
     let slot_mm = slot_size_mm(&request.settings);
-    // 与打印时自动增强共用同一阈值（前端滑块可调）
+    // 仅用于「会糊」判定，不影响打印时的自动增强（issue #52 起增强不再按阈值筛选）
     let min_dpi = request.settings.enhance_min_dpi.unwrap_or(CLARITY_MIN_DPI).clamp(50.0, 600.0);
 
     request.files.iter().enumerate().map(|(i, f)| {
@@ -4442,16 +4442,14 @@ struct CachedXobj {
 fn decode_images(
     files: &[FileSpec],
     settings: &RenderSettings,
-    slot_mm: (f32, f32),
 ) -> Vec<Option<ImageSource>> {
     use rayon::prelude::*;
 
     let trim = settings.trim_white.unwrap_or(false);
     let trim_pad = settings.trim_pad.unwrap_or(TRIM_PAD_DEFAULT).min(TRIM_PAD_MAX);
     let color_mode = settings.color_mode.clone();
-    // 清晰度优化：打印时自动增强低有效 DPI 的位图源（issue #39）
+    // 清晰度优化：打印时自动增强图片源（issue #39；issue #52 起不再按 DPI 阈值筛选）
     let auto_enhance = settings.auto_enhance;
-    let min_dpi = settings.enhance_min_dpi.unwrap_or(CLARITY_MIN_DPI).clamp(50.0, 600.0);
     let enhance_params = EnhanceParams::from_settings(
         settings.enhance_gamma,
         settings.enhance_amount,
@@ -4507,22 +4505,12 @@ fn decode_images(
 
             // ---- 清晰度优化：判定是否需要自动增强 ----
             // PDF 页走矢量直通，与分辨率无关，永不增强。
+            // 开启自动增强后图片源一律增强，不再按 DPI 阈值筛选（issue #52）。
             let is_pdf_page = file_spec.pdf_path.is_some();
             let want_enhance = auto_enhance && !is_pdf_page;
 
-            // JPEG 可从头部读出尺寸而不解码；读不到时保守地放行直通 ——
-            // 把一张本来清晰的 JPEG 重编码一遍只会损失质量。
-            let jpeg_needs_enhance = match (want_enhance, parse_jpeg_info(&bytes)) {
-                (true, Some((w, h, _))) => {
-                    let dpi = effective_dpi_px(w, h, slot_mm);
-                    log::info!(
-                        "clarity: jpeg {}x{} → {:.0} DPI (slot {:.1}x{:.1}mm, min {:.0})",
-                        w, h, dpi, slot_mm.0, slot_mm.1, min_dpi
-                    );
-                    dpi < min_dpi
-                }
-                _ => false,
-            };
+            // 需增强时禁止 JPEG 直通，改走「解码 → 增强」路径。
+            let jpeg_needs_enhance = is_jpeg_bytes(&bytes) && want_enhance;
 
             let can_passthrough = is_jpeg_bytes(&bytes)
                 && !trim
@@ -4565,20 +4553,14 @@ fn decode_images(
                 img = trim_white_edges(&img, WHITE_THRESHOLD, trim_pad).0;
             }
 
-            // 清晰度优化：非 JPEG 位图解码后才有尺寸，此时按实际有效 DPI 增强。
+            // 清晰度优化：图片源一律增强，不再按 DPI 阈值筛选（issue #52）。
             // 必须在 apply_color_mode 之前 —— 色阶拉伸依据原始色调直方图，
             // 先转灰度会破坏红章与通道间的相对关系。
             if want_enhance {
-                let dpi = effective_dpi_px(img.width(), img.height(), slot_mm);
-                if dpi < min_dpi {
-                    log::info!(
-                        "clarity: raster {}x{} → {:.0} DPI < {:.0}, auto-enhancing",
-                        img.width(), img.height(), dpi, min_dpi
-                    );
-                    let mut rgb = normalize_for_jpeg(img).to_rgb8();
-                    enhance_rgb_inplace(&mut rgb, &enhance_params);
-                    img = image::DynamicImage::ImageRgb8(rgb);
-                }
+                log::info!("clarity: auto-enhancing raster {}x{}", img.width(), img.height());
+                let mut rgb = normalize_for_jpeg(img).to_rgb8();
+                enhance_rgb_inplace(&mut rgb, &enhance_params);
+                img = image::DynamicImage::ImageRgb8(rgb);
             }
 
             // Apply color mode (global setting, not per-slot)
@@ -4902,7 +4884,7 @@ fn generate_pdf_from_layout_inner(
     if let Some(ref cb) = &on_progress {
         cb("decode", 0, total_files);
     }
-    let sources = decode_images(&request.files, &request.settings, slot_size_mm(&request.settings));
+    let sources = decode_images(&request.files, &request.settings);
     if let Some(ref cb) = &on_progress {
         cb("decode", total_files, total_files);
     }

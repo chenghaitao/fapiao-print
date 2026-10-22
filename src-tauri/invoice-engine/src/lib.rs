@@ -33,6 +33,10 @@ pub struct OfdInvoiceInfo {
     pub invoice_type: Option<String>,
     /// 通行费电子发票标记（销售方保留真实路桥公司名）
     pub is_toll: Option<bool>,
+    /// 项目名称（明细行；数电票 `*类别*品名` 还原成 `【类别】品名`，多条用「、」连接）
+    pub item_name: Option<String>,
+    /// 票面备注（多行合并为一行）
+    pub remark: Option<String>,
 }
 
 /// Result returned by `parse_ofd_file`: SVG rendering + structured invoice data.
@@ -72,6 +76,10 @@ pub struct XmlInvoiceInfo {
     pub invoice_type: Option<String>,
     /// 通行费电子发票标记（ItemName 含「通行费」）
     pub is_toll: Option<bool>,
+    /// 项目名称（明细行；数电票 `*类别*品名` 还原成 `【类别】品名`，多条用「、」连接）
+    pub item_name: Option<String>,
+    /// 票面备注（多行合并为一行）
+    pub remark: Option<String>,
 }
 
 // =====================================================
@@ -1173,6 +1181,53 @@ fn parse_custom_tag(xml: &str) -> HashMap<String, Vec<u32>> {
         buf.clear();
     }
     map
+}
+
+/// Parse Tags/CustomTag.xml 的 `<Item>` 分组：一个 Item 内的 ObjectRef 序列 = 一条明细。
+/// 生成器会把长品名拆成多个文字对象（如「*生产生活服务*技术服务」+「费」），
+/// 这些段必须按组内顺序拼成一条，不能逐段当成独立明细。
+fn parse_custom_tag_item_groups(xml: &str) -> Vec<Vec<u32>> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_item = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match local_tag_name(&e.name()).as_str() {
+                "Item" => {
+                    in_item = true;
+                    groups.push(Vec::new());
+                }
+                "ObjectRef" if in_item => {
+                    let text = read_element_text(&mut reader);
+                    if let Ok(id) = text.trim().parse::<u32>() {
+                        if let Some(g) = groups.last_mut() {
+                            g.push(id);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => {
+                if local_tag_name(&e.name()) == "Item" {
+                    in_item = false;
+                    if groups.last().map_or(false, |g| g.is_empty()) {
+                        groups.pop(); // 无 ObjectRef 的空组丢弃
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    groups
 }
 
 /// Parse PublicRes.xml for font definitions
@@ -2738,12 +2793,21 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
     };
 
     // 10. Parse CustomTag.xml for semantic field mapping
-    let custom_tag_path = format!("{}/Tags/CustomTag.xml", base_dir);
-    let tag_map = if let Some(xml) = zip_read_str(&mut archive, &custom_tag_path) {
-        parse_custom_tag(&xml)
-    } else {
-        HashMap::new()
+    // 标准结构是 Tags/CustomTag.xml；少数生成器把标签直接写进 Tags/CustomTags.xml
+    // （多数情况该文件只是索引，解析结果为空 map，无副作用），故作为兜底再读一次。
+    let tag_xml = {
+        let single = format!("{}/Tags/CustomTag.xml", base_dir);
+        match zip_read_str(&mut archive, &single) {
+            Some(xml) => Some(xml),
+            None => {
+                let plural = format!("{}/Tags/CustomTags.xml", base_dir);
+                zip_read_str(&mut archive, &plural)
+            }
+        }
     };
+    let tag_map = tag_xml.as_deref().map(parse_custom_tag).unwrap_or_default();
+    // 明细分组：长品名会被拆成多个文字对象，必须按 <Item> 组拼接
+    let item_groups = tag_xml.as_deref().map(parse_custom_tag_item_groups).unwrap_or_default();
 
     // 11. Extract invoice info from structured data
     let mut invoice_info = OfdInvoiceInfo::default();
@@ -2851,6 +2915,69 @@ pub fn parse_ofd_file(ofd_path: &str) -> Result<OfdResult, String> {
         if invoice_info.invoice_type.is_none() { invoice_info.invoice_type = extracted.invoice_type; }
     }
 
+    // 11c. 项目名称 / 备注
+    // 首选 CustomTag.xml 语义标签（最精准，税局标准 OFD 均带）：
+    //   <Item> → 明细文字对象 ID；<Note> → 备注文字对象 ID。
+    // 缺失时才退到坐标推断（数电票 OFD 无 CustomTag）。
+    {
+        let by_id = |id: &u32| -> Option<&OfdTextObject> {
+            page_texts.iter().find(|t| t.id == *id)
+                .or_else(|| tpl_texts.iter().find(|t| t.id == *id))
+        };
+        if invoice_info.item_name.is_none() {
+            if !item_groups.is_empty() {
+                // 每个 <Item> 组 = 一条明细；组内多段按顺序拼成完整品名
+                let items: Vec<String> = item_groups.iter()
+                    .map(|g| {
+                        let joined: String = g.iter()
+                            .filter_map(|id| by_id(id))
+                            .map(|t| t.text.trim())
+                            .collect();
+                        normalize_item_name(&joined)
+                    })
+                    .collect();
+                invoice_info.item_name = join_item_names(&items);
+            } else if let Some(ids) = tag_map.get("Item") {
+                // 无分组信息时退回扁平处理（各 ObjectRef 视为独立明细）
+                let items: Vec<String> = ids.iter()
+                    .filter_map(by_id)
+                    .map(|t| normalize_item_name(&t.text))
+                    .collect();
+                invoice_info.item_name = join_item_names(&items);
+            }
+        }
+        if invoice_info.remark.is_none() {
+            if let Some(ids) = tag_map.get("Note") {
+                // 备注框里可能夹着落款行（复核人/收款人/开票人），单独成条的不算备注内容
+                let lines: Vec<String> = ids.iter()
+                    .filter_map(by_id)
+                    .map(|t| t.text.trim().to_string())
+                    .filter(|s| {
+                        let c: String = s.chars().filter(|ch| !ch.is_whitespace()).collect();
+                        !(c.starts_with("复核人") || c.starts_with("收款人") || c.starts_with("开票人"))
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !lines.is_empty() {
+                    invoice_info.remark = normalize_remark(&lines.join(" "));
+                }
+            }
+        }
+    }
+
+    // 11d. 项目名称 / 备注坐标兜底（无 CustomTag 时）
+    {
+        let all: Vec<&OfdTextObject> = tpl_texts.iter().chain(page_texts.iter()).collect();
+        // 项目名称：按「项目名称」列边界取明细（不做全局星号扫描）
+        if invoice_info.item_name.is_none() {
+            invoice_info.item_name = extract_ofd_item_name(&all, page_h);
+        }
+        // 备注：左下角「备注」标签右侧、页脚行之上的文字
+        if invoice_info.remark.is_none() {
+            invoice_info.remark = extract_ofd_remark(&all, page_h);
+        }
+    }
+
     // 12. Build SVG
     let svg = build_ofd_svg(
         page_w, page_h,
@@ -2882,6 +3009,379 @@ pub fn extract_ofd_images_raw(ofd_path: &str) -> Result<Vec<OfdExtractedImage>, 
         width: w,
         height: h,
     }).collect())
+}
+
+// =====================================================
+// 项目名称 / 备注 清洗与合并（OFD / XML 共用）
+// =====================================================
+
+/// 数电票 `*类别*品名` → `【类别】品名`；去掉零散星号与空白；单条上限 80 字符
+fn normalize_item_name(raw: &str) -> String {
+    let s: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let is_star = |c: char| c == '*' || c == '＊';
+    let out: String = if is_star(chars[0]) {
+        match chars[1..].iter().position(|c| is_star(*c)) {
+            Some(close) => {
+                let cat: String = chars[1..1 + close].iter().collect();
+                let rest: String = chars[1 + close + 1..].iter().filter(|c| !is_star(**c)).collect();
+                if !cat.is_empty() && cat.chars().count() <= 24 {
+                    format!("【{}】{}", cat, rest)
+                } else {
+                    rest
+                }
+            }
+            None => chars[1..].iter().filter(|c| !is_star(**c)).collect(),
+        }
+    } else {
+        chars.iter().filter(|c| !is_star(**c)).collect()
+    };
+    let out = out.trim();
+    if out.chars().count() > 80 {
+        out.chars().take(80).collect()
+    } else {
+        out.to_string()
+    }
+}
+
+/// 多条项目名称去重合并：「、」连接，按整条边界截断（总长上限 120 字符）
+fn join_item_names(items: &[String]) -> Option<String> {
+    let mut uniq: Vec<String> = Vec::new();
+    for it in items {
+        let it = it.trim();
+        if it.is_empty() {
+            continue;
+        }
+        if !uniq.iter().any(|u| u == it) {
+            uniq.push(it.to_string());
+        }
+    }
+    if uniq.is_empty() {
+        return None;
+    }
+    const MAX: usize = 120;
+    let mut out: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for it in &uniq {
+        let add = it.chars().count() + if out.is_empty() { 0 } else { 1 };
+        if len + add > MAX {
+            break;
+        }
+        len += add;
+        out.push(it.clone());
+    }
+    if out.is_empty() {
+        return Some(uniq[0].chars().take(MAX).collect());
+    }
+    Some(out.join("、"))
+}
+
+/// 备注清洗：去掉紧跟标签的冒号/空白、压平换行，剔掉结构性标签与页脚；上限 200 字符
+fn normalize_remark(raw: &str) -> Option<String> {
+    let mut s = raw.replace('\r', "");
+    s = s.split('\n')
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = s.trim_start_matches(['：', ':', '.', '-', '—', ' ']).trim();
+    let s = s.trim_end_matches([';', '；', '、', ',']).trim();
+    if s.is_empty() {
+        return None;
+    }
+    let nos: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    for kw in ["价税合计", "大写", "小写", "开票人", "收款人", "复核人"] {
+        if nos.contains(kw) {
+            return None;
+        }
+    }
+    for kw in ["备注", "开票人", "收款人", "复核人", "合计"] {
+        if nos.starts_with(kw) {
+            return None;
+        }
+    }
+    if !nos.chars().any(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return None;
+    }
+    if s.chars().count() > 200 {
+        Some(s.chars().take(200).collect())
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// OFD 文本对象在页面坐标系里的位置：Boundary 原点 + CTM 作用于 TextCode 的 X/Y
+/// （无 CTM 时即 Boundary + X/Y，与渲染路径的 Normal 分支一致）
+fn ofd_page_pos(t: &OfdTextObject) -> (f64, f64) {
+    let (a, b, c, d, e, f) = t.ctm.unwrap_or((1.0, 0.0, 0.0, 1.0, 0.0, 0.0));
+    (
+        t.boundary.0 + a * t.text_x + c * t.text_y + e,
+        t.boundary.1 + b * t.text_x + d * t.text_y + f,
+    )
+}
+
+/// 去空白后的文本，用于标签比对
+fn ofd_compact(t: &OfdTextObject) -> String {
+    t.text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// 明细栏里的结构性文本（表头 / 合计 / 落款），不是品名
+fn is_ofd_structural(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    // 「合 计」常被拆成两个单字对象，单字/双字组合也滤掉
+    if s.chars().all(|c| c == '合' || c == '计') {
+        return true;
+    }
+    const KEYS: [&str; 17] = [
+        "价税合计", "金额合计", "大写", "小写", "备注", "开票人", "收款人", "复核人",
+        "单价", "数量", "单位", "金额", "税额", "税率", "征收率", "规格型号", "项目名称",
+    ];
+    KEYS.iter().any(|k| s.starts_with(k))
+}
+
+/// 表头行判定的纵向容差（mm）
+const OFD_ROW_TOL: f64 = 1.8;
+/// 明细数据值相对其表头左缘可能左偏的量（mm），用于把列右界往里收，避免收进邻列的数值
+const OFD_COL_MARGIN: f64 = 2.0;
+
+/// OFD 项目名称：**按列边界取**，与 JS 坐标路同一口径。
+/// 用「项目名称」表头 + 同排右侧最近表头的左缘定出品名列，只取列内、表头下方的文字；
+/// `*` 开头为新条目、否则为换行续行并回上一条。不做全局星号扫描（会误收其它区域的星号文本）。
+fn extract_ofd_item_name(texts: &[&OfdTextObject], page_h: f64) -> Option<String> {
+    // 1. 表头：最靠上的「项目名称」
+    let mut header: Option<(f64, f64, f64)> = None; // (x, y, w)
+    for t in texts {
+        if ofd_compact(t) != "项目名称" {
+            continue;
+        }
+        let (x, y) = ofd_page_pos(t);
+        let better = match header {
+            Some((_, hy, _)) => y < hy - 0.5 || ((y - hy).abs() <= 0.5 && x < header.unwrap().0),
+            None => true,
+        };
+        if better {
+            header = Some((x, y, t.boundary.2));
+        }
+    }
+    let (hx, hy, hw) = header?;
+    // 2. 同一表头行里、表头右侧最近的一个非空对象左缘（往里收 OFD_COL_MARGIN）= 品名列右界
+    let mut col_right: Option<f64> = None;
+    for t in texts {
+        if ofd_compact(t).is_empty() {
+            continue;
+        }
+        let (x, y) = ofd_page_pos(t);
+        if (y - hy).abs() > OFD_ROW_TOL {
+            continue;
+        }
+        if x <= hx + 0.5 {
+            continue;
+        }
+        col_right = Some(col_right.map_or(x, |c| c.min(x)));
+    }
+    // 找不到同排表头时退到一个保守值（表头自身右边 + 1mm）
+    let col_right = col_right.map_or(hx + hw + 1.0, |c| c - OFD_COL_MARGIN);
+    // 3. 下界：表头下方最近的 合计 / 价税合计 / 备注 锚点（找不到退到表头 + 35% 页高）
+    let mut bottom = hy + page_h * 0.35;
+    for t in texts {
+        let s = ofd_compact(t);
+        let is_anchor = !s.is_empty()
+            && !s.starts_with("单价") && !s.starts_with("数量") && !s.starts_with("单位")
+            && !s.starts_with("规格型号") && !s.starts_with("项目名称")
+            && (s.starts_with("合计") || s.contains("价税合计") || s.starts_with("大写")
+                || s.starts_with("小写") || s.starts_with("备注"));
+        if !is_anchor {
+            continue;
+        }
+        let (_, y) = ofd_page_pos(t);
+        if y > hy + 0.5 && y < bottom {
+            bottom = y;
+        }
+    }
+    // 4. 品名列内、表头下方的文字对象
+    let mut cand: Vec<(f64, f64, String)> = Vec::new(); // (x, y, text)
+    for t in texts {
+        let s = t.text.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let (x, y) = ofd_page_pos(t);
+        if y <= hy + 0.5 || y >= bottom {
+            continue;
+        }
+        if x >= col_right - 0.5 {
+            continue;
+        }
+        if is_ofd_structural(&ofd_compact(t)) {
+            continue;
+        }
+        // 与「规格型号」同串时裁掉尾部（同 JS 口径）
+        let body = match s.find("规格型号") {
+            Some(i) => &s[..i],
+            None => s,
+        };
+        if body.trim().is_empty() {
+            continue;
+        }
+        cand.push((x, y, body.to_string()));
+    }
+    if cand.is_empty() {
+        return None;
+    }
+    cand.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    // 5. 按 y 分行，`*` 开头为新条目、否则并回上一条
+    let mut rows: Vec<(f64, Vec<(f64, String)>)> = Vec::new();
+    for (x, y, txt) in cand {
+        match rows.last_mut() {
+            Some(r) if (y - r.0).abs() < OFD_ROW_TOL => r.1.push((x, txt)),
+            _ => rows.push((y, vec![(x, txt)])),
+        }
+    }
+    let star_style = rows.iter().any(|(_, ws)| {
+        ws.iter().any(|(_, t)| t.starts_with('*') || t.starts_with('＊'))
+    });
+    let mut items: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for (_, mut ws) in rows {
+        ws.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let line: String = ws.iter().map(|(_, t)| t.as_str()).collect();
+        let is_new = line.starts_with('*') || line.starts_with('＊');
+        if star_style && !buf.is_empty() && !is_new {
+            buf.push_str(&line); // 换行续行：同一品名被折行的后半段
+        } else {
+            if !buf.is_empty() {
+                let n = normalize_item_name(&buf);
+                if n.chars().count() >= 2 {
+                    items.push(n);
+                }
+            }
+            buf = line;
+        }
+    }
+    if !buf.is_empty() {
+        let n = normalize_item_name(&buf);
+        if n.chars().count() >= 2 {
+            items.push(n);
+        }
+    }
+    join_item_names(&items)
+}
+
+/// OFD 备注：左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上的文字（best-effort）
+fn extract_ofd_remark(texts: &[&OfdTextObject], page_h: f64) -> Option<String> {
+    // 标签：整词「备注」或竖排「备」+「注」，取最靠下的一组；记录 (左缘, 顶, 底)
+    let mut label: Option<(f64, f64, f64)> = None;
+    for t in texts {
+        let c = ofd_compact(t);
+        let (x, y) = ofd_page_pos(t);
+        if c == "备注" {
+            if label.map_or(true, |(_, top, _)| y > top) {
+                label = Some((x, y, y + 3.2));
+            }
+            continue;
+        }
+        if c != "备" {
+            continue;
+        }
+        for t2 in texts {
+            if ofd_compact(t2) != "注" {
+                continue;
+            }
+            let (x2, y2) = ofd_page_pos(t2);
+            if (x2 - x).abs() > 2.0 || y2 <= y || y2 > y + 14.0 {
+                continue;
+            }
+            if label.map_or(true, |(_, top, _)| y > top) {
+                label = Some((x, y, y2 + 3.2));
+            }
+            break;
+        }
+    }
+    let (lx, ltop, _lbot) = label?;
+    // 上界：标签上方最近的 价税合计/大写/小写/合计 行之下（标签常在框内垂直居中，
+    // 不能只从标签顶部算，否则会漏掉比标签更高的备注行）
+    let mut top = ltop - 6.0;
+    for t in texts {
+        let s = ofd_compact(t);
+        if !(s.contains("价税合计") || s.starts_with("大写") || s.starts_with("小写")
+            || s.starts_with("合计") || s.starts_with("金额合计")) {
+            continue;
+        }
+        let (_, y) = ofd_page_pos(t);
+        if y < ltop && y + 3.2 > top {
+            top = y + 3.2;
+        }
+    }
+    if top < 0.0 {
+        top = 0.0;
+    }
+    // 下界：标签下方最近的 开票人/收款人/复核人（没有则退到 97% 页高）
+    // 同时记录这些落款行的 y，用于剔除「与落款标签同行」的落款值（如「开票人:」旁边的姓名）
+    let mut bottom = page_h * 0.97;
+    let mut footer_rows: Vec<f64> = Vec::new();
+    for t in texts {
+        let s = ofd_compact(t);
+        if !(s.starts_with("开票人") || s.starts_with("收款人") || s.starts_with("复核人")) {
+            continue;
+        }
+        let (_, y) = ofd_page_pos(t);
+        footer_rows.push(y);
+        if y > ltop && y < bottom {
+            bottom = y;
+        }
+    }
+    let rx = lx + 1.6;
+    let mut rows: Vec<(f64, Vec<(f64, String)>)> = Vec::new();
+    for t in texts {
+        let s = t.text.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let (x, y) = ofd_page_pos(t);
+        if y < top || y > bottom || x < rx {
+            continue;
+        }
+        let nos = ofd_compact(t);
+        if nos == "备注" || nos == "备" || nos == "注" {
+            continue;
+        }
+        if nos.starts_with("开票人") || nos.starts_with("收款人") || nos.starts_with("复核人") {
+            continue;
+        }
+        if nos.contains("价税合计") || nos.starts_with("大写") || nos.starts_with("小写") {
+            continue;
+        }
+        // 与落款标签同行的文字是落款值，不是备注内容
+        if footer_rows.iter().any(|fy| (y - fy).abs() < 3.0) {
+            continue;
+        }
+        match rows.last_mut() {
+            Some(r) if (y - r.0).abs() < OFD_ROW_TOL => r.1.push((x, s.to_string())),
+            _ => rows.push((y, vec![(x, s.to_string())])),
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let joined = rows
+        .iter_mut()
+        .map(|(_, ws)| {
+            ws.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            ws.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalize_remark(&joined)
 }
 
 // =====================================================
@@ -2928,6 +3428,8 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
     let mut general_or_special_code: Option<String> = None;
     // Item names (IssuItemInformation) — used for toll detection
     let mut item_names: Vec<String> = Vec::new();
+    // 票面备注（Remark）——可能拆成多个标签，全部收集后合并
+    let mut remark_texts: Vec<String> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -2991,6 +3493,8 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
                         },
                         // Item names — used for toll detection (通行费)
                         "ItemName" => item_names.push(text.to_string()),
+                        // 票面备注
+                        "Remark" => remark_texts.push(text.to_string()),
                         _ => {}
                     }
                 }
@@ -3022,6 +3526,13 @@ fn parse_xml_invoice_content(content: &str) -> Result<XmlInvoiceInfo, String> {
 
     // Toll detection: item name contains 通行费 (e.g. "*生产生活服务*通行费")
     info.is_toll = Some(item_names.iter().any(|s| s.contains("通行费")));
+
+    // 项目名称 / 备注：数电票明细 *类别*品名 还原成【类别】品名，多条用「、」连接
+    let names: Vec<String> = item_names.iter().map(|s| normalize_item_name(s)).collect();
+    info.item_name = join_item_names(&names);
+    if !remark_texts.is_empty() {
+        info.remark = normalize_remark(&remark_texts.join(" "));
+    }
 
     // Fallback: if amount_tax still empty, try alternate tag name
     if info.amount_tax.is_none() {
@@ -3488,6 +3999,146 @@ mod tests {
         assert!(dump.contains("DeltaX="), "应含 DeltaX 数组");
         assert!(dump.contains("汉"), "文本应经脱敏输出");
         assert!(!dump.contains("通行费"), "原始文本不得出现在诊断输出中");
+    }
+
+    #[test]
+    fn normalizes_star_item_name() {
+        assert_eq!(normalize_item_name("*生产生活服务*培训费"), "【生产生活服务】培训费");
+        assert_eq!(normalize_item_name("*环境监测仪器*外置泵"), "【环境监测仪器】外置泵");
+        assert_eq!(normalize_item_name("培训费"), "培训费");
+        assert_eq!(normalize_item_name("  *电子计算机* 路由器 "), "【电子计算机】路由器");
+        assert_eq!(normalize_item_name(""), "");
+    }
+
+    #[test]
+    fn joins_item_names_with_dedupe_and_cap() {
+        let items = vec![
+            normalize_item_name("*公共安全设备*防火泥"),
+            normalize_item_name("*塑料制品*PVC电线管"),
+            normalize_item_name("*公共安全设备*防火泥"),
+        ];
+        assert_eq!(join_item_names(&items).unwrap(), "【公共安全设备】防火泥、【塑料制品】PVC电线管");
+        assert!(join_item_names(&[]).is_none());
+    }
+
+    #[test]
+    fn cleans_remark() {
+        assert_eq!(normalize_remark("业务号码:13156770132;账期:202604").unwrap(), "业务号码:13156770132;账期:202604");
+        assert_eq!(normalize_remark(": 第一行\n第二行 ").unwrap(), "第一行 第二行");
+        assert!(normalize_remark("开票人: 张三").is_none());
+        assert!(normalize_remark("   ").is_none());
+    }
+
+    #[test]
+    fn maps_custom_tag_item_and_note() {
+        // 税局标准 OFD：CustomTag 用语义标签直接指向明细 / 备注文字对象
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ofd:root xmlns:ofd="http://www.ofdspec.org/2016">
+  <ofd:InvoiceNo><ofd:ObjectRef PageRef="61">6922</ofd:ObjectRef></ofd:InvoiceNo>
+  <ofd:Item><ofd:ObjectRef PageRef="61">6939</ofd:ObjectRef></ofd:Item>
+  <ofd:Item><ofd:ObjectRef PageRef="61">6940</ofd:ObjectRef></ofd:Item>
+  <ofd:Note><ofd:ObjectRef PageRef="61">6946</ofd:ObjectRef></ofd:Note>
+  <ofd:Note><ofd:ObjectRef PageRef="61">6947</ofd:ObjectRef></ofd:Note>
+</ofd:root>"#;
+        let map = parse_custom_tag(xml);
+        assert_eq!(map.get("Item"), Some(&vec![6939u32, 6940u32]));
+        assert_eq!(map.get("Note"), Some(&vec![6946u32, 6947u32]));
+        assert_eq!(map.get("InvoiceNo"), Some(&vec![6922u32]));
+    }
+
+    #[test]
+    fn groups_custom_tag_items() {
+        // 一个 <Item> 内的多个 ObjectRef 属于同一条明细（长品名被拆成多段）
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ofd:root xmlns:ofd="http://www.ofdspec.org/2016">
+  <ofd:Item><ofd:ObjectRef PageRef="61">6939</ofd:ObjectRef><ofd:ObjectRef PageRef="61">6940</ofd:ObjectRef></ofd:Item>
+  <ofd:Item><ofd:ObjectRef PageRef="61">6947</ofd:ObjectRef><ofd:ObjectRef PageRef="61">6948</ofd:ObjectRef></ofd:Item>
+  <ofd:Item><ofd:ObjectRef PageRef="61">6957</ofd:ObjectRef></ofd:Item>
+  <ofd:Note><ofd:ObjectRef PageRef="61">6966</ofd:ObjectRef></ofd:Note>
+</ofd:root>"#;
+        let groups = parse_custom_tag_item_groups(xml);
+        assert_eq!(groups, vec![vec![6939u32, 6940u32], vec![6947u32, 6948u32], vec![6957u32]]);
+    }
+
+    #[test]
+    fn extracts_ofd_item_name_by_column() {
+        let mk = |text: &str, b: (f64, f64, f64, f64), tx: f64, ty: f64| {
+            let mut t = OfdTextObject::default();
+            t.text = text.to_string();
+            t.boundary = b;
+            t.ctm = Some((1.0, 0.0, 0.0, 1.0, 0.0, 0.0));
+            t.text_x = tx;
+            t.text_y = ty;
+            t
+        };
+        // 单层模板版式（移动话费）：表头同一行，品名列右界 = 右侧表头左缘 - 2mm
+        let tpl = vec![
+            mk("项目名称 ", (15.5063, 52.7882, 14.2875, 3.175), 0.0, 0.0),
+            mk("规格型号", (40.9, 52.7882, 12.7, 3.175), 0.0, 0.0),
+            mk("单  位", (67.4375, 52.7882, 9.525, 3.175), 0.0, 0.0),
+            mk("*电信服务*通信服务费", (4.4, 56.9277, 31.75, 3.175), 0.0, 0.0),
+            mk("项", (70.6125, 56.6632, 3.175, 3.175), 0.0, 0.0),
+            mk("合        计 ", (20.3313, 92.7631, 20.6375, 3.175), 0.0, 0.0),
+        ];
+        let tpl_refs: Vec<&OfdTextObject> = tpl.iter().collect();
+        assert_eq!(
+            extract_ofd_item_name(&tpl_refs, 270.0).as_deref(),
+            Some("【电信服务】通信服务费")
+        );
+
+        // 数电票数据层版式（高速通行费）：值用 TextCode 的 X/Y，表头在模板层；
+        // 邻列数值（车牌号 x=41.9）比其表头（x=43.17）略偏左，必须靠列边界排除
+        let mut data_item = OfdTextObject::default();
+        data_item.text = "*生产生活服务*通行费".to_string();
+        data_item.boundary = (0.0, 0.0, 210.0, 297.0);
+        data_item.text_x = 8.0;
+        data_item.text_y = 57.0;
+        let mut plate = OfdTextObject::default();
+        plate.text = "苏B3A70G".to_string();
+        plate.boundary = (0.0, 0.0, 210.0, 297.0);
+        plate.text_x = 41.9;
+        plate.text_y = 57.0;
+        let mix = vec![
+            mk("项目名称", (15.1313, 47.1513, 13.4245, 2.8377), 0.0, 0.0),
+            mk("车牌号车辆类型", (43.1745, 47.1513, 139.403, 2.8377), 0.0, 0.0),
+            data_item,
+            plate,
+        ];
+        let mix_refs: Vec<&OfdTextObject> = mix.iter().collect();
+        assert_eq!(
+            extract_ofd_item_name(&mix_refs, 297.0).as_deref(),
+            Some("【生产生活服务】通行费")
+        );
+    }
+
+    #[test]
+    fn parses_xml_item_name_and_remark() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EInvoice>
+  <EInvoiceData>
+    <SellerInformation><SellerName>某某公司</SellerName></SellerInformation>
+    <BasicInformation><TotalTax-includedAmount>400.00</TotalTax-includedAmount></BasicInformation>
+    <IssuItemInformation><ItemName>*生产生活服务*餐费</ItemName><Amount>377.36</Amount></IssuItemInformation>
+    <IssuItemInformation><ItemName>*住宿服务*住宿费</ItemName><Amount>200.00</Amount></IssuItemInformation>
+    <Remark>业务号码:13156770132;账期:202604</Remark>
+  </EInvoiceData>
+</EInvoice>"#;
+        let info = parse_xml_invoice_content(xml).unwrap();
+        assert_eq!(info.item_name.as_deref(), Some("【生产生活服务】餐费、【住宿服务】住宿费"));
+        assert_eq!(info.remark.as_deref(), Some("业务号码:13156770132;账期:202604"));
+    }
+
+    #[test]
+    fn merges_multiple_xml_remark_tags() {
+        // 备注被拆成多个 <Remark> 标签时全部合并（此前只保留最后一个）
+        let xml = r#"<EInvoice><EInvoiceData>
+    <SellerInformation><SellerName>某某公司</SellerName></SellerInformation>
+    <IssuItemInformation><ItemName>*生产生活服务*餐费</ItemName></IssuItemInformation>
+    <Remark>第一行 合同号 HT2025-0912</Remark>
+    <Remark>第二行 报销人 张三</Remark>
+</EInvoiceData></EInvoice>"#;
+        let info = parse_xml_invoice_content(xml).unwrap();
+        assert_eq!(info.remark.as_deref(), Some("第一行 合同号 HT2025-0912 第二行 报销人 张三"));
     }
 }
 

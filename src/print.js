@@ -180,10 +180,10 @@ function buildLayoutRequest(files, settings, pageRange) {
     pageSpecs.push({ slots: slots });
   }
 
-  // 排除纯打印机参数，避免切换打印机/份数等操作错误地导致缓存失效
-  // copyBadge 为纯预览标记，不影响 PDF 内容
-  // 这些字段仅影响打印方式，不影响 PDF 内容布局
-  var _cacheExclude = { printerName:1, copies:1, duplex:1, collate:1, copyBadge:1 };
+  // 排除不影响 PDF 内容的参数，避免设置一改就误判缓存失效：
+  //   printerName/copies/duplex/collate 只影响打印方式；copyBadge 为纯预览标记；
+  //   enhanceMinDpi 现仅用于「检查清晰度」的 ⚠ 提示阈值（issue #52），不再筛选要增强的图片
+  var _cacheExclude = { printerName:1, copies:1, duplex:1, collate:1, copyBadge:1, enhanceMinDpi:1 };
   var layoutSettings = {};
   for (var k in settings) {
     if (!(k in _cacheExclude)) layoutSettings[k] = settings[k];

@@ -121,6 +121,8 @@ function createFileObj(opts) {
     buyerName: opts.buyerName || '',
     buyerCreditCode: opts.buyerCreditCode || '',
     invoiceType: opts.invoiceType || '',
+    itemName: opts.itemName || '',            // 项目名称（发票明细首行，best-effort 识别）
+    invoiceRemark: opts.invoiceRemark || '',  // 发票备注（票面「备注」栏，best-effort 识别）
     _ocrText: opts._ocrText || '',
     _isTicket: opts._isTicket || false,
     _isToll: opts._isToll || false,
@@ -1937,6 +1939,8 @@ function loadFileFromDataUrlFast(fd) {
           buyerCreditCode: info.buyerTaxId || '',
           invoiceType: info.invoiceType || '',
           _isToll: !!info.isToll,
+          itemName: info.itemName || '',
+          invoiceRemark: info.remark || '',
           // OFD page dimensions for layout
           ow: payload.img.naturalWidth,
           oh: payload.img.naturalHeight,
@@ -1992,6 +1996,8 @@ function loadFileFromDataUrlFast(fd) {
           buyerCreditCode: info.buyerTaxId || '',
           invoiceType: info.invoiceType || '',
           _isToll: !!info.isToll,
+          itemName: info.itemName || '',
+          invoiceRemark: info.remark || '',
           // XML has no preview image — use placeholder dimensions
           ow: 0, oh: 0,
           _xmlInvoice: true
@@ -2547,6 +2553,9 @@ function runClarityAudit() {
   var req;
   try { req = buildLayoutRequest(files, getSettings()); }
   catch (e) { toast('构建版式失败：' + e); return; }
+  // enhanceMinDpi 是纯提示参数、不进 PDF 缓存比较（见 print.js 的 _cacheExclude），
+  // 这里补回 request 供 Rust 的清晰度体检判定 ⚠ 徽章
+  req.settings.enhanceMinDpi = parseFloat(document.getElementById('enhanceMinDpi').value) || 250;
 
   invoke('audit_clarity', { request: req }).then(function (list) {
     var keys = req._specKeys || [];
@@ -2897,6 +2906,8 @@ function ctxCopyInfo() {
   add('开票日期', f.invoiceDate);
   add('购买方', f.buyerName);
   add('销售方', f.sellerName);
+  add('项目名称', f.itemName);
+  add('发票备注', f.invoiceRemark);
   add('金额（含税）', f.amountTax > 0 ? '¥' + f.amountTax.toFixed(2) : '');
   add('金额（不含税）', f.amountNoTax > 0 ? '¥' + f.amountNoTax.toFixed(2) : '');
   add('税额', f.taxAmount > 0 ? '¥' + f.taxAmount.toFixed(2) : '');
@@ -3454,6 +3465,8 @@ function openInvModal(i) {
     mRA('购方代码', '<input type="text" id="mBuyerCreditCode" value="' + escHtml(f.buyerCreditCode || '') + '" placeholder="自动识别" class="mono-input">') +
     mRA('销售方', '<input type="text" id="mSeller" value="' + escHtml(f.sellerName || '') + '" placeholder="自动识别">') +
     mRA('信用代码', '<input type="text" id="mCreditCode" value="' + escHtml(f.sellerCreditCode || '') + '" placeholder="自动识别" class="mono-input">') +
+    mRA('项目名称', '<input type="text" id="mItemName" value="' + escHtml(f.itemName || '') + '" placeholder="自动识别（发票明细首行）">') +
+    mRA('发票备注', '<input type="text" id="mInvoiceRemark" value="' + escHtml(f.invoiceRemark || '') + '" placeholder="自动识别（票面备注栏）">') +
     mRA('备注', '<input type="text" id="mNote" value="' + escHtml(f.note || '') + '" placeholder="手动备注（汇总表同步）">') +
     mRF('旋转', '<select id="mRot" style="width:140px;flex:none"><option value="0" ' + (f.rotation === 0 ? 'selected' : '') + '>不旋转</option><option value="90" ' + (f.rotation === 90 ? 'selected' : '') + '>90\u00B0</option><option value="180" ' + (f.rotation === 180 ? 'selected' : '') + '>180\u00B0</option><option value="270" ' + (f.rotation === 270 ? 'selected' : '') + '>270\u00B0</option></select>') +
     '<div style="border-top:1px dashed var(--border);margin-top:4px;padding-top:8px">' +
@@ -3485,6 +3498,8 @@ function confirmInvModal() {
   f.invoiceDate = document.getElementById('mInvoiceDate').value;
   f.buyerName = document.getElementById('mBuyer').value;
   f.buyerCreditCode = document.getElementById('mBuyerCreditCode').value;
+  f.itemName = document.getElementById('mItemName').value;
+  f.invoiceRemark = document.getElementById('mInvoiceRemark').value;
   f.note = document.getElementById('mNote').value;
   // Per-slot adjustments
   f.slotScale = Math.max(0.2, Math.min(5.0, (parseInt(document.getElementById('mSlotScale').value) || 100) / 100));
@@ -4271,6 +4286,7 @@ function getSettings() {
     colorMode: document.getElementById('colorMode').value,
     globalRotation: document.getElementById('globalRotation').value,
     // 清晰度优化（issue #39）：自动增强开关与参数（threshold 无 UI，Rust 用默认 8）
+    // enhanceMinDpi 现仅用于「检查清晰度」的 ⚠ 提示阈值，不再筛选要增强的图片（issue #52）
     autoEnhance: !!S.feat.autoEnhance,
     enhanceMinDpi: parseFloat(document.getElementById('enhanceMinDpi').value) || 250,
     enhanceGamma: parseFloat(document.getElementById('enhanceGamma').value) || null,
@@ -5657,6 +5673,8 @@ var SUMMARY_FIELDS = [
   { key: 'taxAmount', label: '税额',      type: 'amount',  default: false, editable: true },
   { key: 'name',      label: '文件名',    type: 'text',    default: false, editable: true },
   { key: 'copies',    label: '份数',      type: 'copies',  default: false, editable: true },
+  { key: 'itemName',  label: '项目名称',  type: 'text',    default: false, editable: true },
+  { key: 'invoiceRemark', label: '发票备注', type: 'text', default: false, editable: true },
   { key: 'note',      label: '备注',      type: 'text',    default: true, editable: true }
 ];
 
@@ -5987,6 +6005,8 @@ var RENAME_FIELDS = [
   { key: 'invoiceNo',       label: '发票号码'   },
   { key: 'invoiceDate',     label: '开票日期'   },
   { key: 'invoiceType',     label: '发票类型'   },
+  { key: 'itemName',        label: '项目名称'   },
+  { key: 'invoiceRemark',   label: '发票备注'   },
   { key: 'note',           label: '备注'       },
 ];
 

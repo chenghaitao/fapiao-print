@@ -161,6 +161,8 @@ fn dump_xml(path: &str) -> Result<String, String> {
         "  通行费标记: {}\n",
         info.is_toll.map(|b| b.to_string()).unwrap_or_else(|| "（无）".to_string())
     ));
+    r.push_str(&format!("  项目名称: {}\n", s(&info.item_name)));
+    r.push_str(&format!("  发票备注: {}\n", s(&info.remark)));
     Ok(r)
 }
 

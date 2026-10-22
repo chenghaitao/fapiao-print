@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- **版本**: v2.6.16（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
+- **版本**: v2.6.17（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架、无打包）
 - **双版本**: 轻量版 / OCR 版（PP-OCRv6）；Cargo.toml 定义 `ocr` feature，`lib.rs` 按 `#[cfg(feature = "ocr")]` 条件注册命令，OCR 构建用 `tauri.ocr.conf.json` 叠加配置（仅追加 bundle.resources）
 - **目录结构**:
@@ -175,7 +175,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **图片文本增强**（`toggleTextEnhance`，纯本地）：Rust `enhance_image()` 读原图全分辨率 → EXIF 烘焙 → 直方图 1%/99% 色阶拉伸 + gamma 1.4 + USM 锐化 → JPEG q92；同一 LUT 应用 RGB 三通道（红章保色），退化图恒等映射防噪点放大。`f._enhanced` + 备份可还原；打印链路走 dataUrl 分支（去重 key 改用 previewUrl）；限图片文件且有 `_filePath`（web 未移植）。**核心 `enhance_rgb_inplace()` 与打印自动增强共用（单一真源）**，`normalize_for_jpeg()` 统一 16 位/32F 高精度图。
 
-**清晰度体检与打印自动增强**（v2.6.6，issue #39）：`audit_clarity`（`async fn` + `spawn_blocking`）只读文件头毫秒级算每张发票折算打印 DPI（矢量电子发票 `kind='vector'` 与分辨率无关刻意不参与），低于阈值前端打 `clarity-badge` ⚠ 徽章；`S.feat.autoEnhance` 开启后打印/保存时对折算 DPI < `enhanceMinDpi`（默认 250）的图片自动增强（`EnhanceParams{minDpi, gamma, amountPct, quality}`，滑块越界 clamp 而非拒绝），读原图全分辨率、预览缩略图永不作增强源。
+**清晰度体检与打印自动增强**（v2.6.6，issue #39）：`audit_clarity`（`async fn` + `spawn_blocking`）只读文件头毫秒级算每张发票折算打印 DPI（矢量电子发票 `kind='vector'` 与分辨率无关刻意不参与），低于阈值前端打 `clarity-badge` ⚠ 徽章；`S.feat.autoEnhance` 开启后打印/保存时对**全部图片源**自动增强（v2.6.17 按用户反馈调整：原先按 DPI 阈值筛选是**有意设计**、阈值亦可自定义，现改为一律增强，`enhanceMinDpi` 仅作体检 ⚠ 徽章阈值），读原图全分辨率、预览缩略图永不作增强源。
 
 **白边裁剪坐标换算**（v2.6.6，issue #38）：`trimmedBox` 基于预览缩略图（`THUMB_MAX_DIM=600`）坐标，而图片文件 `ow/oh` 是原图尺寸——进 `SlotSpec.trimBox` 前必须按 `ow/tw`、`oh/th` 比例换算到原图坐标（否则 Rust 读全分辨率原图执行裁剪时整体偏移，打印与预览不一致）；PDF/OFD 页面 `ow/oh` 即渲染位图尺寸，无需换算。裁剪走 `trim_images_batch`（`async fn` + `spawn_blocking`，Rust 内 rayon 并行，一次 IPC 返回整批 `[Option<TrimImageResult>]`，单张失败为 `null` 由前端跳过）。
 
@@ -191,6 +191,14 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - **medical（医疗收费票据）**：强标记「医疗门诊/住院/急诊收费票据|医疗收费明细」，**必须在 nontax 判定前**（否则「票据代码/票据号码/交款人」先抢走判成非税）；复用非税提取链路（金额合计/票据号码/交款人），`getMedicalLabel()` 细分门诊/住院/急诊标签；报销口径只取金额合计，不识别自费/统筹等支付分解字段。明细页（第二页起「医疗收费明细」长清单）由 `isMedicalDetailPage()` 双确认（`医疗收费明细` + `所属电子票据号码`，「所属」前缀是明细页独有特征），`finalizeMedicalDetailPages()` 从列表移除——只留汇总首页、不参与排版/统计/去重，主票挂「附N页明细」徽章并 toast（幂等 `_medDetailHandled`，与逻辑票聚合 issue #40 共存，移除后 `updateDuplicateMarks()` 重排）；web 分支识别同步（js/pdf-text.js）
 
 **金额提取**：含税价 → 数学验证配对 → 区域解析三阶段；中文大写 `parseChineseNumeral()` 兜底；金额求和校验失败时卡片 ⚠ 徽章 + hover 详情 + 汇总栏计数。
+
+**项目名称 / 发票备注提取**（v2.6.17，best-effort）：**两路互补**——项目名称**坐标优先**、备注**文字优先**，缺失再互相补空（原因：项目名称有严格列边界，坐标能剔除「规格型号」列 / 合并换行续行；备注是大区域无列边界，文字正则更稳）。
+- **项目名称 · 坐标路**（`_extractItemNameRemarkByCoords()`）：需同时找到「项目名称」表头与右侧列边界（规格型号/单位/数量/单价表头左缘），否则交文字路。取左缘落在品名列内的词（`分类列` 右缘越界的词裁掉尾部型号串，如 `…便携式气KP826` → `…便携式气`）；按行高 ×0.6 分行；**数电票明细以 `*` 开头，不以 `*` 开头的行是上一行品名的换行续行，直接并回上一条**；行文本命中共 `合计`/表头等结构性词（`_isStructuralItemRow()`，含被拆成「合」「计」两词的合计标签）直接丢弃。
+- **项目名称 · 文字路**（`_extractByText` 内）：兜底用——`*类别*品名` 星号模式全局收集（星号段后裁到下一个表头关键词），再退到「项目名称」标签后换行内容。
+- **备注 · 文字路**：取「备注」标签之后、截到页脚（开票人/收款人/复核人）之前，`_cleanRemark()` 清洗；**坐标路**：取左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上区域。
+- **多条项目名称用「、」去重合并**（`_joinItems()`，总长上限 `ITEM_NAME_MAX=120`，按整条边界截断）；**备注多行合并为一行**（空格分隔，上限 200 字）。`_cleanItemName()` 把数电票的 `*类别*品名` 还原成 **`【类别】品名`**（分类保留、不与品名连成一片），单条上限 80 字。
+- **结构化路径（OFD / XML 数电票）**（`invoice-engine`）：XML 直接取 `IssuItemInformation/ItemName`（多条合并）+ `<Remark>`（多个标签合并）。**XML 没有备注就留空**——`BuyerBankName/BuyerBankAccNum/SellerBankName/SellerBankAccNum` 是独立银行字段，**不属于备注，禁止拼接成备注**（曾误用其「还原」，已撤销：同票 XML 里 `Remark/备注/Note` 出现 0 次，而 OFD 的 `<Note>` 才有该内容，两者本就不一致）。OFD **两级**：①首选 `CustomTag.xml` 语义标签（`<Item>` / `<Note>` 直接指向文字对象 ID，税局标准 OFD 均带，最精准；该文件缺失时再读 `CustomTags.xml` 兜底，后者多数只是索引、解析为空即无副作用）；**`<Item>` 必须按组解析**（`parse_custom_tag_item_groups()`）——生成器会把长品名拆成多个文字对象（如「*生产生活服务*技术服务」+「费」），同组各段按序拼接成一条明细，逐段当独立明细会把 3 条拆成 5 条；②无 CustomTag 时才退到坐标推断——`extract_ofd_item_name()` 按「项目名称」列边界取（**不做全局星号扫描**）：用「项目名称」表头 + 同排右侧最近表头的左缘（再往里收 `OFD_COL_MARGIN=2mm`，避免收进邻列数值）定出品名列，只取列内、表头下方的文字对象，`*` 开头为新条目、否则为换行续行并回上一条；下界取「合计/价税合计/备注」锚点。坐标统一走 `ofd_page_pos()` = Boundary 原点 + CTM 作用于 TextCode 的 X/Y（无 CTM 时即 Boundary + X/Y），**模板层与数电票数据层（Boundary 覆盖整页、X/Y 为页面绝对坐标）因此可跨层比较**。备注坐标路 `extract_ofd_remark()`：左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上的文字，上界由「价税合计/大写/小写」行推出（标签常在框内垂直居中），并剔除与落款标签同行的落款值；CustomTag 的 `<Note>` 里形如「复核人:…」的独立落款行同样剔除。两侧共用 Rust 清洗 `normalize_item_name()`（`*类别*品名` → `【类别】品名`）/ `join_item_names()`（「、」去重合并、上限 120）/ `normalize_remark()`，与 JS 侧口径一致；前端 OFD/XML 加载路径直接把 `info.itemName` / `info.remark` 写进 fileObj。
+- **版式不固定，取不到就留空、绝不猜测**，故两字段仅作参考；在发票弹窗、汇总表内可人工修正，并已加入批量重命名可选字段。**覆盖 图片 OCR / PDF 文字层 / OFD / XML 数电票**（车票、非税票分支不调用）。
 
 **多页发票逻辑票聚合**（v2.6.7，issue #40）：**物理层逐页输出不变**，逻辑层新增分组——`rebuildPdfInvoiceGroups()` 把同批次同 PDF（`getPdfBatchKey` = `_pdfPath|_batchId`）且组内非空发票号去重后**唯一**的多页归为一张逻辑票，写回 `_invoiceGroupId`（= 批次 key）+ `_multiPageInvoice{total,pageNo,isSummary}`；**合计页** = 组内最后一个识别到含税金额的页（无则取末页），统计口径（底部汇总 / 汇总表合计行 / CSV）经 `isMultiPageDetail()` 跳过非合计页，明细页仅回填合计页票种（只补空不覆盖，金额不回填）；去重 `updateDuplicateMarks()` / `removeDuplicates` 按 `getLogicalInvoiceId()` **整组计数 + 整组删除**，杜绝续页被当成重复自动删除导致打印缺页；续页徽章 `buildMultiPageBadge()`「续 n/N」「共 N 页」列表 / 卡片双视图共用。分组**幂等**，依赖已识别的 `invoiceNo`，识别异步完成后须重跑；`_placeholder` / `_xmlInvoice` 不参与。
 

@@ -442,6 +442,8 @@ struct UpdateInfo {
     assets: Vec<UpdateAsset>,
     /// 当前安装版本所属渠道："stable"（正式版）/ "beta"（测试版）
     channel: String,
+    /// 更新来源："fork"（本 Fork 最新版）/ "official"（官方仓库）
+    source: String,
     /// 候选版本本身是否为预发布（测试版）
     is_prerelease: bool,
 }
@@ -592,8 +594,16 @@ fn fetch_releases_json(agent: &ureq::Agent, urls: &[String]) -> Result<(serde_js
 /// 主备双源: 先尝试直连 api.github.com,失败后 fallback 到 gh-proxy.com 加速代理。
 /// 保证大陆网络环境下更新检查可用,网络通畅时直连最快。
 #[command]
-async fn check_for_updates(channel: Option<String>) -> Result<UpdateInfo, String> {
+async fn check_for_updates(
+    channel: Option<String>,
+    source: Option<String>,
+) -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
+    let source = match source.as_deref() {
+        None | Some("fork") => "fork",
+        Some("official") => "official",
+        Some(_) => return Err("无效的更新来源".to_string()),
+    };
 
     tauri::async_runtime::spawn_blocking(move || -> Result<UpdateInfo, String> {
         let agent = build_http_agent(std::time::Duration::from_secs(15))?;
@@ -603,14 +613,22 @@ async fn check_for_updates(channel: Option<String>) -> Result<UpdateInfo, String
             Some("stable") => false,
             _ => current.contains('-'),
         };
-        let path = if is_beta_channel {
-            "/releases?per_page=20"
-        } else {
+        let path = if source == "fork" || !is_beta_channel {
             "/releases/latest"
+        } else {
+            "/releases?per_page=20"
+        };
+        let repo = if source == "fork" {
+            "chenghaitao/fapiao-print"
+        } else {
+            "erma0/fapiao-print"
         };
         let urls = [
-            format!("https://api.github.com/repos/erma0/fapiao-print{}", path),
-            format!("https://gh-proxy.com/https://api.github.com/repos/erma0/fapiao-print{}", path),
+            format!("https://api.github.com/repos/{}{}", repo, path),
+            format!(
+                "https://gh-proxy.com/https://api.github.com/repos/{}{}",
+                repo, path
+            ),
         ];
         let (json, via_proxy) = fetch_releases_json(&agent, &urls)?;
 
@@ -650,6 +668,7 @@ async fn check_for_updates(channel: Option<String>) -> Result<UpdateInfo, String
         }
 
         let channel = if is_beta_channel { "beta" } else { "stable" }.to_string();
+        let source = source.to_string();
 
         Ok(match best {
             Some((ver, e)) => UpdateInfo {
@@ -661,6 +680,7 @@ async fn check_for_updates(channel: Option<String>) -> Result<UpdateInfo, String
                 published_at: e.published_at,
                 assets: e.assets,
                 channel,
+                source,
                 is_prerelease: e.prerelease,
             },
             None => UpdateInfo {
@@ -672,6 +692,7 @@ async fn check_for_updates(channel: Option<String>) -> Result<UpdateInfo, String
                 published_at: String::new(),
                 assets: Vec::new(),
                 channel,
+                source,
                 is_prerelease: false,
             },
         })

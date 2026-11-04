@@ -321,22 +321,29 @@ async function run() {
   equal(checkState.deselectAll, { sel: -1, name: null, tbHidden: true }, '全部取消勾选后清空选中');
 
   const updates = await evaluate(async () => {
-    isTauri = true;
+    isTauri = false;
     APP_VERSION = '2.6.16-beta.8';
     var requests = [], shown = [], toasts = [];
-    invoke = function(cmd, args) { return new Promise(function(resolve, reject) { requests.push({ channel: args.channel, resolve: resolve, reject: reject }); }); };
+    invoke = function(cmd, args) { return new Promise(function(resolve, reject) { requests.push({ channel: args.channel, source: args.source, resolve: resolve, reject: reject }); }); };
     showUpdateModal = function(info) { shown.push(info.channel); };
     toast = function(text) { toasts.push(text); };
+    localStorage.removeItem(_UPDATE_SOURCE_KEY);
+    var defaultSource = getUpdateSource();
+    setUpdateSource('official');
+    var savedSource = getUpdateSource();
+    var syncedSource = [document.getElementById('updateSourcePrefs').value, document.getElementById('updateSource').value];
+    setUpdateSource('fork');
+    isTauri = true;
     localStorage.setItem(_UPDATE_CHANNEL_KEY, 'beta');
     localStorage.removeItem(_UPDATE_CACHE_KEY);
     _updateChecking = false;
     checkForUpdates(false);
     setUpdateChannel('stable');
     checkForUpdates(false);
-    requests[0].resolve({ has_update: true, channel: 'beta', latest_version: '2.6.16-beta.9' });
+    requests[0].resolve({ has_update: true, channel: 'beta', source: 'fork', latest_version: '2.6.16-beta.9' });
     await Promise.resolve();
     var stale = { shown: shown.slice(), cache: localStorage.getItem(_UPDATE_CACHE_KEY), checking: _updateChecking, requests: requests.length };
-    requests[1].resolve({ has_update: false, channel: 'stable', current_version: APP_VERSION });
+    requests[1].resolve({ has_update: false, channel: 'stable', source: 'fork', current_version: APP_VERSION });
     await Promise.resolve();
     var accepted = { channel: JSON.parse(localStorage.getItem(_UPDATE_CACHE_KEY)).channel, checking: _updateChecking, message: toasts[toasts.length - 1] };
     setUpdateChannel('beta');
@@ -346,27 +353,42 @@ async function run() {
     requests[2].reject('旧渠道错误');
     await Promise.resolve(); await Promise.resolve();
     var rejected = { checking: _updateChecking, staleErrorShown: toasts.some(t => t.includes('旧渠道错误')) };
-    requests[3].resolve({ has_update: false, channel: 'stable', current_version: APP_VERSION });
+    requests[3].resolve({ has_update: false, channel: 'stable', source: 'fork', current_version: APP_VERSION });
     await Promise.resolve();
     // 旧版串渠道缓存不能被静默检查复用。
-    localStorage.setItem(_UPDATE_CACHE_KEY, JSON.stringify({ ts: Date.now(), ver: APP_VERSION, channel: 'stable', info: { has_update: true, channel: 'beta' } }));
+    localStorage.setItem(_UPDATE_CACHE_KEY, JSON.stringify({ ts: Date.now(), ver: APP_VERSION, channel: 'stable', source: 'fork', info: { has_update: true, channel: 'beta', source: 'fork' } }));
     checkForUpdates(true);
     var poisonedCacheFetched = requests.length === 5;
-    requests[4].resolve({ has_update: false, channel: 'stable', current_version: APP_VERSION });
+    requests[4].resolve({ has_update: false, channel: 'stable', source: 'fork', current_version: APP_VERSION });
     await Promise.resolve();
     // 切走又切回原渠道时，最早的响应仍然过期。
     checkForUpdates(false);
     setUpdateChannel('beta'); setUpdateChannel('stable');
-    requests[5].resolve({ has_update: true, channel: 'stable', latest_version: '2.6.16' });
+    requests[5].resolve({ has_update: true, channel: 'stable', source: 'fork', latest_version: '2.6.16' });
+    await Promise.resolve();
+    var returnedChannelStale = shown.length === 0 && localStorage.getItem(_UPDATE_CACHE_KEY) === null;
+    checkForUpdates(false);
+    document.getElementById('updateModal').classList.remove('hidden');
+    setUpdateSource('official');
+    var sourceSwitchClosedModal = document.getElementById('updateModal').classList.contains('hidden');
+    requests[6].resolve({ has_update: true, channel: 'stable', source: 'fork', latest_version: '2.6.17' });
+    await Promise.resolve();
+    requests[7].resolve({ has_update: false, channel: 'stable', source: 'official', current_version: APP_VERSION });
     await Promise.resolve();
     return { stale: stale, accepted: accepted, rejected: rejected, poisonedCacheFetched: poisonedCacheFetched,
-      returnedChannelStale: shown.length === 0 && localStorage.getItem(_UPDATE_CACHE_KEY) === null };
+      returnedChannelStale: returnedChannelStale,
+      source: { defaultSource: defaultSource, savedSource: savedSource, requestSource: requests[0].source,
+        stale: shown.length === 0, cachedSource: JSON.parse(localStorage.getItem(_UPDATE_CACHE_KEY)).source,
+        syncedSource: syncedSource, officialRequestSource: requests[7].source, sourceSwitchClosedModal: sourceSwitchClosedModal } };
   });
   equal(updates.stale, { shown: [], cache: null, checking: true, requests: 2 }, '旧响应不能污染缓存或解除新请求锁');
-  equal(updates.accepted, { channel: 'stable', checking: false, message: '已是最新版本 v2.6.16-beta.8' }, '当前渠道响应正常生效');
+  equal(updates.accepted, { channel: 'stable', checking: false, message: '本 Fork 已是最新版本 v2.6.16-beta.8' }, '当前渠道响应正常生效');
   equal(updates.rejected, { checking: true, staleErrorShown: false }, '旧渠道错误不影响新请求');
   equal(updates.poisonedCacheFetched, true, '拒绝历史串渠道缓存');
   equal(updates.returnedChannelStale, true, '切走再切回仍丢弃旧响应');
+  equal(updates.source, { defaultSource: 'fork', savedSource: 'official', requestSource: 'fork', stale: true, cachedSource: 'official',
+    syncedSource: ['official', 'official'], officialRequestSource: 'official', sourceSwitchClosedModal: true },
+    '更新源默认 Fork、切换持久化且旧源响应失效');
   await cdp('Browser.close');
   console.log('PASS: ' + checks + ' regression checks');
 }

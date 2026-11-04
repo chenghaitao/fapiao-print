@@ -373,6 +373,7 @@
         <div class="sec">
           <div class="sec-title">ℹ️ 关于</div>
           <div class="about-row"><span class="about-label">当前版本</span><span class="about-value"><span id="prefsCurrentVersion">v—</span><span class="ver-badge" id="prefsChannelBadge">—</span></span></div>
+          <div class="row"><label class="lbl">更新来源</label><div class="ctrl"><select id="updateSourcePrefs" onchange="setUpdateSource(this.value)"><option value="fork">本 Fork 最新版</option><option value="official">官方源（erma0）</option></select></div></div>
           <div class="row"><label class="lbl">更新渠道</label><div class="ctrl"><select id="updateChannel" onchange="setUpdateChannel(this.value)"><option value="stable">正式版</option><option value="beta">测试版</option></select></div></div>
           <div class="hint" id="prefsChannelDesc">—</div>
           <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="checkForUpdates(false)">🔄 检查更新</button>
@@ -504,6 +505,13 @@
   <div class="modal update-modal" onclick="event.stopPropagation()">
     <div class="modal-title"><span id="updateModalTitle">🆕 发现新版本</span><span class="ver-badge hidden" id="updateChannelBadge"></span></div>
     <div class="modal-body">
+      <div class="update-source-row">
+        <label for="updateSource">更新来源</label>
+        <select id="updateSource" onchange="setUpdateSource(this.value)">
+          <option value="fork">本 Fork 最新版</option>
+          <option value="official">官方源（erma0）</option>
+        </select>
+      </div>
       <div class="update-version-row">
         <span class="update-ver-old" id="updateCurrentVersion">v—</span>
         <span class="update-arrow">→</span>

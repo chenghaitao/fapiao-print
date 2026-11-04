@@ -23,10 +23,12 @@ use tauri::Emitter;
 pub static UPDATE_DOWNLOAD_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// 允许的下载来源：GitHub Release 直链、其 CDN 重定向、gh-proxy 加速镜像
-const URL_ALLOWLIST: [&str; 3] = [
+const URL_ALLOWLIST: [&str; 5] = [
     "https://github.com/erma0/fapiao-print/releases/download/",
+    "https://github.com/chenghaitao/fapiao-print/releases/download/",
     "https://objects.githubusercontent.com/",
     "https://gh-proxy.com/https://github.com/erma0/fapiao-print/",
+    "https://gh-proxy.com/https://github.com/chenghaitao/fapiao-print/",
 ];
 
 const PART_NAME: &str = "ticketchan.part";

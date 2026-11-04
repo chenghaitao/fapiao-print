@@ -5323,6 +5323,7 @@ async function exportSettings() {
   data.ocrPrecision = S.ocrPrecision;
   data.saveDir = getSaveDir();
   data.updateChannel = getUpdateChannel();
+  data.updateSource = getUpdateSource();
   data.autoUpdateCheck = !isIgnoreAllUpdates();
   var json = JSON.stringify(data, null, 2);
   if (isTauri && invoke) {
@@ -5400,7 +5401,7 @@ async function importSettings() {
   }
   if (!confirm('导入将覆盖当前全部设置与本地记忆（已打印标记 / 文件列表 / 单票调整 / 备注），并重新加载界面，确认继续？')) return;
   // 设置主体写回 ticketchan-settings；独立存储的偏好项写回各自的 key
-  var extraKeys = ['_meta', 'theme', 'amtMode', 'ocrEnabled', 'pdfTextEnabled', 'ocrPrecision', 'saveDir', 'updateChannel', 'autoUpdateCheck'];
+  var extraKeys = ['_meta', 'theme', 'amtMode', 'ocrEnabled', 'pdfTextEnabled', 'ocrPrecision', 'saveDir', 'updateChannel', 'updateSource', 'autoUpdateCheck'];
   var settings = {};
   Object.keys(data).forEach(function(k) { if (extraKeys.indexOf(k) < 0) settings[k] = data[k]; });
   _importingSettings = true; // 写入期间起锁：清挂起的防抖保存 + 拦截重载窗口内新触发的自动保存
@@ -5413,6 +5414,7 @@ async function importSettings() {
     if (data.ocrPrecision === 'fast' || data.ocrPrecision === 'standard' || data.ocrPrecision === 'precise') localStorage.setItem('ticketchan-ocr-precision', data.ocrPrecision);
     if (typeof data.saveDir === 'string') localStorage.setItem('ticketchan-save-dir', data.saveDir);
     if (data.updateChannel === 'stable' || data.updateChannel === 'beta') localStorage.setItem('ticketchan-update-channel', data.updateChannel);
+    if (data.updateSource === 'fork' || data.updateSource === 'official') localStorage.setItem(_UPDATE_SOURCE_KEY, data.updateSource);
     if (typeof data.autoUpdateCheck === 'boolean') localStorage.setItem(_UPDATE_IGNORE_ALL_KEY, data.autoUpdateCheck ? '' : '1');
   } catch(e) {
     _importingSettings = false; // 写入失败解锁，恢复自动保存
@@ -5558,8 +5560,10 @@ function resetSettings(scope) {
   try { localStorage.removeItem('ticketchan-ocr-precision'); } catch(e) {}
   try { localStorage.removeItem('ticketchan-pdf-text-enabled'); } catch(e) {}
   try { localStorage.removeItem('ticketchan-update-channel'); } catch(e) {}
+  try { localStorage.removeItem(_UPDATE_SOURCE_KEY); } catch(e) {}
   try { localStorage.removeItem(_UPDATE_IGNORE_ALL_KEY); } catch(e) {}
   syncUpdateChannelUI();
+  syncUpdateSourceUI();
   syncAutoUpdateCheckUI();
   try { localStorage.removeItem('ticketchan-settings'); } catch(e) {}
   try { localStorage.removeItem('ticketchan-print-mode'); } catch(e) {}
@@ -5894,6 +5898,7 @@ renderQuickLayoutList();
 (function() {
   function showApp() {
     syncAutoUpdateCheckUI();
+    syncUpdateSourceUI();
     if (isTauri && invoke) {
       // 上次更新若只替换到一半（例如文件被占用），启动时补偿完成并自动重启
       invoke('check_pending_update').then(function(r) {
@@ -5975,6 +5980,7 @@ var _updateChecking = false;
 var _updateRequestId = 0; // 切渠道时令旧请求失效，允许立即检查新渠道
 var _lastUpdateInfo = null;
 var _UPDATE_CHANNEL_KEY = 'ticketchan-update-channel';
+var _UPDATE_SOURCE_KEY = 'ticketchan-update-source';
 
 // 应用内自更新状态（issue #58）：下载 → 校验 → 替换 exe → 自动重启
 var _updateAssetPicked = null; // 当前可自动替换的产物（带 digest）
@@ -5999,6 +6005,43 @@ function getUpdateChannel() {
     if (saved === 'stable' || saved === 'beta') return saved;
   } catch(e) {}
   return getDefaultUpdateChannel();
+}
+
+function getUpdateSource() {
+  try {
+    var saved = localStorage.getItem(_UPDATE_SOURCE_KEY);
+    if (saved === 'fork' || saved === 'official') return saved;
+  } catch(e) {}
+  return 'fork';
+}
+
+function setUpdateSource(source) {
+  if (source !== 'fork' && source !== 'official') return;
+  if (source === getUpdateSource()) return;
+  if (_updateDownloading || _updateApplying) {
+    syncUpdateSourceUI();
+    return;
+  }
+  try { localStorage.setItem(_UPDATE_SOURCE_KEY, source); } catch(e) {}
+  _updateRequestId++;
+  _updateChecking = false;
+  _lastUpdateInfo = null;
+  try { localStorage.removeItem(_UPDATE_CACHE_KEY); } catch(e) {}
+  syncUpdateSourceUI();
+  syncUpdateChannelUI();
+
+  var modal = document.getElementById('updateModal');
+  if (modal && !modal.classList.contains('hidden')) closeUpdateModal();
+  checkForUpdates(false);
+}
+
+function syncUpdateSourceUI() {
+  ['updateSource', 'updateSourcePrefs'].forEach(function(id) {
+    var sel = document.getElementById(id);
+    if (!sel) return;
+    sel.value = getUpdateSource();
+    sel.disabled = _updateDownloading || _updateApplying;
+  });
 }
 
 function setUpdateChannel(v) {
@@ -6027,9 +6070,15 @@ function syncUpdateChannelUI() {
     badge.classList.toggle('beta', isBetaInstall);
   }
   var desc = document.getElementById('prefsChannelDesc');
-  if (desc) desc.textContent = ch === 'beta'
-    ? '检查测试版与正式版中版本更高的一个；正式版用户不会收到测试版提示'
-    : '只检查稳定版本，不会收到测试版更新提示';
+  if (desc) {
+    if (getUpdateSource() === 'fork') {
+      desc.textContent = '本 Fork 固定检查最新正式版；测试版渠道仅对官方源生效';
+    } else {
+      desc.textContent = ch === 'beta'
+        ? '检查测试版与正式版中版本更高的一个；正式版用户不会收到测试版提示'
+        : '只检查稳定版本，不会收到测试版更新提示';
+    }
+  }
 }
 
 function getIgnoredUpdateVersion() {
@@ -6059,6 +6108,7 @@ function checkForUpdates(silent) {
   if (_updateChecking) return;
   _updateChecking = true;
   var channel = getUpdateChannel();
+  var source = getUpdateSource();
   var version = APP_VERSION;
   var requestId = ++_updateRequestId;
 
@@ -6070,7 +6120,8 @@ function checkForUpdates(silent) {
       var cached = localStorage.getItem(_UPDATE_CACHE_KEY);
       if (cached) {
         var data = JSON.parse(cached);
-        if (data.ver === version && data.channel === channel && data.info && data.info.channel === channel &&
+        if (data.ver === version && data.channel === channel && data.source === source && data.info &&
+            data.info.channel === channel && data.info.source === source &&
             Date.now() - data.ts < _UPDATE_CACHE_TTL) {
           _updateChecking = false;
           if (shouldAutoShowUpdate(data.info)) {
@@ -6084,12 +6135,14 @@ function checkForUpdates(silent) {
 
   if (!silent) toast('正在检查更新...', 1500);
 
-  invoke('check_for_updates', { channel: channel }).then(function(info) {
-    if (requestId !== _updateRequestId || channel !== getUpdateChannel() || version !== APP_VERSION) return;
+  invoke('check_for_updates', { channel: channel, source: source }).then(function(info) {
+    if (requestId !== _updateRequestId || channel !== getUpdateChannel() ||
+        source !== getUpdateSource() || version !== APP_VERSION) return;
+    if (!info || info.source !== source) throw new Error('更新检查返回的来源不匹配');
     _updateChecking = false;
     // Cache result for silent auto-check
     try {
-      localStorage.setItem(_UPDATE_CACHE_KEY, JSON.stringify({ ts: Date.now(), ver: version, channel: channel, info: info }));
+      localStorage.setItem(_UPDATE_CACHE_KEY, JSON.stringify({ ts: Date.now(), ver: version, channel: channel, source: source, info: info }));
     } catch(e) {}
 
     if (info.has_update) {
@@ -6098,10 +6151,13 @@ function checkForUpdates(silent) {
         showUpdateModal(info);
       }
     } else if (!silent) {
-      toast((channel === 'beta' ? '已是最新测试版 v' : '已是最新版本 v') + info.current_version, 2500);
+      var sourceLabel = source === 'fork' ? '本 Fork ' : '官方源';
+      var versionLabel = source === 'official' && channel === 'beta' ? '最新测试版' : '最新版本';
+      toast(sourceLabel + '已是' + versionLabel + ' v' + info.current_version, 2500);
     }
   }).catch(function(err) {
-    if (requestId !== _updateRequestId || channel !== getUpdateChannel() || version !== APP_VERSION) return;
+    if (requestId !== _updateRequestId || channel !== getUpdateChannel() ||
+        source !== getUpdateSource() || version !== APP_VERSION) return;
     _updateChecking = false;
     if (!silent) toast('检查更新失败: ' + err, 4000);
     console.warn('[Update] check failed:', err);
@@ -6284,6 +6340,7 @@ function syncUpdateDownloadUI() {
   }
   if (cancel) cancel.classList.toggle('hidden', !busy);
   if (open) open.disabled = busy || _updateApplying;
+  syncUpdateSourceUI();
   setUpdateProgressUI(busy || _updateApplying);
 }
 
@@ -6363,6 +6420,7 @@ function showUpdateModal(info) {
   var modal = document.getElementById('updateModal');
   if (!modal) return;
   _lastUpdateInfo = info;
+  syncUpdateSourceUI();
 
   // 下载/替换进行中时不要重置状态，否则可再次点击下载导致两个任务并发写同一文件
   if (!_updateDownloading && !_updateApplying) {

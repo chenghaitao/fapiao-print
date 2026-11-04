@@ -7,6 +7,11 @@
 var _lastLayoutRequest = null;
 var _lastPdfPath = null;
 
+// 下发前剔除：Rust 结构体不认识、或生成路径不使用的纯前端字段
+var _requestStrip = { copyBadge: 1, enhanceMinDpi: 1 };
+// 仅缓存比较时忽略：只影响打印方式，不影响 PDF 内容
+var _cacheIgnore = { printerName: 1, copies: 1, duplex: 1, collate: 1 };
+
 /**
  * 深度比较两个对象是否相等
  */
@@ -32,9 +37,19 @@ function deepEqual(a, b) {
 /**
  * 检查是否可以使用缓存（比较当前和上次的 LayoutRequest）
  */
+function _cacheComparable(req) {
+  var settings = {};
+  for (var k in req.settings) {
+    if (!(k in _cacheIgnore)) settings[k] = req.settings[k];
+  }
+  var out = {};
+  for (var key in req) out[key] = req[key];
+  out.settings = settings;
+  return out;
+}
 function canUseCachedPdf(currentRequest) {
   if (!_lastLayoutRequest || !_lastPdfPath) return false;
-  return deepEqual(currentRequest, _lastLayoutRequest);
+  return deepEqual(_cacheComparable(currentRequest), _cacheComparable(_lastLayoutRequest));
 }
 
 /**
@@ -180,13 +195,11 @@ function buildLayoutRequest(files, settings, pageRange) {
     pageSpecs.push({ slots: slots });
   }
 
-  // 排除不影响 PDF 内容的参数，避免设置一改就误判缓存失效：
-  //   printerName/copies/duplex/collate 只影响打印方式；copyBadge 为纯预览标记；
-  //   enhanceMinDpi 现仅用于「检查清晰度」的 ⚠ 提示阈值（issue #52），不再筛选要增强的图片
-  var _cacheExclude = { printerName:1, copies:1, duplex:1, collate:1, copyBadge:1, enhanceMinDpi:1 };
+  // 只剔除 Rust 用不到的前端字段；打印方式参数（printerName/copies/duplex/collate）
+  // 照常下发，由 canUseCachedPdf 在比较时忽略，避免打印参数与请求体耦合。
   var layoutSettings = {};
   for (var k in settings) {
-    if (!(k in _cacheExclude)) layoutSettings[k] = settings[k];
+    if (!(k in _requestStrip)) layoutSettings[k] = settings[k];
   }
   // _specKeys 是纯前端字段（与 fileSpecs 同序），供清晰度体检把结果反查回 fileObj。
   // Rust 的 LayoutRenderRequest 不认识它，会被 serde 忽略。
@@ -272,10 +285,19 @@ async function doPrint() {
 
 function showPrintConfirm(files, s) {
   var printerName = s.printerName || '默认打印机';
-  var layout = s.reimburseMode ? ('报销单 ' + (s.reimburseHeight || 120) + 'mm 分段') : (S.layout.rows + '\u00D7' + S.layout.cols);
+  var layout;
+  if (s.photoMode) {
+    var pg = getPhotoGrid(s);
+    layout = '相纸 ' + pg.cols + '\u00D7' + pg.rows + ' \u00B7 单张 ' + s.photoW + '\u00D7' + s.photoH + 'mm';
+  } else if (s.reimburseMode) {
+    layout = '报销单 ' + (s.reimburseHeight || 120) + 'mm 分段';
+  } else {
+    layout = S.layout.rows + '\u00D7' + S.layout.cols;
+  }
   var ps = document.getElementById('paperSize').value;
   var orient = document.getElementById('orientation').value === 'portrait' ? '纵向' : '横向';
-  var paper = ps === 'custom' ? (s.paperW + '\u00D7' + s.paperH + 'mm') : ps.toUpperCase();
+  var paper = ps === 'custom' ? (s.paperW + '\u00D7' + s.paperH + 'mm')
+    : (PAPER[ps] && PAPER[ps].name ? (PAPER[ps].name + ' ' + s.paperW + '\u00D7' + s.paperH + 'mm') : ps.toUpperCase());
   var copies = s.copies || 1;
   var colorMode = document.getElementById('colorMode').value;
   var colorLabel = colorMode === 'color' ? '彩色' : colorMode === 'grayscale' ? '灰度' : '黑白';
@@ -284,14 +306,18 @@ function showPrintConfirm(files, s) {
   var pages = buildPages(files, s);
   var totalPages = pages.length;
 
-  var fitLabel = s.fitMode === 'contain' ? '适应' : s.fitMode === 'cover' ? '填充' : (Math.round(s.customScale * 100) + '%');
+  var fitLabel = s.fitMode === 'fit' ? '自适应' : s.fitMode === 'fill' ? '拉伸填充'
+    : s.fitMode === 'original' ? '原始大小' : (Math.round(s.customScale * 100) + '%');
   var rotLabel = s.globalRotation === 'auto' ? '自动' : s.globalRotation + '\u00B0';
+  var marginInfo = s.photoMode
+    ? ('留边 ' + s.photoMargin + 'mm \u00B7 间距 ' + s.photoGap + 'mm')
+    : (s.marginTop + '/' + s.marginBottom + '/' + s.marginLeft + '/' + s.marginRight + 'mm \u00B7 间距 ' + s.gapH + '/' + s.gapV + 'mm');
 
   var row = function(lbl, val, cls) {
     return '<div class="modal-row compact' + (cls ? ' ' + cls : '') + '"><span class="modal-lbl">' + lbl + '</span><span class="modal-val">' + val + '</span></div>';
   };
 
-  var engineSelect = '<select id="confirmPrintEngine" style="padding:1px 4px;border-radius:4px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px">'
+  var engineSelect = '<select id="confirmPrintEngine" style="padding:1px 4px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--text-primary);font-size:12px">'
     + '<option value="pdfium">PDFium（推荐）</option>'
     + '<option value="sumatra">SumatraPDF（备用）</option>'
     + '</select>';
@@ -300,7 +326,7 @@ function showPrintConfirm(files, s) {
     + row('引擎', engineSelect)
     + row('发票', activeCount + ' 张 \u00D7 ' + copies + ' 份 \u2192 ' + totalPages + ' 页', 'highlight')
     + row('布局', layout + ' \u00B7 ' + paper + orient + ' \u00B7 ' + fitLabel + ' \u00B7 ' + rotLabel)
-    + row('边距', s.marginTop + '/' + s.marginBottom + '/' + s.marginLeft + '/' + s.marginRight + 'mm \u00B7 间距 ' + s.gapH + '/' + s.gapV + 'mm')
+    + row('边距', marginInfo)
     + row('选项', colorLabel + ' \u00B7 ' + (s.duplex ? '双面' : '单面') + ' \u00B7 ' + (s.cutline ? '切割线' : '无切割线'));
 
   document.getElementById('printConfirmBody').innerHTML = html;
@@ -691,6 +717,7 @@ async function doSavePdf(fromPage, toPage) {
       }
     } catch(e) { savePath = null; }
   }
+  if (!savePath) { toast('已取消保存'); return; }
 
   var s = getSettings();
   var currentRequest = buildLayoutRequest(files, s, pageRange);
@@ -810,12 +837,20 @@ function fallbackPrint(files, s) {
       }
     }
     var isReimb = !!s.reimburseMode;
+    var isPhoto = !!s.photoMode;
     var segMm = s.reimburseHeight || 120;
     var segCount = isReimb ? Math.max(1, Math.floor(s.paperH / segMm)) : 0;
-    var effRows = isReimb ? segCount : s.rows;
-    var effCols = isReimb ? 1 : s.cols;
+    // 相纸模式：槽位严格等于证件照实际尺寸、整版居中（与 calculateLayout / Rust 同源）
+    var pg = isPhoto ? getPhotoGrid(s) : null;
+    var photoStartX = pg ? (s.paperW - pg.gridW) / 2 : 0;
+    var photoStartY = pg ? (s.paperH - pg.gridH) / 2 : 0;
+    var effRows = isPhoto ? pg.rows : (isReimb ? segCount : s.rows);
+    var effCols = isPhoto ? pg.cols : (isReimb ? 1 : s.cols);
     var slotW, slotH;
-    if (isReimb) {
+    if (isPhoto) {
+      slotW = pg.w;
+      slotH = pg.h;
+    } else if (isReimb) {
       // 报销单分段：段高固定，mt/mb 为段内安全边距，裁切线在段边界绝对位置
       slotW = s.paperW - ml - mr;
       slotH = Math.max(10, segMm - mt - mb);
@@ -824,7 +859,17 @@ function fallbackPrint(files, s) {
       slotH = (s.paperH - s.rows * (mt + mb) - (s.rows - 1) * s.gapV - fm - sigPx) / s.rows;
     }
     // Draw cut lines (vertical + horizontal) between slots
-    if (isReimb) {
+    if (isPhoto) {
+      // 裁切线画在间距中线，与 calculateLayout photo 分支同口径；沿用全局裁切线开关
+      if (s.cutline) {
+        for (var pc2 = 1; pc2 < pg.cols; pc2++) {
+          html += '<div class="cutline-v" style="left:' + (photoStartX + pc2 * (pg.w + pg.gap) - pg.gap / 2) + 'mm;height:' + s.paperH + 'mm"></div>';
+        }
+        for (var pr2 = 1; pr2 < pg.rows; pr2++) {
+          html += '<div class="cutline-h" style="top:' + (photoStartY + pr2 * (pg.h + pg.gap) - pg.gap / 2) + 'mm"></div>';
+        }
+      }
+    } else if (isReimb) {
       // 段底裁切线：k = 1..segCount，每段底部一条（含最后一段）
       for (var k = 1; k <= segCount; k++) {
         html += '<div class="cutline-h" style="top:' + (k * segMm) + 'mm"></div>';
@@ -845,13 +890,15 @@ function fallbackPrint(files, s) {
     for (var r = 0; r < effRows; r++) for (var c = 0; c < effCols; c++) {
       var f = page[r * effCols + c];
       var x, y;
-      if (isReimb) {
+      if (isPhoto) {
+        x = photoStartX + c * (pg.w + pg.gap); y = photoStartY + r * (pg.h + pg.gap);
+      } else if (isReimb) {
         x = ml; y = r * segMm + mt;
       } else {
         x = ml + c * (slotW + ml + mr + s.gapH); y = mt + r * (slotH + mt + mb + s.gapV);
       }
       if (f && f.previewUrl) {
-        var src = S.feat.trimWhite && f.trimmedUrl ? f.trimmedUrl : f.previewUrl;
+        var src = s.trimWhite && f.trimmedUrl ? f.trimmedUrl : f.previewUrl;
         // Compute effective rotation (same logic as layout.js getRotation)
         var rot = 0;
         var slot = { w: slotW, h: slotH };
@@ -877,9 +924,9 @@ function fallbackPrint(files, s) {
         if (perScale !== 1) transforms += 'scale(' + perScale + ') ';
         if (rot) transforms += 'rotate(' + rot + 'deg) ';
         var transformStyle = transforms ? 'transform:' + transforms + ';' : '';
-        // 报销单模式：左上对齐；「裁剪白边」：垂直贴顶（水平仍居中）
+        // 报销单模式：纵向贴段顶，水平按设置；「裁剪白边」：垂直贴顶（水平仍居中）
         var slotAlignStyle = isReimb
-          ? 'align-items:flex-start;justify-content:flex-start;'
+          ? 'align-items:flex-start;justify-content:' + (s.reimburseAlign === 'center' ? 'center' : (s.reimburseAlign === 'right' ? 'flex-end' : 'flex-start')) + ';'
           : (s.trimWhite ? 'align-items:flex-start;' : '');
         html += '<div class="slot" style="left:' + x + 'mm;top:' + y + 'mm;width:' + slotW + 'mm;height:' + slotH + 'mm;' + slotAlignStyle + '"><img src="' + escHtml(src) + '" style="' + sizeStyle + transformStyle + '"></div>';
       }

@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- **版本**: v2.6.17（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
+- **版本**: v2.7.1-beta.2（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架、无打包）
 - **双版本**: 轻量版 / OCR 版（PP-OCRv6）；Cargo.toml 定义 `ocr` feature，`lib.rs` 按 `#[cfg(feature = "ocr")]` 条件注册命令，OCR 构建用 `tauri.ocr.conf.json` 叠加配置（仅追加 bundle.resources）
 - **目录结构**:
@@ -12,7 +12,7 @@
 | 路径 | 内容 |
 | --- | --- |
 | `src/` | 桌面版前端：`index.html` `styles.css` `ocr.js` `layout.js` `print.js` `app.js` |
-| `src-tauri/src/` | Rust 后端：`main.rs` `lib.rs`（IPC 命令层）`pdf_engine.rs`（PDF 生成/渲染）`pdfium_print.rs`（直打引擎） |
+| `src-tauri/src/` | Rust 后端：`main.rs` `lib.rs`（IPC 命令层）`pdf_engine.rs`（PDF 生成/渲染）`pdfium_print.rs`（直打引擎）`updater.rs`（应用内自更新）`diagnostics.rs`（诊断导出）`seh_wrapper.c`（SEH 保护，cc 静态库） |
 | `src-tauri/invoice-engine/` | 独立 crate：OFD / XML 数电票解析 |
 | `web` 分支 | 纯浏览器版（pdf-lib 实现），目录为 `js/` `css/` `vendor/` |
 
@@ -25,6 +25,7 @@ npm run build           # 轻量版构建
 npm run build:ocr       # OCR 版构建
 npm run build:all       # 全量构建，产物输出到 dist/
 npm run bump <版本号>    # 同步版本号
+npm test                # 前端浏览器回归（Node 22+ / Chrome 或 Edge，不编译 Rust）
 ```
 
 - **编译缓存**: 只改 HTML/JS/CSS 不触发 Rust 重编译；改 Rust 文件才会完整重编译
@@ -58,7 +59,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 关键分层约定：
 
 - **预览与导出必须语义一致**：预览（CSS）与 PDF 生成（Rust/web）对旋转、缩放、偏移、适配的计算公式互为镜像，任何一方改动必须同步另一方（见「旋转与适配语义」）
-- **桌面/web 双分支同步**：字段提取（`ocr.js` ↔ `js/pdf-text.js`）、预览布局（`layout.js` ↔ `js/layout.js`）逻辑一致，识别与排版改动必须双向同步
+- **桌面/web 双分支同步**：字段提取（`ocr.js` ↔ `js/pdf-text.js`）、预览布局（`layout.js` ↔ `js/layout.js`）逻辑一致；日常改动先落桌面端，**桌面端 release 前同步到 web 分支一次，web 端可随该轮一起发新版**，日常修复不必即时同步
 - **坐标体系**: JS 端 top-down（y 向下），PDF 端 bottom-up（y 向上，PDF 标准），各自独立计算，**不做相互转换**
 
 ## 核心机制
@@ -91,9 +92,9 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 | 模式 | 实现 | 说明 |
 | --- | --- | --- |
-| PDF 阅读器（默认） | `ShellExecuteW` print/printto | ⚠️ 无法可靠控制打印机选择（Edge/Chrome 查看器不支持 printto），选了具体打印机时 toast 引导改用 PDFium |
+| PDF 阅读器 | `ShellExecuteW` print/printto | ⚠️ 无法可靠控制打印机选择（Edge/Chrome 查看器不支持 printto），选了具体打印机时 toast 引导改用 PDFium |
 | 弹窗确认 | 自定义对话框 → PDFium/SumatraPDF | — |
-| 静默打印 PDFium（推荐） | `pdfium_print.rs` 矢量直打 DC | 失败自动降级 SumatraPDF（`doPdfiumPrint` 兜底） |
+| 静默打印 PDFium（默认，推荐） | `pdfium_print.rs` 矢量直打 DC | 失败自动降级 SumatraPDF（`doPdfiumPrint` 兜底） |
 | 静默打印 SumatraPDF | 命令行 `-print-settings` | — |
 
 **PDFium 细节**（`pdfium_print.rs`）：
@@ -126,15 +127,19 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - **每页 slot 数一律走 `getPerPage(s)`**（报销单单列分段 vs 网格 cols×rows），禁止直接写 `cols * rows`
 - 页脚边距模型：footerMargin 是纸底额外独立空间，不影响 slot 边距
 
-**报销单分段模式**（`S.feat.reimburse`，默认段高 120mm）：单列 N 段（N=⌊paperH÷seg⌋），mt/mb 为段内安全边距，裁切线在 k×seg 绝对位置强制绘制（不经 cutline 开关）；发票**左上对齐**——JS `renderPage`、Rust `build_nup_content_stream`/`build_page_ops`、`setSlotAlignment` 基准三处同步；rows/cols/gap/footerMargin 扣除均忽略（UI 置灰 `syncReimburseUI()`），关闭后网格布局原样恢复。
+**报销单分段模式**（`S.feat.reimburse`，默认段高 120mm）：单列 N 段（N=⌊paperH÷seg⌋），mt/mb 为段内安全边距，裁切线在 k×seg 绝对位置强制绘制（不经 cutline 开关）；发票**纵向贴段顶、水平对齐可配**（`reimburseAlign`：靠左 / 居中 / 靠右，默认靠左）——JS `renderPage`、Rust `build_nup_content_stream`/`build_page_ops`（统一走 `reimburse_align_offset()`）、`setSlotAlignment` 基准三处同步；rows/cols/gap/footerMargin 扣除均忽略（UI 置灰 `syncReimburseUI()`），关闭后网格布局原样恢复。
 
-**粘贴单模式**（`S.feat.pasteMode`，v2.6.6）：表单式整页版式，票据只排在装订线上方、签字栏下方；**与报销单分段互斥**（开启互关，`enablePasteMode`/`enableReimburse` 同步 UI）。独立边距（`pasteTop/Bottom/Left/Right`，默认上 20.8mm 装订区 / 下·左·右 4.1mm）+ 装订线（`pasteBindLine` 开关 + `pasteBindText` 文字 + `pasteBindSize` 字号）+ 右下角签字栏（`pasteShowSig` + `pasteSigCols` 列名 / `pasteSigWidth` 宽 / `pasteSigRowH` 表头行高 / `pasteSigBodyH` 填写行高 / `pasteSigGap` 区间距），签字栏留空打印后手写；粘贴单下页码/日期/自定义页脚停用（`getPageSettings` 置空）；Rust `calculate_layout_mm` 与 JS 解析规则逐字对应（预览/PDF 同源）；`applyPastePreset()` 一键恢复标准边距，`resetSettings` 的 `layoutOnly` 分支须同步粘贴单 UI。
+**粘贴单模式**（`S.feat.pasteMode`，v2.6.6）：表单式整页版式，票据只排在装订线上方、签字栏下方；**与报销单分段互斥**（开启互关，`enablePasteMode`/`enableReimburse` 同步 UI）。独立边距（`pasteTop/Bottom/Left/Right`，默认上 20.8mm 装订区 / 下·左·右 4.1mm）+ 装订线（`pasteBindLine` 开关 + `pasteBindText` 文字 + `pasteBindSize` 字号）+ 右下角签字栏（`pasteShowSig` + `pasteSigCols` 列名 / `pasteSigWidth` 宽 / `pasteSigRowH` 表头行高 / `pasteSigBodyH` 填写行高 / `pasteSigGap` 区间距），签字栏留空打印后手写；粘贴单下页码/日期/自定义页脚停用（`getSettings()` 中置空）；Rust `calculate_layout_mm` 与 JS 解析规则逐字对应（预览/PDF 同源）；`applyPastePreset()` 一键恢复标准边距，`resetSettings` 的 `layoutOnly` 分支须同步粘贴单 UI。
 
 **单票独立调整**：`fileObj.{slotScale, slotOffsetX, slotOffsetY}`，CSS transform 预览 + Rust `SlotSpec` 参数输出。九宫格快速对齐、数字框/滑块滚轮微调、选中后滚轮缩放单票（5%/步）、拖拽约束按实际显示尺寸动态计算、放大上限 5x、编辑态溢出可见（`.selected/.dragging` 时 `overflow:visible`）。持久化：`perFileAdjustments` Map 按文件名匹配，可选开关。
 
-**选中票面浮动工具条**（v2.6.1，v2.6.8 钳制 + 删除，v2.6.9 按格子归位）：`app.js syncSlotToolbar()` 把 `#slotToolbar` 锚在选中槽位上方 36px 居中（CSS `translateX(-50%)`），随 `previewWrap` 滚动与窗口 resize 重算。⚠️ 四条硬约定：①上方那块位置**一旦与别的格子相交就贴回本格子内侧顶部**（下排格子、报销单第 2 段起、3×3 中下排都命中）——否则工具条骑在裁切线上压住邻格票面，就是 issue #43① 的「跑到框外」；②**水平必须左右钳制**（内侧放置先钳在本格子框内，再统一钳在预览区可视宽度内各留 8px）——否则右列槽位的右半截会跑出预览框；③**先 `classList.remove('hidden')` 再读 `offsetWidth`**，`display:none` 时宽度为 0 会让钳制失效；且**旋转按钮文案要在测量之前刷新**（`旋转` → `90°` 宽约 +12px，否则钳制用过期宽度）。工具条宽于格子时自动加 `.compact`（只留图标）并重测宽度。按钮：重置 / 居中 / 应用到全部 / 旋转 / **✕ 删除**（`deleteSlotInvoice()`，删完清空选中）。
+**选中票面浮动工具条**（v2.6.1，v2.6.8 钳制 + 删除，v2.6.9 按格子归位）：`app.js syncSlotToolbar()` 把 `#slotToolbar` 锚在选中槽位上方 36px 居中（CSS `translateX(-50%)`），随 `previewWrap` 滚动与窗口 resize 重算。⚠️ 六条硬约定：①上方那块位置**一旦与别的格子相交就贴回本格子内侧顶部**（下排格子、报销单第 2 段起、3×3 中下排都命中）——否则工具条骑在裁切线上压住邻格票面，就是 issue #43① 的「跑到框外」；②**水平必须左右钳制**（内侧放置先钳在本格子框内，再统一钳在预览区可视宽度内各留 8px）——否则右列槽位的右半截会跑出预览框；③**先 `classList.remove('hidden')` 再读 `offsetWidth`**，`display:none` 时宽度为 0 会让钳制失效；且**旋转按钮文案要在测量之前刷新**（`旋转` → `90°` 宽约 +12px，否则钳制用过期宽度）。④**「是否收成纯图标（.compact）」必须用「非 compact」的固有宽度判定**：直接读 `offsetWidth` 拿到的是上一档宽度，会在两档之间来回翻转（3×3 中间列卡在 395px、每边压邻格 66px）。⑤**容器 `pointer-events:none`、只有 `.btn` 是 `auto`**：工具条浮在票面上时，空隙不拦鼠标，点票面不会误触按钮；⑥因为容器不接收事件，`previewWrap` 的「点空白取消选中」**不能再靠 `closest('#slotToolbar')`**，要用 `hitSlotToolbar(e)` 按矩形兜底，否则点按钮内边距偏出 2px 就把选中和工具条一起清掉。工具条宽于格子时自动加 `.compact`（只留图标）。按钮：重置 / 居中 / 应用到全部 / **份数**（`#slotCopiesBtn`，图标位显示当前份数 ×N） / 旋转 / **✕ 删除**（`deleteSlotInvoice()`，删完清空选中）。份数按钮是单票份数的**唯一**入口，见下条。
+
+**选中态跟随列表变化**（v2.6.16-beta.10）：浮动工具条指向的「选中槽位」只是一个页内索引，而 `S.files` 的**删除 / 勾选 / 排序 / 列表拖拽**都会让同一槽位换成别的票。凡改变 active 序列的操作统一走 `reflowAfterListChange(keep)`：动手前 `captureSlotSelection()` 记下「文件对象 + 第几份」，改完按对象重定位；选中票已不在排版里就 `selectedSlot = -1`（工具条随之隐藏）。⚠️ 无票时 `updatePreview()` 会提前 return、不会触发 `updateAdjPanel()`，所以 `reflowAfterListChange` 里要额外调一次 `updateAdjPanel()`，否则删光最后一张后工具条仍浮在空预览上。**禁止**只写 `renderFileList(); updatePreview();` 收尾。
 
 **预览滚轮交互**（`previewWrap` wheel 三分支，按优先级）：选中槽位+悬停 → 缩放单票；Ctrl+滚轮 → 缩放整体视图；普通滚轮 → 滚动内容，触顶/触底翻页。`_wheelFlipTs` 150ms 节流。
+
+**单票份数设置**（issue #59 / #60）：只从浮动工具条的「份数」按钮进入（`toggleSlotCopyMenu()` → `openSlotCopyMenu()`，×1 / ×2 / ×3 / 自定义…）。份数变动会重排展开序列，改前 `captureSlotSelection()` 记「文件对象 + 第几份」，改后按它重定位选中，**不能沿用原槽位编号**（会操作到别的票）。⚠️ **不要恢复「双击票面设份数」**：第一次点击就 `updatePreview()` 重建预览 DOM，第二次点击的 `click/dblclick` 目标已 detach，实测 `e.detail` 恒为 1、原生 `dblclick` 不派发，只能靠「500ms / 12px」自判，慢速双击（>500ms）必失效；而且工具条宽于格子时按上方硬约定①贴回本格内侧顶部，实际压住票面上部约 33px，双击靠上位置会直接落到工具条按钮上。issue #60 用户明确要求只保留工具条入口，代码里 `_lastSlotDown` / `_slotCopyMenuClickGuard` 已随之删除，勿再引入。预览空白处双击仍是「重置视图缩放」（`previewWrap` 的 dblclick），槽位内双击不做任何事。
 
 **版面拖拽排序**（v2.5.0+，与单票偏移拖拽共用 `_slotDrag` 状态机 `mode:'move'`）：
 
@@ -159,11 +164,13 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **PDF 渲染双引擎**：首选 WinRT（`render_pdf_pages`，`check_winrt_pdf_available()` 启动检测）→ 失败回退 PDFium（`render_pdf_pages_pdfium`）。
 
-**筛选体系**（侧边栏，可折叠）：类型（专票/普票/车票/通行费/医疗/非税/其他 `S.typeFilter`）× 格式（PDF/OFD/图片/XML `S.formatFilter`）× 状态（全部/未打印/已打印/重复 `S.printedFilter`/`S.fileFilter`）三维正交；类型匹配与票种 chip 共用 `resolveInvoiceType` 单一真源（车票/通行费/医疗直判 `_isTicket`/`_isToll`/`_isMedical` 分类标记），「其他」= 不渲染票种 chip 的文件（未识别 + 无法归专普的粗粒度串），非税/专票/普票对 XML/OFD/PDF 文字层等非 OCR 来源同样生效；类型/格式切换即切换打印批次，`clearInvisibleChecks()` 清除不可见勾选（防筛选切换后残留勾选重复打印）。列表上方工具栏（`.file-header`）与筛选区（`.filter-section`）sticky 钉在滚动容器顶部，仅列表滚动。
+**筛选体系**（侧边栏，可折叠）：类型（专票/普票/车票/通行费/医疗/非税/其他 `S.typeFilter`）× 格式（PDF/OFD/图片/XML `S.formatFilter`）× 状态（全部/未打印/已打印/重复 `S.printedFilter`/`S.fileFilter`）三维正交；类型匹配与票种 chip 共用 `resolveInvoiceType` 单一真源（车票/通行费/医疗直判 `_isTicket`/`_isToll`/`_isMedical` 分类标记），「其他」= 不渲染票种 chip 的文件（未识别 + 无法归专普的粗粒度串），非税/专票/普票对 XML/OFD/PDF 文字层等非 OCR 来源同样生效；类型/格式切换即切换打印批次，`selectFilteredOnly()` / `applyFilterSelection()` 清除不可见勾选（防筛选切换后残留勾选重复打印）。列表上方工具栏（`.file-header`）与筛选区（`.filter-section`）sticky 钉在滚动容器顶部，仅列表滚动。
 
 **文件列表双视图**：`S.fileView`（list/grid），`renderFileList()` grid 分支输出 `.file-card`；`updateFileItem()` 按视图增量更新。
 
 **份数概念区分**（易混淆）：「排版份数」= 每张发票在版面中重复几次（`fileObj.copies`，列表 ② 按钮批量设 ×1/×2/×3，`getActiveFiles()` 展开）；「打印份数」= 整版打印几份（全局 copies，SumatraPDF 经 `-print-settings Nx` 处理，不展开）。
+
+**份数变动后的选中态**：修改前经 `captureSlotSelection()` 记住文件对象与副本序号，修改后统一 `refreshAfterCopiesChange()` 恢复到该票仍存在的副本（原序号越界则取末份）。槽位号会随份数变化，禁止直接沿用旧页码/槽位号；排版菜单、右键、批量与发票弹窗四个入口共用。
 
 **打印状态追踪**：四种模式成功后 `markFilesAsPrinted()` → ✓ 标识；`_printedMap` 持久化 localStorage；`clearAll()/executeRename()/resetSettings()` 迁移 key。
 
@@ -195,7 +202,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 **项目名称 / 发票备注提取**（v2.6.17，best-effort）：**两路互补**——项目名称**坐标优先**、备注**文字优先**，缺失再互相补空（原因：项目名称有严格列边界，坐标能剔除「规格型号」列 / 合并换行续行；备注是大区域无列边界，文字正则更稳）。
 - **项目名称 · 坐标路**（`_extractItemNameRemarkByCoords()`）：需同时找到「项目名称」表头与右侧列边界（规格型号/单位/数量/单价表头左缘），否则交文字路。取左缘落在品名列内的词（`分类列` 右缘越界的词裁掉尾部型号串，如 `…便携式气KP826` → `…便携式气`）；按行高 ×0.6 分行；**数电票明细以 `*` 开头，不以 `*` 开头的行是上一行品名的换行续行，直接并回上一条**；行文本命中共 `合计`/表头等结构性词（`_isStructuralItemRow()`，含被拆成「合」「计」两词的合计标签）直接丢弃。
 - **项目名称 · 文字路**（`_extractByText` 内）：兜底用——`*类别*品名` 星号模式全局收集（星号段后裁到下一个表头关键词），再退到「项目名称」标签后换行内容。
-- **备注 · 文字路**：取「备注」标签之后、截到页脚（开票人/收款人/复核人）之前，`_cleanRemark()` 清洗；**坐标路**：取左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上区域。
+- **备注 · 文字路**：取「备注」标签之后、截到页脚（开票人/收款人/复核人）之前，`_cleanRemark()` 清洗；**坐标路**：取左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上区域。`_getRemarkTop()` 按完整合计行底边确定上界（包含标签基线下方的大写/数字金额），与公司名备注区排除逻辑共用；不能仅按标签底边或固定页面高度截取；合计行只有标签一个词时兜底为标签底边（不能返回 -1）。`_findRemarkLabel()` 的竖排「备/注」合成容差为 4.5 行——不同模板间距从 1.9 行到 3.4 行不等，卡得太紧会整段备注取不到。
 - **多条项目名称用「、」去重合并**（`_joinItems()`，总长上限 `ITEM_NAME_MAX=120`，按整条边界截断）；**备注多行合并为一行**（空格分隔，上限 200 字）。`_cleanItemName()` 把数电票的 `*类别*品名` 还原成 **`【类别】品名`**（分类保留、不与品名连成一片），单条上限 80 字。
 - **结构化路径（OFD / XML 数电票）**（`invoice-engine`）：XML 直接取 `IssuItemInformation/ItemName`（多条合并）+ `<Remark>`（多个标签合并）。**XML 没有备注就留空**——`BuyerBankName/BuyerBankAccNum/SellerBankName/SellerBankAccNum` 是独立银行字段，**不属于备注，禁止拼接成备注**（曾误用其「还原」，已撤销：同票 XML 里 `Remark/备注/Note` 出现 0 次，而 OFD 的 `<Note>` 才有该内容，两者本就不一致）。OFD **两级**：①首选 `CustomTag.xml` 语义标签（`<Item>` / `<Note>` 直接指向文字对象 ID，税局标准 OFD 均带，最精准；该文件缺失时再读 `CustomTags.xml` 兜底，后者多数只是索引、解析为空即无副作用）；**`<Item>` 必须按组解析**（`parse_custom_tag_item_groups()`）——生成器会把长品名拆成多个文字对象（如「*生产生活服务*技术服务」+「费」），同组各段按序拼接成一条明细，逐段当独立明细会把 3 条拆成 5 条；②无 CustomTag 时才退到坐标推断——`extract_ofd_item_name()` 按「项目名称」列边界取（**不做全局星号扫描**）：用「项目名称」表头 + 同排右侧最近表头的左缘（再往里收 `OFD_COL_MARGIN=2mm`，避免收进邻列数值）定出品名列，只取列内、表头下方的文字对象，`*` 开头为新条目、否则为换行续行并回上一条；下界取「合计/价税合计/备注」锚点。坐标统一走 `ofd_page_pos()` = Boundary 原点 + CTM 作用于 TextCode 的 X/Y（无 CTM 时即 Boundary + X/Y），**模板层与数电票数据层（Boundary 覆盖整页、X/Y 为页面绝对坐标）因此可跨层比较**。备注坐标路 `extract_ofd_remark()`：左下角「备注」标签（支持竖排拆字 备/注）右侧、页脚行之上的文字，上界由「价税合计/大写/小写」行推出（标签常在框内垂直居中），并剔除与落款标签同行的落款值；CustomTag 的 `<Note>` 里形如「复核人:…」的独立落款行同样剔除。两侧共用 Rust 清洗 `normalize_item_name()`（`*类别*品名` → `【类别】品名`）/ `join_item_names()`（「、」去重合并、上限 120）/ `normalize_remark()`，与 JS 侧口径一致；前端 OFD/XML 加载路径直接把 `info.itemName` / `info.remark` 写进 fileObj。
 - **版式不固定，取不到就留空、绝不猜测**，故两字段仅作参考；在发票弹窗、汇总表内可人工修正，并已加入批量重命名可选字段。**覆盖 图片 OCR / PDF 文字层 / OFD / XML 数电票**（车票、非税票分支不调用）。
@@ -206,13 +213,13 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **CJK 拆字兜底**（dzcp/iloveofd 格式）：信用代码全文拼接匹配 18 位；正则支持字母夹数字 + 15/18 位校验；名称括号保留；「年/MM/月/DD/日」序列合并；`_cleanName` 清理日期碎片。
 
-**PDF 文字层提取**：`extract_pdf_text(s)` 解析 lopdf content stream（批量版一次打开 + rayon 并行，按 pdfPath 分组调用，失败回退单页→OCR）；前端 `applyPdfTextResult()` 复用 `extractByCoordinates()`。坑：Form XObject 需展开、GBK-EUC-H 需 `encoding_rs::GBK.decode()`、`Content::encode()` 尾部无换行、内容流顺序≠视觉顺序（金额取最大 ¥）。
+**PDF 文字层提取**：`extract_pdf_text(s)` 解析 lopdf content stream（批量版一次打开 + rayon 并行，按 pdfPath 分组调用，失败回退单页→OCR）；前端 `applyPdfTextResult()` 复用 `extractByCoordinates()`。`expand_pdf_text_content()` 在 `Do` 原位置递归展开 Form，保留父 CTM / Form Matrix / 重复调用，以作用域重命名字体并读取页面树继承 Resources；未调用的 Form 不提取，循环引用返回错误。`concat_pdf_matrix()` 使用列向量 CTM×M，文字包围盒的四角同样经过 CTM×Tm（字号取 Tf，不能用 Tm.d 替代）。坑：GBK-EUC-H 需 `encoding_rs::GBK.decode()`、`Content::encode()` 尾部无换行、内容流顺序≠视觉顺序（金额取最大 ¥）。
 
 **XML 数电票**（`invoice-engine::parse_xml_invoice`）：纯结构化数据无版式，`fileObj._xmlInvoice=true`，不参与排版打印（`getActiveFiles()` 过滤）；用于列表展示/统计/汇总/重命名。
 
 ### 导出与工具命令
 
-**汇总表**（侧边栏 📊）：14 字段按需勾选、双击编辑回写全 UI 同步、三金额合计行 sticky；`exportSummaryCsv()` UTF-8 BOM + CRLF 手写 CSV → `write_text_file`；数据源 `getCheckedFiles()`（不含 copies 展开）。「发票类型」单一真源 `resolveInvoiceType(f)`（分类标记 通行费/车票/非税 → 结构化或 OCR 类型 → 兜底「发票」），`normalizeInvoiceType()` 归一为「专票 / 普票」短标签，列表徽章 / 复制发票信息 / 重命名 / CSV 共用同一口径；**禁止再写死「增值税发票」**（issue #35：普票全被显示成该串）。内嵌批量重命名面板：3 预设模板 + 自定义字段（勾选顺序=文件名顺序）、`resolveNameConflicts()` 自动 `_2` 序号、`executeRename()` → `rename_file` 命令并同步 `S.files` 共享路径与 `_fileAdjMap`/`_notesMap` key；OFD 的 dedup key 排除 `_filePath`。⚠️ **长数字必须按文本导出**：≥15 位纯数字（20 位发票号、18 位税号）用 Excel 文本公式 `="..."` 包裹，否则 Excel/WPS 打开会转科学计数法并丢精度（issue #49）。
+**汇总表**（侧边栏 📊）：16 字段按需勾选（含项目名称 / 发票备注）、双击编辑回写全 UI 同步、三金额合计行 sticky；`exportSummaryCsv()` UTF-8 BOM + CRLF 手写 CSV → `write_text_file`；数据源 `getCheckedFiles()`（不含 copies 展开）。「发票类型」单一真源 `resolveInvoiceType(f)`（分类标记 通行费/车票/非税 → 结构化或 OCR 类型 → 兜底「发票」），`normalizeInvoiceType()` 归一为「专票 / 普票」短标签，列表徽章 / 复制发票信息 / 重命名 / CSV 共用同一口径；**禁止再写死「增值税发票」**（issue #35：普票全被显示成该串）。内嵌批量重命名面板：3 预设模板 + 自定义字段（勾选顺序=文件名顺序）、`resolveNameConflicts()` 自动 `_2` 序号、`executeRename()` → `rename_file` 命令并同步 `S.files` 共享路径与 `_fileAdjMap`/`_notesMap` key；OFD 的 dedup key 排除 `_filePath`。⚠️ **长数字必须按文本导出**：≥15 位纯数字（20 位发票号、18 位税号）用 Excel 文本公式 `="..."` 包裹，否则 Excel/WPS 打开会转科学计数法并丢精度（issue #49）。
 
 **文件命令**（均为 `async fn` + `spawn_blocking`）：`copy_file`、`rename_file`（同盘原子 rename，跨盘 copy+delete）。
 
@@ -222,11 +229,19 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **设置持久化**：`saveSettings()`/`loadSettings()` — `ticketchan-settings` JSON，覆盖排版/纸张/边距/缩放/旋转/水印/页脚/筛选/视图等；`updatePreview()` 500ms 防抖自动保存；恢复默认清空全部。⚠️ **var 提升坑**：被 `loadSettings()` 恢复的 JS 变量的 `var x = 默认值` 声明必须在调用点之前（声明提升、赋值不提升，曾致 issue #7）。
 
-**导出 / 导入配置**（`exportSettings()`/`importSettings()`，issue #50）：数据同源——`collectSettings()`（saveSettings 的收集逻辑抽出共用）+ 独立存储的偏好键（theme/amtMode/ocrEnabled/pdfTextEnabled/ocrPrecision/saveDir）；导出经原生「另存为」写 JSON（含 `_meta` 头）；导入校验 `_meta.app`（或 layout+feat）→ 写回同名 localStorage 键 → **`location.reload()` 重载生效**（不重载会被下次自动保存覆盖回去），Rust 侧 `read_text_file` 与之配套。
+**纸张规格与单位**（v2.6.16，issue #55）：`PAPER` 在标准纸张外新增证件照与 5寸/6寸相纸预设（`name`/`usage`/`pxW`/`pxH`），下拉选项由 `renderPaperOptions()` 按 `paperUnit`（mm/px）动态生成，`paperSize` 的 value 保持稳定（A4 / photo1 / photoPaper6 / custom …）；自定义尺寸一律经 `getCustomPaperMm()` 换算成 mm 再进 `getSettings()`（px 按 300DPI，与 PDF 渲染一致），禁止各处自行解析 `customW/customH`。调用顺序：`renderPaperOptions()` 必须先于 `loadSettings()` 里恢复 `paperSize`（否则 restore 到不存在的 option 会静默回落 A4）。证件照预设选中时 `onPaperChange()` 自动切纵向。改动需同步 web 分支同套实现。
 
-**更新检查**：`check_for_updates`（reqwest 调 GitHub Releases API，主源 `api.github.com` 失败回退 `gh-proxy.com`）；启动 5 秒后静默检查（1 小时缓存 `ticketchan-update-cache` 防速率限制），状态栏版本号/关于面板可手动触发；更新弹窗 `#updateModal`。**忽略体系**（v2.6.0）：`shouldAutoShowUpdate()` 只拦静默弹窗——`ticketchan-update-ignore`（忽略此版本，弹窗按钮）+ `ticketchan-update-ignore-all`（忽略所有，弹窗按钮 + 设置→关于「自动检查更新」开关 `toggleAutoUpdateCheck`，`showApp` 里 `syncAutoUpdateCheckUI()` 同步）；手动检查不受忽略影响。未用 Tauri Updater（4 产物 + 无签名证书，引导用户去 Release 自选）。Release Notes 由 CI 从 CHANGELOG.md 提取 `## v<tag>` 段落写入 `release_body.txt`。
+**相纸模式**（v2.6.16，issue #55）：与报销单 / 粘贴单并列的第三种版式模式（`S.feat.photoMode`，互斥）。`getPhotoGrid(settings)` 按证件照实际尺寸求每页列/行：自动铺满用「留边」算容量；手动列/行只受纸张物理尺寸约束（留边可被压缩，栅格仍居中），超出物理容量时收敛。默认间距 2mm、留边 3mm（对齐常见排版工具：6寸一寸自动 12 张、5寸一寸自动 9 张）；「常用张数」按钮（4/6/8/9/12/16）由 `findPhotoCountGrid()` 选能放下的最接近纸张比例的列×行，放不下则禁用。证件照规格下拉由 `renderPhotoSizeOptions()` 从 `PAPER_PHOTO_SIZES` 生成，每项括号内标注常用场景；`photoCard`（身份证实际卡片尺寸 85.6×54mm，issue #57）仅用于相纸模式、不进纸张规格；该函数须先于 `loadSettings()` 恢复 `photoSize` 调用，否则保存的规格会回落一寸。`calculateLayout` 的 photo 分支让槽位严格等于 `photoW × photoH`，整版居中，普通行列/边距/间距/页脚全部忽略；`getPerPage` 返回栅格容量；Rust `calculate_layout_mm` / `slot_size_mm` 的 photo 分支必须逐字镜像。`getSettings()` 在 photoMode 下强制 `trimWhite/watermark/pageNum/printDate/footerText=false`（这些会挤占版心或污染照片），裁切线沿用全局 `cutline` 开关（issue #57，预览 `calculateLayout` / Rust / HTML 兜底三处同口径）；`togglePhotoMode()` 开启时固定自适应适配与 0° 旋转，并与报销单/粘贴单互斥。`syncPhotoModeUI()` 负责选项显隐、被接管控件置灰（grid/margin/gap）、排列提示与常用张数按钮重绘；`syncReimburseUI()` 同时考虑 photoMode 的置灰（marginSec 仅相纸模式置灰，报销单仍需边距）。web 分支无报销单/粘贴单，但相纸模式与栅格逻辑完全同步（`js/layout.js` + `js/print.js` 的缓存键）。
+
+**导出 / 导入配置**（`exportSettings()`/`importSettings()`，issue #50）：数据同源——`collectSettings()`（saveSettings 的收集逻辑抽出共用）+ 独立存储的偏好键（theme/amtMode/ocrEnabled/pdfTextEnabled/ocrPrecision/saveDir/updateChannel）；导出经原生「另存为」写 JSON（含 `_meta` 头）；导入校验 `_meta.app`（或 layout+feat）→ 写回同名 localStorage 键 → **`location.reload()` 重载生效**（不重载会被下次自动保存覆盖回去），Rust 侧 `read_text_file` 与之配套。
+
+**更新检查**：`check_for_updates(channel)`（ureq 调 GitHub Releases API，主源 `api.github.com` 失败回退 `gh-proxy.com`）；**双更新渠道**（v2.6.16-beta.6，issue #58）——渠道可在设置→关于手动选择（`ticketchan-update-channel`，未选择时按安装版本：版本号含 `-` 即测试版；导出 / 导入包含该项，切换即清 `ticketchan-update-cache`）。**正式渠道**只查 `/releases/latest`（GitHub 该接口天然排除预发布，不会收到 beta）；**测试渠道**查 `/releases?per_page=20` 并按 semver 取「高于当前版本的最大项」（能收到新 beta，也能在同版本转正后提示正式版，但绝不会把旧正式版 2.6.14 当成新版本）。`compare_versions()` 支持预发布语义（`2.6.16-beta.3 < 2.6.16` 且 `> 2.6.14`），**禁止**退回纯数字分段比较（曾把 `2.6.16-beta.2` 解析成 `2.6.2`）。启动 5 秒后静默检查（1 小时缓存 `ticketchan-update-cache` 防速率限制，缓存按 `ver + channel` 校验），状态栏版本号/关于面板可手动触发；更新弹窗 `#updateModal` 展示渠道徽章（`is_prerelease`）、Markdown 更新说明（前端 `renderReleaseNotes()`）、与当前安装类型（`hasOcr`）匹配的推荐产物（`getAssetVariant()`）。**忽略体系**（v2.6.0）：`shouldAutoShowUpdate()` 只拦静默弹窗——`ticketchan-update-ignore`（忽略此版本，弹窗按钮）+ `ticketchan-update-ignore-all`（忽略所有，弹窗按钮 + 设置→关于「自动检查更新」开关 `toggleAutoUpdateCheck`，`showApp` 里 `syncAutoUpdateCheckUI()` 同步）；手动检查不受忽略影响。未用 Tauri Updater（4 产物 + 无签名证书，引导用户去 Release 自选）。Release Notes 由 CI 从 CHANGELOG.md 提取 `## v<tag>` 段落写入 `release_body.txt`。
+
+**应用内自更新**（v2.7.0，`updater.rs`，issue #58）：更新弹窗「⬇️ 下载并更新」→ 下载 → 校验 → 替换 exe → 自动重启，不跑 NSIS 安装器。流程：`download_update(url, sha256, size, is_zip)` 下载到 exe 同目录 `ticketchan.part`（边下边算 sha256、emit `update-download-progress`），通过后落地 `ticketchan.update`；`apply_update_and_restart()` 隐藏窗口 → 当前 exe 改名 `ticketchan.old.exe` → `.update` 改回原名 → spawn 新 exe → 300ms 后 `TerminateProcess`；`check_pending_update()` 启动时清理 `.part`/`.tmp`/`.old`，若有 `.update` 则补偿应用（失败即删除，**绝不重启循环**）。硬约束：①**只换 exe**，OCR 模型不动（`<exe_dir>/models` 原样保留）——轻量版取 `*_portable.exe`，OCR 版取 `*_ocr-portable.zip` 内层 exe，安装包（NSIS）不可当主程序；②URL 必须命中白名单（GitHub Release / `objects.githubusercontent.com` / gh-proxy），sha256 取 GitHub API 的 `digest`（历史资产缺失则该按钮隐藏、回退浏览器），另校验 size 与 PE 头；API 走 gh-proxy 兜底时资产下载 URL 同步改写为 gh-proxy 形式，否则客户端仍会直连 github.com 而失败；③任一步失败必须回滚旧 exe 并保留 `.update`；④退出必须 `TerminateProcess`。`UpdateAsset` 的 `digest` 字段由 `parse_release()` 读取。
 
 ## 前端模块
+
+**更新渠道并发约束**：`_updateRequestId` 为每次检查与渠道切换递增；响应和错误均校验请求序号、渠道与安装版本。旧请求不得写缓存、显示弹窗或释放新请求锁；缓存同时校验外层渠道与 `info.channel`。
 
 | 文件 | 职责 |
 | --- | --- |
@@ -252,8 +267,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - PDFium 非线程安全 → `with_pdfium()` 闭包 + Mutex 串行化
 - `DEVMODEW` 嵌套匿名结构 `dm.Anonymous1.Anonymous1.dmCopies`；`dmDuplex` 是 `DEVMODE_DUPLEX(i16)`；`std::ptr::read` 只复制 `sizeof(DEVMODEW)` 会丢驱动私有数据 → 完整 `Vec<u8>`
 - `DOCINFOW`/`StartDocW`/`StartPage`/`EndPage` 在 `Win32::Storage::Xps` 模块（不是 Gdi）
-- `windows` crate 0.58：`HENHMETAFILE` 是 CopyType，`DeleteEnhMetaFile(h)` 不需要 `&`
-- `CreateEnhMetaFileW` 的 `lpRect` 是 0.01mm 单位（直打 DC 时无需 EMF 中间层）
+- （历史经验）`windows` crate 0.58：`HENHMETAFILE` 是 CopyType，`DeleteEnhMetaFile(h)` 不需要 `&`；`CreateEnhMetaFileW` 的 `lpRect` 是 0.01mm 单位。当前实现已移除 EMF 中间层，直接 `FPDF_RenderPage(printer_dc)`
 
 ### OFD
 
@@ -282,7 +296,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 改动前自查，违反即引入 bug：
 
 1. 每页 slot 数一律 `getPerPage(s)`，禁止 `cols * rows`（所有分页计算点）
-2. 旋转适配改动必须同步：预览 renderPage / 拖拽约束 / setSlotAlignment / Rust 矩阵 / web 分支，共五处
+2. 旋转适配改动必须同步：预览 renderPage / 拖拽约束 / setSlotAlignment / Rust 矩阵（web 分支在桌面端 release 前同步）
 3. CPU 密集 IPC 命令必须 `async fn` + `spawn_blocking`
 4. 顶层变量用 `var`；被 `loadSettings()` 恢复的变量声明必须在调用点之前
 5. `defaultQuickLayouts()` 取深拷贝；空列表按 `Array.isArray` 恢复；不迁移旧默认布局
@@ -290,8 +304,9 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 7. 自动去重只删 `no:` key，`sum:` 仅标记
 8. 类型/格式筛选切换后必须重算勾选集合（`selectFilteredOnly()` / `applyFilterSelection()`）
 9. `deepEqual` 缓存比较排除纯打印机参数（printerName/copies/duplex/collate）
-10. 桌面/web 双分支：识别（ocr.js ↔ js/pdf-text.js）与预览布局（layout.js ↔ js/layout.js）改动双向同步
+10. 桌面/web 双分支：识别（ocr.js ↔ js/pdf-text.js）与预览布局（layout.js ↔ js/layout.js）逻辑保持一致，同步时机为 **桌面端 release 前**，日常修复不必即时同步
 11. 新增 http 请求一律走 `build_http_agent()`；裸建 `ureq::AgentBuilder` 会丢 TLS 后端（见「关键踩坑」）
+12. 自更新只换 exe（不跑安装器、不动 models）；下载必须过 URL 白名单 + digest/size 校验，替换失败必须回滚，退出用 `TerminateProcess`（见「应用内自更新」）
 
 ## Git 工作流
 
@@ -304,7 +319,10 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 - 简洁直接，对 Bug 极度敏感，全面修复原则
 - **Issue 回复只说人话**：结论 + 让用户做什么（下载哪个文件、看哪几处、回报什么），不写规范条款、推导过程与术语细节——太复杂没人看；技术细节留在代码注释、CHANGELOG 与本文件里
 - 不要主动编译（耗时），等明确指令
+- **永远不要等待编译或 CI 构建完成**：不跑 `gh run watch`、不 sleep 轮询构建状态。提交 / 打 tag 后直接继续其他工作，构建结果由用户或后续即时查询确认
 - 分析任务绝对不可修改代码，必须先确认方案
+- **界面做减法**：删掉多余的标语、说明文字和次要标签。如果删完界面就看不懂，说明布局本身有问题，直接重新设计。
+- **三方受益**：每次修改都要兼顾用户体验、开发体验和 AI Agent 的使用体验，三者都要变好，且不得破坏现有功能。
 
 ## Release 检查清单
 
@@ -313,4 +331,5 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 1. **README.md**：功能描述、技术栈版本与当前版本一致
 2. **CHANGELOG.md**：新版本更新日志（新功能/修复/优化/依赖变更）
 3. **AGENTS.md**：版本号、架构要点（如有变更）
-4. **其他文档**：新增配置/命令/架构变更同步更新
+4. **web 分支**：把桌面端自上次同步以来的识别 / 布局改动同步到 `web`，web 端可随该轮一起发新版
+5. **其他文档**：新增配置/命令/架构变更同步更新

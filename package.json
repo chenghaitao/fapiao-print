@@ -1,8 +1,9 @@
 {
   "name": "ticketchan",
-  "version": "2.6.17",
+  "version": "2.7.1-beta.2",
   "description": "发票酱 - Tauri 桌面应用",
   "scripts": {
+    "test": "node scripts/test-regressions.js",
     "dev": "tauri dev",
     "dev:ocr": "tauri dev --features ocr",
     "build": "tauri build",

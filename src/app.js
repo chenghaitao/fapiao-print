@@ -7,13 +7,32 @@
 var isTauri = window.__TAURI_INTERNALS__ !== undefined;
 var invoke  = isTauri ? window.__TAURI_INTERNALS__.invoke : null;
 var hasOcr  = false; // Set to true at startup if OCR feature is available
+var _ocrBuildFeature = null; // Rust get_config 的编译期 OCR 标识，自更新选产物时优先使用
 var APP_VERSION = ''; // Filled at startup from Rust get_app_version()
 var _winrtPdfAvailable = true; // Set to false at startup if WinRT PDF component is missing
 
 // =====================================================
 // Constants
 // =====================================================
-var PAPER = { A4:{w:210,h:297}, A5:{w:148,h:210}, B5:{w:176,h:250}, letter:{w:216,h:279}, legal:{w:216,h:356} };
+// 纸张规格：w/h 为 mm；证件照另带常用像素尺寸（pxW/pxH，证件照按 300DPI，身份证照按 350DPI）
+var PAPER = {
+  A4:{w:210,h:297}, A5:{w:148,h:210}, B5:{w:176,h:250}, letter:{w:216,h:279}, legal:{w:216,h:356},
+  photoPaper5:{w:89,h:127,name:'5寸相纸',usage:'3R，证件照拼版常用'},
+  photoPaper6:{w:102,h:152,name:'6寸相纸',usage:'4R，证件照拼版常用'},
+  photoSmall1:{w:22,h:32,name:'小一寸',usage:'驾驶证、部分准考证',pxW:260,pxH:378},
+  photo1:{w:25,h:35,name:'一寸',usage:'简历、学籍、体检表、教资',pxW:295,pxH:413},
+  photoBig1:{w:33,h:48,name:'大一寸',usage:'护照、港澳台通行证',pxW:390,pxH:567},
+  photoSmall2:{w:35,h:45,name:'小二寸',usage:'签证、公考、资格审核',pxW:413,pxH:531},
+  photo2:{w:35,h:49,name:'二寸',usage:'毕业证、职称、考试报名',pxW:413,pxH:579},
+  photoId:{w:26,h:32,name:'身份证照片/社保卡',usage:'白底有回执，350DPI',pxW:358,pxH:441},
+  // 身份证/银行卡实际卡片尺寸（85.6×54mm），只用于相纸模式的照片规格，不进纸张规格
+  photoCard:{w:85.6,h:54,name:'身份证',usage:'实际卡片尺寸，可拼 A4 打印'}
+};
+var PAPER_STANDARD = ['A4','A5','B5','letter','legal'];
+var PAPER_STANDARD_NAMES = { A4:'A4', A5:'A5', B5:'B5', letter:'Letter', legal:'Legal' };
+var PAPER_PHOTO_PAPER = ['photoPaper5','photoPaper6'];
+var PAPER_PHOTO = ['photoSmall1','photo1','photoBig1','photoSmall2','photo2','photoId'];
+var PAPER_PHOTO_SIZES = PAPER_PHOTO.concat(['photoCard']);
 var MM2PX = 96 / 25.4;
 var PDF_RENDER_DPI = 300;  // Print/save DPI — Must match Rust RENDER_DPI
 var PDF_PREVIEW_DPI = 150;  // Preview DPI — faster loading, lower resolution
@@ -83,7 +102,8 @@ var S = {
     autoDedup: false,
     autoEnhance: false,
     compatFlat: false,
-    pasteMode: false, pasteBindLine: true, pasteShowSig: true
+    pasteMode: false, pasteBindLine: true, pasteShowSig: true,
+    photoMode: false
   }
 };
 
@@ -336,7 +356,7 @@ async function downloadSumatraPdf() {
     if (body) body.innerHTML = '<div style="text-align:center;padding:16px 0">' +
       '<div class="spinner" style="width:40px;height:40px;border-width:3px;margin:0 auto 12px"></div>' +
       '<div style="font-size:14px;color:var(--text-secondary);margin-bottom:10px">正在下载 SumatraPDF，请稍候...</div>' +
-      '<div style="width:100%;height:14px;background:var(--bg-secondary);border-radius:7px;overflow:hidden">' +
+      '<div style="width:100%;height:14px;background:var(--border);border-radius:7px;overflow:hidden">' +
         '<div id="sumatraDownloadProgress" style="height:100%;width:0%;background:var(--accent);border-radius:7px;transition:width 0.2s"></div>' +
       '</div>' +
       '<div id="sumatraDownloadPercent" style="font-size:13px;color:var(--text-muted);margin-top:6px">0%</div>' +
@@ -412,7 +432,7 @@ function showSumatraDownloadError(errMsg) {
 
 function switchToPdfMode() {
   document.getElementById('printMode').value = 'pdf';
-  try { localStorage.setItem('ticketchan-print-mode', 'pdf'); } catch(e) {}
+  saveSettings();
   var modal1 = document.getElementById('sumatraPdfModal');
   if (modal1) modal1.classList.add('hidden');
   var modal2 = document.getElementById('pdfiumModal');
@@ -457,7 +477,7 @@ async function downloadPdfiumDll() {
     if (body) body.innerHTML = '<div style="text-align:center;padding:16px 0">' +
       '<div class="spinner" style="width:40px;height:40px;border-width:3px;margin:0 auto 12px"></div>' +
       '<div style="font-size:14px;color:var(--text-secondary);margin-bottom:10px">正在下载 pdfium.dll，请稍候...</div>' +
-      '<div style="width:100%;height:14px;background:var(--bg-secondary);border-radius:7px;overflow:hidden">' +
+      '<div style="width:100%;height:14px;background:var(--border);border-radius:7px;overflow:hidden">' +
         '<div id="pdfiumDownloadProgress" style="height:100%;width:0%;background:var(--accent);border-radius:7px;transition:width 0.2s"></div>' +
       '</div>' +
       '<div id="pdfiumDownloadPercent" style="font-size:13px;color:var(--text-muted);margin-top:6px">0%</div>' +
@@ -905,57 +925,59 @@ async function processFileDataList(fileDataList, batchInfo) {
   }, updateIntervalMs);
 
   var lastToastUpdate = 0;
-  for (var fdIdx = 0; fdIdx < fileDataList.length; fdIdx++) {
-    var r = await loadPromises[fdIdx];
-    completed++;
+  try {
+    for (var fdIdx = 0; fdIdx < fileDataList.length; fdIdx++) {
+      var r = await loadPromises[fdIdx];
+      completed++;
 
-    var fd = fileDataList[fdIdx];
-    var phIdx = -1;
-    for (var i = 0; i < S.files.length; i++) {
-      if (S.files[i]._placeholderKey === fd._phKey) { phIdx = i; break; }
-    }
+      var fd = fileDataList[fdIdx];
+      var phIdx = -1;
+      for (var i = 0; i < S.files.length; i++) {
+        if (S.files[i]._placeholderKey === fd._phKey) { phIdx = i; break; }
+      }
 
-    if (phIdx >= 0 && r) {
-      var items = Array.isArray(r) ? r : [r];
-      items.forEach(function(it) { _newFileIds[it.id] = true; });
-      if (slotInsert && !_lastInsertedId && firstPlaceholder && fd._phKey === firstPlaceholder._placeholderKey) _lastInsertedId = items[0].id;
-      S.files.splice.apply(S.files, [phIdx, 1].concat(items));
-      added += items.length;
-    } else if (phIdx >= 0) {
-      S.files.splice(phIdx, 1);
-    }
+      if (phIdx >= 0 && r) {
+        var items = Array.isArray(r) ? r : [r];
+        items.forEach(function(it) { _newFileIds[it.id] = true; });
+        if (slotInsert && !_lastInsertedId && firstPlaceholder && fd._phKey === firstPlaceholder._placeholderKey) _lastInsertedId = items[0].id;
+        S.files.splice.apply(S.files, [phIdx, 1].concat(items));
+        added += items.length;
+      } else if (phIdx >= 0) {
+        S.files.splice(phIdx, 1);
+      }
 
-    var now = Date.now();
-    if (now - lastToastUpdate > 100 || completed >= total) {
-      lastToastUpdate = now;
-      var ocrRemaining = ocrBusyCount();
-      var isLast = (completed >= total);
-      if (isLast) {
-        if (ocrRemaining > 0 && S.feat.ocrEnabled) {
-          var ocrDone2 = _ocrBatchTotal > 0 ? _ocrBatchTotal - ocrRemaining : 0;
-          toastLoading('加载完成，识别中 ' + ocrDone2 + '/' + _ocrBatchTotal);
-        }
-      } else {
-        if (ocrRemaining > 0 && S.feat.ocrEnabled) {
-          var ocrDone = _ocrBatchTotal > 0 ? _ocrBatchTotal - ocrRemaining : 0;
-          toastLoading('加载中 ' + completed + '/' + total + '，识别中 ' + ocrDone + '/' + _ocrBatchTotal);
+      var now = Date.now();
+      if (now - lastToastUpdate > 100 || completed >= total) {
+        lastToastUpdate = now;
+        var ocrRemaining = ocrBusyCount();
+        var isLast = (completed >= total);
+        if (isLast) {
+          if (ocrRemaining > 0 && S.feat.ocrEnabled) {
+            var ocrDone2 = _ocrBatchTotal > 0 ? _ocrBatchTotal - ocrRemaining : 0;
+            toastLoading('加载完成，识别中 ' + ocrDone2 + '/' + _ocrBatchTotal);
+          }
         } else {
-          toastLoading('加载中 ' + completed + '/' + total);
+          if (ocrRemaining > 0 && S.feat.ocrEnabled) {
+            var ocrDone = _ocrBatchTotal > 0 ? _ocrBatchTotal - ocrRemaining : 0;
+            toastLoading('加载中 ' + completed + '/' + total + '，识别中 ' + ocrDone + '/' + _ocrBatchTotal);
+          } else {
+            toastLoading('加载中 ' + completed + '/' + total);
+          }
         }
       }
+
+      hasNewResults = true;
+      await nextFrame();
     }
-
-    hasNewResults = true;
-    await nextFrame();
+  } finally {
+    clearInterval(updateInterval);
+    _loadingBatchActive = false;
   }
-
-  clearInterval(updateInterval);
   if (slotInsert) locateInsertedFile(_lastInsertedId);
   if (S.feat.autoDedup) removeDuplicates(true);
   renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn();
   scrollActiveFileIntoView();
 
-  _loadingBatchActive = false;
   _insertSlotIdx = -1;
   _lastInsertedId = null;
   maybeAutoTrim();  // 裁剪白边开关跨会话记忆：加载完成后自动补裁剪
@@ -1132,6 +1154,16 @@ async function processFiles(files, batchInfo) {
 // Incremental loading: read files one-by-one, render in small batches.
 // Strategy: skeleton placeholders (stable layout) + parallel background load + batch render every 3 files.
 async function processFilesIncremental(paths, batchInfo) {
+  try {
+    return await _processFilesIncremental(paths, batchInfo);
+  } finally {
+    _loadingBatchActive = false;
+    _insertSlotIdx = -1;
+    _lastInsertedId = null;
+    document.getElementById('fileList').classList.remove('batch-loading');
+  }
+}
+async function _processFilesIncremental(paths, batchInfo) {
   var total = paths.length;
   var added = 0;
   batchInfo = batchInfo || { files: total, skipped: 0 };
@@ -1281,11 +1313,7 @@ async function processFilesIncremental(paths, batchInfo) {
   renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn();
   scrollActiveFileIntoView();
 
-  _loadingBatchActive = false;
-  _insertSlotIdx = -1;
-  _lastInsertedId = null;
   maybeAutoTrim();  // 裁剪白边开关跨会话记忆：加载完成后自动补裁剪
-  document.getElementById('fileList').classList.remove('batch-loading');
 
   if (ocrBusyCount() === 0) {
     _ocrToastActive = false;
@@ -2738,6 +2766,7 @@ function toggleSortMenu() {
 function sortByDate(dir) {
   document.getElementById('sortMenu').classList.add('hidden');
   if (!S.files.length) return;
+  var keep = captureSlotSelection();
   S.files.sort(function(a, b) {
     var da = _parseDate(a.invoiceDate);
     var db = _parseDate(b.invoiceDate);
@@ -2749,14 +2778,14 @@ function sortByDate(dir) {
     return 0;
   });
   _activeFileIdx = -1;
-  renderFileList();
-  updatePreview();
+  if (keep) refreshAfterCopiesChange(keep); else { renderFileList(); updatePreview(); }
 }
 // 按发票类型分组排序（issue #40）：专票归一堆、普票归一堆，打印按列表顺序分批走。
 // 跨页票整组归堆（取组内最小 rank），组内页序由排序稳定性保持、不拆散
 function sortByType() {
   document.getElementById('sortMenu').classList.add('hidden');
   if (!S.files.length) return;
+  var keep = captureSlotSelection();
   var groupRank = {};
   S.files.forEach(function(f) {
     if (!f._invoiceGroupId) return;
@@ -2770,8 +2799,7 @@ function sortByType() {
   }
   S.files.sort(function(a, b) { return rank(a) - rank(b); });
   _activeFileIdx = -1;
-  renderFileList();
-  updatePreview();
+  if (keep) refreshAfterCopiesChange(keep); else { renderFileList(); updatePreview(); }
 }
 // 类型分组次序：专票 → 普票 → 通行费 → 医疗 → 非税 → 车票 → 其他（未识别 / 占位）
 function _invoiceTypeRank(f) {
@@ -2796,20 +2824,24 @@ function setAllCopies(e, n) {
   e.stopPropagation();
   var sel = S.files.filter(function(f) { return f.checked; });
   if (!sel.length) { toast('请先选择发票'); document.getElementById('copyMenu').classList.add('hidden'); return; }
+  var selection = captureSlotSelection();
   sel.forEach(function(f) { f.copies = n; });
   document.getElementById('copyMenu').classList.add('hidden');
-  renderFileList();
-  updatePreview();
+  refreshAfterCopiesChange(selection);
 }
-function togCheck(i) { if (!isSelectableFile(S.files[i])) return; S.files[i].checked = !S.files[i].checked; renderFileList(); updatePreview(); updateSummaryBtn(); }
-
+function togCheck(i) {
+  if (!isSelectableFile(S.files[i])) return;
+  var keep = captureSlotSelection();
+  S.files[i].checked = !S.files[i].checked;
+  reflowAfterListChange(keep);
+}
 // 当前筛选条件下可勾选的文件（全选/取消全选只作用于可见项，issue #27）
 function isSelectableFile(f) { return !!f && !f._placeholder && !f._loading; }
 function getSelectableInView() {
   return getFilteredFiles().filter(isSelectableFile);
 }
-function selectAll() { getSelectableInView().forEach(function(f) { f.checked = true; }); renderFileList(); updatePreview(); updateSummaryBtn(); }
-function deselectAll() { getSelectableInView().forEach(function(f) { f.checked = false; }); renderFileList(); updatePreview(); updateSummaryBtn(); }
+function selectAll() { var keep = captureSlotSelection(); getSelectableInView().forEach(function(f) { f.checked = true; }); reflowAfterListChange(keep); }
+function deselectAll() { var keep = captureSlotSelection(); getSelectableInView().forEach(function(f) { f.checked = false; }); reflowAfterListChange(keep); }
 function toggleSelectAll() {
   var selectable = getSelectableInView();
   var all = selectable.length > 0 && selectable.every(function(f) { return f.checked; });
@@ -2876,9 +2908,9 @@ function _showSlotAdjGroup(show) {
 
 function ctxSetCopies(n) {
   if (_ctxIdx < 0) return;
+  var selection = captureSlotSelection();
   S.files[_ctxIdx].copies = n;
-  renderFileList();
-  updatePreview();
+  refreshAfterCopiesChange(selection);
   closeCtxMenu();
 }
 function ctxRotate() { if (_ctxIdx >= 0) rotFile(_ctxIdx); closeCtxMenu(); }
@@ -2927,11 +2959,13 @@ async function ctxExportDiagnostics() {
   closeCtxMenu();
   if (!f) return;
   if (!isTauri || !invoke) { toast('诊断导出仅桌面版支持'); return; }
-  if (!f._filePath) { toast('该文件缺少本地路径，无法导出'); return; }
+  // PDF 页对象只有 _pdfPath（多页共享），图片/OFD 才有 _filePath
+  var srcPath = f._filePath || f._pdfPath;
+  if (!srcPath) { toast('该文件缺少本地路径，无法导出'); return; }
   try {
     toast('正在生成诊断报告...');
     var report = await invoke('export_diagnostics', {
-      files: [{ path: f._filePath, summary: buildDiagSummary(f) }],
+      files: [{ path: srcPath, summary: buildDiagSummary(f) }],
       exportedAt: new Date().toLocaleString('zh-CN')
     });
     var defaultDir = '';
@@ -2965,6 +2999,8 @@ function buildDiagSummary(f) {
   parts.push('销方=' + (f.sellerName ? '有' : '无'));
   parts.push('购方=' + (f.buyerName ? '有' : '无'));
   parts.push('金额=' + (f.amountTax > 0 ? '有' : '无'));
+  parts.push('备注=' + (f.invoiceRemark ? '有(' + f.invoiceRemark.length + '字)' : '无'));
+  parts.push('项目=' + (f.itemName ? '有' : '无'));
   parts.push('PDF文字层=' + (f._pdfTextExtracted ? '有' : '无'));
   parts.push('份数=' + (f.copies || 1));
   parts.push('旋转=' + (f.rotation || 0));
@@ -3086,9 +3122,26 @@ function deleteSelected() {
   var active = _activeFileIdx >= 0 ? S.files[_activeFileIdx] : null;
   S.files = S.files.filter(function(f) { return !f.checked; });
   _activeFileIdx = active ? S.files.indexOf(active) : -1;
-  renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn();
+  // 预览里能选中的票必然是勾选状态（getActiveFiles 只收 checked / 占位），批量删除一定连带删掉它
+  reflowAfterListChange(null);
 }
-function rmFile(i) { S.files.splice(i, 1); if (_activeFileIdx === i) _activeFileIdx = -1; else if (_activeFileIdx > i) _activeFileIdx--; renderFileList(); updatePreview(); updatePrintBtn(); updateSummaryBtn(); }
+// 列表增删 / 勾选 / 重排后统一收尾：槽位序号会整体挪动，选中必须按「文件对象」重定位，
+// 沿用旧索引会指到别的票，接下来点删除 / 改份数就作用在错的发票上（选中票已不在排版里则清空）
+function reflowAfterListChange(keep) {
+  if (keep) refreshAfterCopiesChange(keep);
+  else { S.selectedSlot = -1; renderFileList(); updatePreview(); }
+  // 删空时 updatePreview 会在无票分支提前返回，这里兜住工具条与单票调整面板
+  updateAdjPanel();
+  updatePrintBtn(); updateSummaryBtn();
+}
+function rmFile(i) {
+  var removed = S.files[i];
+  var sel = getSelectedFileObj();
+  var keep = (sel && sel !== removed) ? captureSlotSelection() : null;
+  S.files.splice(i, 1);
+  if (_activeFileIdx === i) _activeFileIdx = -1; else if (_activeFileIdx > i) _activeFileIdx--;
+  reflowAfterListChange(keep);
+}
 
 // 医疗票明细页处理（幂等）：把「医疗收费明细」长页从列表移除（只留汇总首页），
 // 在共享 _batchId 的主票上挂附件计数徽章，toast 明示排除行为。
@@ -3201,14 +3254,15 @@ function moveFile(i, dir) {
 
 function swapFiles(ia, ib) {
   if (ia === ib || ia < 0 || ib < 0 || ia >= S.files.length || ib >= S.files.length) return;
+  // 列表重排同样会让预览槽位换票：选中按对象重定位，别让工具条留在原槽位指向另一张
+  var keep = captureSlotSelection();
   var tmp = S.files[ia];
   S.files[ia] = S.files[ib];
   S.files[ib] = tmp;
   // Update active file index to follow the moved item
   if (_activeFileIdx === ia) { _activeFileIdx = ib; }
   else if (_activeFileIdx === ib) { _activeFileIdx = ia; }
-  renderFileList();
-  updatePreview();
+  if (keep) refreshAfterCopiesChange(keep); else { renderFileList(); updatePreview(); }
   scrollToListItem(ib);
 }
 
@@ -3218,13 +3272,13 @@ function moveFileTo(fromIdx, toIdx, zone) {
   var a = S.files[fromIdx];
   var b = S.files[toIdx];
   if (!a || !b || a === b) return;
+  var keep = captureSlotSelection();
   S.files.splice(fromIdx, 1);
   var insertAt = zone === 'after' ? S.files.indexOf(b) + 1 : S.files.indexOf(b);
   S.files.splice(insertAt, 0, a);
   if (insertAt === fromIdx) return; // 落点即原位，顺序未变
   _activeFileIdx = S.files.indexOf(a);
-  renderFileList();
-  updatePreview();
+  if (keep) refreshAfterCopiesChange(keep); else { renderFileList(); updatePreview(); }
   scrollToListItem(insertAt);
 }
 
@@ -3439,7 +3493,7 @@ function openInvModal(i) {
   if (S.files[i]._loading) return; // Don't open modal for loading placeholders
   S.editIdx = i; var f = S.files[i];
   var ocrText = f._ocrText || '';
-  var ocrHtml = ocrText ? '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px"><div style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:6px" onclick="this.nextElementSibling.classList.toggle(\'hidden\');this.querySelector(\'.arrow\').textContent=this.nextElementSibling.classList.contains(\'hidden\')?\'▶\':\'▼\'"><span class="arrow" style="font-size:10px;color:var(--text-muted)">▶</span><span style="font-size:12px;font-weight:600;color:var(--primary)">🔍 OCR识别全文</span><span style="font-size:10px;color:var(--text-muted)">(点击展开)</span></div><div class="hidden" style="position:relative"><pre style="margin:0;padding:8px 10px;background:var(--surface2);border-radius:6px;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-size:11px;line-height:1.5;font-family:Consolas,monospace;border:1px solid var(--border)">' + escHtml(ocrText) + '</pre><button class="btn btn-sm" style="position:absolute;top:6px;right:6px;padding:3px 8px;font-size:11px;opacity:0.7" onclick="event.stopPropagation();copyOcrText(this)" title="复制OCR文本">📋 复制</button></div></div>' : '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;font-size:11px;color:var(--text-muted)">⏳ OCR 全文尚未识别</div>';
+  var ocrHtml = ocrText ? '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px"><div style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:6px" onclick="this.nextElementSibling.classList.toggle(\'hidden\');this.querySelector(\'.arrow\').textContent=this.nextElementSibling.classList.contains(\'hidden\')?\'▶\':\'▼\'"><span class="arrow" style="font-size:10px;color:var(--text-muted)">▶</span><span style="font-size:12px;font-weight:600;color:var(--accent)">🔍 OCR识别全文</span><span style="font-size:10px;color:var(--text-muted)">(点击展开)</span></div><div class="hidden" style="position:relative"><pre style="margin:0;padding:8px 10px;background:var(--surface2);border-radius:6px;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-size:11px;line-height:1.5;font-family:Consolas,monospace;border:1px solid var(--border)">' + escHtml(ocrText) + '</pre><button class="btn btn-sm" style="position:absolute;top:6px;right:6px;padding:3px 8px;font-size:11px;opacity:0.7" onclick="event.stopPropagation();copyOcrText(this)" title="复制OCR文本">📋 复制</button></div></div>' : '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;font-size:11px;color:var(--text-muted)">⏳ OCR 全文尚未识别</div>';
   var _fw = 'width:140px;flex:none;text-align:right;font-size:12px';
   var _fwm = _fw + ';font-family:monospace';
   var mRF = function(label, html) { return '<div class="modal-row"><label class="modal-lbl">' + label + '</label><div class="modal-ctrl end">' + html + '</div></div>'; };
@@ -3482,8 +3536,9 @@ function changeModalCopies(d) { var e = document.getElementById('mCopies'); e.va
 function closeInvModal() { document.getElementById('invModal').classList.add('hidden'); }
 function confirmInvModal() {
   if (S.editIdx < 0) return;
+  var selection = captureSlotSelection();
   var f = S.files[S.editIdx];
-  f.copies = Math.max(1, parseInt(document.getElementById('mCopies').value) || 1);
+  f.copies = Math.max(1, Math.min(99, parseInt(document.getElementById('mCopies').value) || 1));
   f.rotation = parseInt(document.getElementById('mRot').value) || 0;
   var at = parseFloat(document.getElementById('mAmountTax').value);
   var an = parseFloat(document.getElementById('mAmountNoTax').value);
@@ -3505,7 +3560,7 @@ function confirmInvModal() {
   f.slotScale = Math.max(0.2, Math.min(5.0, (parseInt(document.getElementById('mSlotScale').value) || 100) / 100));
   f.slotOffsetX = parseFloat(document.getElementById('mSlotOffX').value) || 0;
   f.slotOffsetY = parseFloat(document.getElementById('mSlotOffY').value) || 0;
-  closeInvModal(); renderFileList(); updatePreview(); updateAmountSummary();
+  closeInvModal(); refreshAfterCopiesChange(selection); updateAmountSummary();
 }
 
 function copyOcrText(btn) {
@@ -3542,13 +3597,13 @@ function selectSlot(idx) {
     var slotEl = document.querySelector('.invoice-slot[data-slot-idx="' + idx + '"]');
     if (slotEl) slotEl.classList.add('selected');
     syncSidebarToSelectedSlot();
-    // 首次选中提示隐藏手势（issue #33）：双击重置 / 右键菜单，跨会话仅提示一次
-    if (!window._dblclickHintShown) {
-      window._dblclickHintShown = true;
+    // 首次选中提示隐藏手势（issue #33 / #60）：浮动工具条设份数 / 右键菜单，跨会话仅提示一次
+    if (!window._slotHintShown) {
+      window._slotHintShown = true;
       try {
-        if (localStorage.getItem('ticketchan-dblclick-hint') !== '1') {
-          localStorage.setItem('ticketchan-dblclick-hint', '1');
-          toast('提示：双击票面可重置单票调整，右键票面有更多操作', 3500);
+        if (localStorage.getItem('ticketchan-slot-hint') !== '1') {
+          localStorage.setItem('ticketchan-slot-hint', '1');
+          toast('提示：选中票面后可用上方工具条设份数，右键有更多操作', 3500);
         }
       } catch(e) {}
     }
@@ -3575,18 +3630,23 @@ function syncSlotToolbar() {
     rotText.textContent = rot ? rot + '°' : '旋转';
     rotBtn.title = '旋转此票 90°（顺时针），当前 ' + rot + '°';
   }
+  // 份数按钮同理：图标位显示当前份数（×1 / ×2 …），变更时宽度会变
+  var copiesIco = document.getElementById('slotCopiesIco');
+  if (copiesIco) copiesIco.textContent = '×' + (f.copies || 1);
 
   var wr = wrap.getBoundingClientRect();
   var sr = slotEl.getBoundingClientRect();
   // absolute 子元素位于滚动内容坐标系：可视偏移 + 滚动量
   var sl = wrap.scrollLeft, st = wrap.scrollTop;
-  var tbW = tb.offsetWidth, tbH = tb.offsetHeight;
-  // 窄格子（3×3 及以上、纵向纸张）：工具条比格子还宽时只留图标，否则横向必压邻格
-  var compact = tbW + 8 > sr.width;
-  if (compact !== tb.classList.contains('compact')) {
-    tb.classList.toggle('compact', compact);
-    tbW = tb.offsetWidth; // 换档后宽度变了，重新测量
-  }
+  var tbW, tbH;
+  // 窄格子（3×3 及以上、纵向纸张）：工具条比格子还宽时只留图标，否则横向必压邻格。
+  // ⚠️ 判定必须用「非 compact」的固有宽度：直接读 offsetWidth 会拿到上一档的宽度，
+  // 在 compact 与非 compact 之间来回翻转（3×3 中间列就卡在 395 宽、每边压邻格 66px）
+  tb.classList.remove('compact');
+  var fullW = tb.offsetWidth;
+  if (fullW + 8 > sr.width) tb.classList.add('compact');
+  tbW = tb.offsetWidth;
+  tbH = tb.offsetHeight;
   var slotLeft = sr.left - wr.left + sl;
   var slotTop = sr.top - wr.top + st;
   var center = slotLeft + sr.width / 2;
@@ -3622,8 +3682,88 @@ function syncSlotToolbar() {
   tb.style.top = Math.round(top) + 'px';
   tb.classList.remove('hidden');
 }
-document.getElementById('previewWrap').addEventListener('scroll', syncSlotToolbar);
+document.getElementById('previewWrap').addEventListener('scroll', function() {
+  closeSlotCopyMenu();
+  syncSlotToolbar();
+});
 window.addEventListener('resize', syncSlotToolbar);
+
+// 工具条「份数」：点击按钮弹出份数菜单（issue #59）
+function toggleSlotCopyMenu(e) {
+  if (e) e.stopPropagation();
+  var menu = document.getElementById('slotCopyMenu');
+  if (!menu) return;
+  if (!menu.classList.contains('hidden')) { closeSlotCopyMenu(); return; }
+  openSlotCopyMenu();
+}
+// 打开菜单（幂等）
+function openSlotCopyMenu() {
+  var menu = document.getElementById('slotCopyMenu');
+  var btn = document.getElementById('slotCopiesBtn');
+  if (!menu || !btn) return;
+  var f = getSelectedFileObj();
+  if (!f) return;
+  var cur = f.copies || 1;
+  Array.prototype.forEach.call(menu.querySelectorAll('.copy-menu-item[data-n]'), function(it) {
+    it.classList.toggle('active', parseInt(it.dataset.n) === cur);
+  });
+  menu.classList.remove('hidden');
+  // 锚在按钮下方居中，左右/上下钳制在窗口内
+  var r = btn.getBoundingClientRect();
+  var mw = menu.offsetWidth, mh = menu.offsetHeight;
+  var left = Math.max(8, Math.min(window.innerWidth - mw - 8, r.left + r.width / 2 - mw / 2));
+  var top = r.bottom + 4;
+  if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 4);
+  menu.style.left = Math.round(left) + 'px';
+  menu.style.top = Math.round(top) + 'px';
+}
+function closeSlotCopyMenu() {
+  var menu = document.getElementById('slotCopyMenu');
+  if (menu) menu.classList.add('hidden');
+}
+// 份数变动会重排展开序列：记住文件与第几份，不能沿用原槽位编号操作别的票。
+function captureSlotSelection() {
+  var f = getSelectedFileObj();
+  if (!f) return null;
+  var files = getActiveFiles();
+  var pos = S.currentPage * getPerPage(getSettings()) + S.selectedSlot;
+  var ordinal = 0;
+  for (var i = 0; i < pos; i++) { if (files[i] === f) ordinal++; }
+  return { file: f, ordinal: ordinal };
+}
+function refreshAfterCopiesChange(selection) {
+  if (selection) {
+    var matches = [];
+    getActiveFiles().forEach(function(f, i) { if (f === selection.file) matches.push(i); });
+    if (matches.length) {
+      var pos = matches[Math.min(selection.ordinal, matches.length - 1)];
+      var perPage = getPerPage(getSettings());
+      S.currentPage = Math.floor(pos / perPage);
+      S.selectedSlot = pos % perPage;
+    } else {
+      S.selectedSlot = -1;
+    }
+  }
+  renderFileList();
+  updatePreview();
+  if (S.selectedSlot >= 0) syncSidebarToSelectedSlot();
+}
+function setSlotCopies(n) {
+  closeSlotCopyMenu();
+  var f = getSelectedFileObj();
+  if (!f) return;
+  var selection = captureSlotSelection();
+  f.copies = Math.max(1, Math.min(99, parseInt(n) || 1));
+  refreshAfterCopiesChange(selection);
+}
+// 「自定义…」：打开发票选项弹窗（含 1-99 份数输入），排版页无需再切回列表
+function openSlotInvModal() {
+  closeSlotCopyMenu();
+  var f = getSelectedFileObj();
+  if (!f) return;
+  var idx = S.files.indexOf(f);
+  if (idx >= 0) openInvModal(idx);
+}
 
 // 浮动工具条「✕ 删除」（issue #43②）：删除选中槽位对应的那张发票
 function deleteSlotInvoice() {
@@ -3912,11 +4052,13 @@ function setSlotAlignment(alignH, alignV) {
   var gapY = (slotH_mm - containedH_mm * effectiveScale) / 2;
 
   // Offset to move wrapper from base position to target alignment.
-  // 常规模式基准=居中；报销单模式基准=左上（renderPage 中 wrapper 定位分支保持一致）。
+  // 常规模式基准=居中；报销单模式基准=设置里的水平对齐（纵向贴段顶），
+  // 与 renderPage 中 wrapper 定位分支保持一致。
   var offsetX = 0, offsetY = 0;
   if (settings.reimburseMode) {
-    if (alignH === 'center') offsetX = gapX;
-    else if (alignH === 'right') offsetX = 2 * gapX;
+    var _reimbBase = gapX * ((settings.reimburseAlign === 'center') ? 1 : (settings.reimburseAlign === 'right' ? 2 : 0));
+    var _reimbTarget = gapX * (alignH === 'center' ? 1 : (alignH === 'right' ? 2 : 0));
+    offsetX = _reimbTarget - _reimbBase;
     if (alignV === 'center') offsetY = gapY;
     else if (alignV === 'bottom') offsetY = 2 * gapY;
   } else {
@@ -4015,12 +4157,17 @@ function toggleFeature(k, btn) {
   if (k === 'autoEnhance') document.getElementById('enhanceOpts').style.display = S.feat[k] ? 'block' : 'none';
   if (k === 'pasteMode') {
     document.getElementById('pasteOpts').style.display = S.feat[k] ? 'block' : 'none';
-    // 粘贴单与报销单分段互斥：两者都要接管整页版式
+    // 粘贴单与报销单/相纸模式互斥：都要接管整页版式
     if (S.feat[k] && S.feat.reimburse) {
       S.feat.reimburse = false;
       document.getElementById('toggleReimburse').classList.remove('on');
       syncReimburseUI();
       toast('粘贴单模式已接管版式，已关闭报销单模式');
+    }
+    if (S.feat[k] && S.feat.photoMode) {
+      S.feat.photoMode = false;
+      document.getElementById('togglePhotoMode').classList.remove('on');
+      syncPhotoModeUI();
     }
   }
   if (k === 'pasteShowSig') {
@@ -4183,6 +4330,11 @@ function syncLayoutHighlight() {
 }
 var _printersLoaded = false;
 var _savedPrinterName = null;
+// 打印机选择变更：同步记忆值并立即落盘（启动恢复期由 _restoringSettings 拦截）
+function onPrinterChange(val) {
+  _savedPrinterName = val || null;
+  saveSettings();
+}
 function switchTab(n, el) {
   document.querySelectorAll('.sidebar-tab').forEach(function(t) { t.classList.remove('active'); });
   document.querySelectorAll('.sidebar-panel').forEach(function(p) { p.classList.add('hidden'); });
@@ -4194,11 +4346,235 @@ function switchTab(n, el) {
     refreshPrinters();
   }
 }
-function onPaperChange() { document.getElementById('customPaperRow').style.display = document.getElementById('paperSize').value === 'custom' ? 'flex' : 'none'; updatePreview(); }
+// =====================================================
+// 纸张规格与单位（issue #55）
+// =====================================================
+function getPaperUnit() {
+  var el = document.getElementById('paperUnit');
+  return el && el.value === 'px' ? 'px' : 'mm';
+}
+function paperMmToPx(mm) { return Math.round(mm * PDF_RENDER_DPI / 25.4); }
+function paperPxToMm(px) { return Math.round(px * 25.4 / PDF_RENDER_DPI * 10) / 10; }
+function getPaperPx(p) {
+  if (p.pxW && p.pxH) return { w: p.pxW, h: p.pxH };
+  return { w: paperMmToPx(p.w), h: paperMmToPx(p.h) };
+}
+function getPaperOptionText(id) {
+  var p = PAPER[id];
+  if (!p) return id;
+  var px = getPaperPx(p);
+  var size = getPaperUnit() === 'px' ? (px.w + '×' + px.h + 'px') : (p.w + '×' + p.h + 'mm');
+  if (p.name) return p.name + ' ' + size + '（' + p.usage + '）';
+  return (PAPER_STANDARD_NAMES[id] || id) + ' (' + size + ')';
+}
+function getPhotoSizeOptionText(id) {
+  var p = PAPER[id];
+  if (!p) return id;
+  return p.name + ' ' + p.w + '×' + p.h + 'mm（' + p.usage + '）';
+}
+// 相纸模式的证件照规格下拉：与纸张规格一致，括号内标注常用场景
+function renderPhotoSizeOptions() {
+  var sel = document.getElementById('photoSize');
+  if (!sel) return;
+  var cur = sel.value || 'photo1';
+  var html = '';
+  PAPER_PHOTO_SIZES.forEach(function(id) { html += '<option value="' + id + '">' + getPhotoSizeOptionText(id) + '</option>'; });
+  html += '<option value="custom">自定义</option>';
+  sel.innerHTML = html;
+  sel.value = (cur === 'custom' || PAPER[cur]) ? cur : 'photo1';
+}
+function renderPaperOptions() {
+  var sel = document.getElementById('paperSize');
+  if (!sel) return;
+  var cur = sel.value || 'A4';
+  var html = '<optgroup label="常用纸张">';
+  PAPER_STANDARD.forEach(function(id) { html += '<option value="' + id + '">' + getPaperOptionText(id) + '</option>'; });
+  html += '</optgroup><optgroup label="证件照 / 证件">';
+  PAPER_PHOTO.forEach(function(id) { html += '<option value="' + id + '">' + getPaperOptionText(id) + '</option>'; });
+  html += '</optgroup><optgroup label="相纸">';
+  PAPER_PHOTO_PAPER.forEach(function(id) { html += '<option value="' + id + '">' + getPaperOptionText(id) + '</option>'; });
+  html += '</optgroup><option value="custom">自定义</option>';
+  sel.innerHTML = html;
+  sel.value = (cur === 'custom' || PAPER[cur]) ? cur : 'A4';
+}
+function paperDisplayLabel(ps) {
+  if (ps === 'custom') {
+    var c = getCustomPaperMm();
+    if (document.getElementById('orientation').value === 'landscape') { var t = c.w; c.w = c.h; c.h = t; }
+    return '自定义 ' + c.w + '×' + c.h + 'mm';
+  }
+  var p = PAPER[ps];
+  if (!p) return ps;
+  if (p.name) {
+    // 预设尺寸随方向翻转，避免横向时显示 102×152 却实际是 152×102
+    var w = p.w, h = p.h;
+    if (document.getElementById('orientation').value === 'landscape') { var t = w; w = h; h = t; }
+    return p.name + ' ' + w + '×' + h + 'mm';
+  }
+  return PAPER_STANDARD_NAMES[ps] || ps;
+}
+function getCustomPaperMm() {
+  var pxMode = getPaperUnit() === 'px';
+  var w = parseFloat(document.getElementById('customW').value);
+  var h = parseFloat(document.getElementById('customH').value);
+  if (!(w > 0)) w = pxMode ? paperMmToPx(210) : 210;
+  if (!(h > 0)) h = pxMode ? paperMmToPx(297) : 297;
+  if (pxMode) return { w: paperPxToMm(w), h: paperPxToMm(h) };
+  return { w: w, h: h };
+}
+function syncPaperUnitUI() {
+  var pxMode = getPaperUnit() === 'px';
+  var lbl = document.getElementById('customPaperUnit');
+  if (lbl) lbl.textContent = pxMode ? 'px' : 'mm';
+  var min = pxMode ? paperMmToPx(10) : 10;
+  ['customW','customH'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.min = min;
+  });
+}
+function onPaperUnitChange() {
+  var toPx = getPaperUnit() === 'px';
+  var wEl = document.getElementById('customW');
+  var hEl = document.getElementById('customH');
+  var w = parseFloat(wEl.value), h = parseFloat(hEl.value);
+  if (w > 0 && h > 0) {
+    wEl.value = toPx ? paperMmToPx(w) : paperPxToMm(w);
+    hEl.value = toPx ? paperMmToPx(h) : paperPxToMm(h);
+  }
+  syncPaperUnitUI();
+  renderPaperOptions();
+  updatePreview();
+}
+function onPaperChange() {
+  var ps = document.getElementById('paperSize').value;
+  var p = PAPER[ps];
+  // 证件照/证件预设一律纵向，避免 25×35mm 被横向摆成 35×25mm
+  if (p && p.name) {
+    var orEl = document.getElementById('orientation');
+    if (orEl.value !== 'portrait') { orEl.value = 'portrait'; syncLayoutHighlight(); }
+  }
+  document.getElementById('customPaperRow').style.display = ps === 'custom' ? 'flex' : 'none';
+  updatePreview();
+}
+
+// =====================================================
+// 相纸模式（issue #55）：按证件照实际尺寸在相纸上整版排列
+// =====================================================
+function getPhotoSizeMm() {
+  var id = document.getElementById('photoSize').value;
+  if (id === 'custom') {
+    var w = parseFloat(document.getElementById('photoCustomW').value) || 25;
+    var h = parseFloat(document.getElementById('photoCustomH').value) || 35;
+    return { w: Math.max(1, w), h: Math.max(1, h) };
+  }
+  var p = PAPER[id] || PAPER.photo1;
+  return { w: p.w, h: p.h };
+}
+function syncPhotoModeUI() {
+  var on = !!S.feat.photoMode;
+  var opts = document.getElementById('photoModeOpts');
+  if (opts) opts.style.display = on ? 'block' : 'none';
+  var btn = document.getElementById('togglePhotoMode');
+  if (btn) btn.classList.toggle('on', on);
+  var ps = document.getElementById('photoSize');
+  var customRow = document.getElementById('photoCustomRow');
+  if (customRow && ps) customRow.style.display = ps.value === 'custom' ? 'flex' : 'none';
+  var hint = document.getElementById('photoModeHint');
+  if (hint) {
+    if (!on) {
+      hint.textContent = '';
+    } else {
+      var s = getSettings();
+      var g = getPhotoGrid(s);
+      var count = g.cols * g.rows;
+      var warn = (g.w > s.paperW || g.h > s.paperH) ? '；照片大于纸张，可能被裁切' : '';
+      var clamped = (s.photoCols > g.cols || s.photoRows > g.rows) ? '；手动行列超出纸张，已按上限收敛' : '';
+      hint.textContent = '单张 ' + g.w + '×' + g.h + 'mm · 每页 ' + g.cols + '×' + g.rows + ' = ' + count + ' 张；自动居中排列，页脚 / 页码 / 日期 / 水印 / 白边裁剪不生效' + clamped + warn;
+    }
+  }
+  if (on) renderPhotoCountPresets();
+  syncReimburseUI(); // 同步新版式模式的控件置灰状态（含相纸/报销单）
+}
+function onPhotoOptChange() {
+  syncPhotoModeUI();
+  updatePreview();
+}
+// 按目标张数寻找能放下的最顺眼排列（列×行），找不到返回 null
+function findPhotoCountGrid(s, n) {
+  var w = Math.max(1, parseFloat(s.photoW) || 25);
+  var h = Math.max(1, parseFloat(s.photoH) || 35);
+  var gap = Math.max(0, parseFloat(s.photoGap) || 0);
+  var pw = s.paperW, ph = s.paperH;
+  var best = null;
+  for (var c = 1; c <= n; c++) {
+    if (n % c !== 0) continue;
+    var r = n / c;
+    var gw = c * w + (c - 1) * gap;
+    var gh = r * h + (r - 1) * gap;
+    if (gw > pw + 1e-6 || gh > ph + 1e-6) continue;
+    var score = Math.abs(gw / gh - pw / ph);
+    if (!best || score < best.score) best = { cols: c, rows: r, score: score };
+  }
+  return best;
+}
+function renderPhotoCountPresets() {
+  var box = document.getElementById('photoCountPresets');
+  if (!box) return;
+  var s = getSettings();
+  var curC = parseInt(s.photoCols) || 0, curR = parseInt(s.photoRows) || 0;
+  var counts = [0, 4, 6, 8, 9, 12, 16];
+  box.innerHTML = counts.map(function(n) {
+    var active = n === 0 ? (curC === 0 && curR === 0) : (curC * curR === n);
+    var fit = n === 0 || !!findPhotoCountGrid(s, n);
+    var title = n === 0 ? '自动铺满' : (fit ? ('每页 ' + n + ' 张') : ('当前纸张放不下 ' + n + ' 张，可减小间距/留边'));
+    return '<button class="btn btn-sm' + (active ? ' btn-primary' : '') + '" ' + (fit ? '' : 'disabled') +
+      ' onclick="setPhotoCount(' + n + ')" title="' + title + '">' + (n === 0 ? '自动' : n) + '</button>';
+  }).join('');
+}
+function setPhotoCount(n) {
+  var s = getSettings();
+  if (n === 0) {
+    document.getElementById('photoCols').value = 0;
+    document.getElementById('photoRows').value = 0;
+  } else {
+    var grid = findPhotoCountGrid(s, n);
+    if (!grid) { toast('当前纸张放不下 ' + n + ' 张，可减小间距 / 留边或换相纸'); return; }
+    document.getElementById('photoCols').value = grid.cols;
+    document.getElementById('photoRows').value = grid.rows;
+  }
+  onPhotoOptChange();
+}
+function togglePhotoMode(btn) {
+  S.feat.photoMode = !S.feat.photoMode;
+  if (S.feat.photoMode) {
+    // 报销单 / 粘贴单 / 相纸 三种版式模式互斥
+    if (S.feat.reimburse) {
+      S.feat.reimburse = false;
+      document.getElementById('toggleReimburse').classList.remove('on');
+    }
+    if (S.feat.pasteMode) {
+      S.feat.pasteMode = false;
+      document.getElementById('togglePasteMode').classList.remove('on');
+      document.getElementById('pasteOpts').style.display = 'none';
+    }
+    // 相纸模式不做白边裁剪：同步关掉功能开关（getSettings 里也会强制 false）
+    if (S.feat.trimWhite) {
+      S.feat.trimWhite = false;
+      document.getElementById('toggleTrimWhite').classList.remove('on');
+      document.getElementById('trimPadOpts').style.display = 'none';
+    }
+    // 照片必须按原比例完整显示，且不能侧放
+    document.getElementById('fitMode').value = 'fit';
+    document.getElementById('customScaleRow').style.display = 'none';
+    document.getElementById('globalRotation').value = '0';
+  }
+  syncPhotoModeUI();
+  saveSettings();
+  updatePreview();
+}
 function onFitChange() {
   var isCustom = document.getElementById('fitMode').value === 'custom';
   document.getElementById('customScaleRow').style.display = isCustom ? 'flex' : 'none';
-  document.getElementById('customScaleHint').style.display = isCustom ? 'block' : 'none';
   updatePreview();
 }
 function setMP(t, b, l, r) {
@@ -4268,13 +4644,17 @@ function _autoFooterMargin() {
 function getSettings() {
   var ps = document.getElementById('paperSize').value;
   var pw, ph;
-  if (ps === 'custom') { pw = parseFloat(document.getElementById('customW').value) || 210; ph = parseFloat(document.getElementById('customH').value) || 297; }
+  if (ps === 'custom') { var c = getCustomPaperMm(); pw = c.w; ph = c.h; }
   else { var p = PAPER[ps] || PAPER.A4; pw = p.w; ph = p.h; }
   if (document.getElementById('orientation').value === 'landscape') { var tmp = pw; pw = ph; ph = tmp; }
+  var photoMode = !!S.feat.photoMode;
+  var photoSize = getPhotoSizeMm();
   return {
     paperW: pw, paperH: ph, cols: S.layout.cols, rows: S.layout.rows,
     reimburseMode: !!S.feat.reimburse,
     reimburseHeight: parseFloat(document.getElementById('reimburseHeight').value) || 120,
+    // 报销单发票水平对齐：left / center / right（纵向始终贴段顶）
+    reimburseAlign: document.getElementById('reimburseAlign').value || 'left',
     marginTop: parseFloat(document.getElementById('marginTop').value),
     marginBottom: parseFloat(document.getElementById('marginBottom').value),
     marginLeft: parseFloat(document.getElementById('marginLeft').value),
@@ -4307,21 +4687,28 @@ function getSettings() {
     pasteSigRowH: parseFloat(document.getElementById('pasteSigRowH').value) || 8,
     pasteSigBodyH: parseFloat(document.getElementById('pasteSigBodyH').value) || 14,
     pasteSigGap: parseFloat(document.getElementById('pasteSigGap').value) || 2,
+    // 相纸模式：按证件照实际尺寸整版排列，忽略普通行列 / 边距 / 间距
+    photoMode: photoMode,
+    photoW: photoSize.w, photoH: photoSize.h,
+    photoGap: parseFloat(document.getElementById('photoGap').value) || 0,
+    photoMargin: parseFloat(document.getElementById('photoMargin').value) || 0,
+    photoCols: parseInt(document.getElementById('photoCols').value) || 0,
+    photoRows: parseInt(document.getElementById('photoRows').value) || 0,
     cutline: S.feat.cutline, number: S.feat.number, border: S.feat.border,
-    borderWidth: 1, borderColor: '#000000', trimWhite: S.feat.trimWhite,
+    borderWidth: 1, borderColor: '#000000', trimWhite: photoMode ? false : S.feat.trimWhite,
     trimPad: getTrimPad(),
     copyBadge: S.feat.copyBadge,
-    watermark: S.feat.watermark,
+    watermark: photoMode ? false : S.feat.watermark,
     watermarkText: document.getElementById('wmText').value,
     watermarkOpacity: parseFloat(document.getElementById('wmOpacity').value) / 100,
     watermarkColor: document.getElementById('wmColor').value,
     watermarkAngle: parseFloat(document.getElementById('wmAngle').value),
     watermarkSize: parseFloat(document.getElementById('wmSize').value),
-    pageNum: S.feat.pageNum && !S.feat.pasteMode, printDate: S.feat.printDate && !S.feat.pasteMode,
+    pageNum: photoMode ? false : (S.feat.pageNum && !S.feat.pasteMode), printDate: photoMode ? false : (S.feat.printDate && !S.feat.pasteMode),
     // 粘贴单是一张表单，页码/日期/自定义页脚会与装订线/签字栏打架，本模式下停用
     //（与魔改版语义一致；Rust 端 slot_size_mm 对 paste 不叠加页脚扣除）
-    footerText: S.feat.footer && !S.feat.pasteMode ? document.getElementById('footerText').value : '',
-    footerMargin: (S.feat.pageNum || S.feat.printDate || S.feat.footer) ? (S.feat.customFM ? parseFloat(document.getElementById('footerMargin').value) || 0 : _autoFooterMargin()) : 0,
+    footerText: !photoMode && S.feat.footer && !S.feat.pasteMode ? document.getElementById('footerText').value : '',
+    footerMargin: !photoMode && !S.feat.pasteMode && (S.feat.pageNum || S.feat.printDate || S.feat.footer) ? (S.feat.customFM ? parseFloat(document.getElementById('footerMargin').value) || 0 : _autoFooterMargin()) : 0,
     customFm: S.feat.customFM,
     // 老打印机兼容模式（issue #46）：生成后整页栅格化为位图 PDF，进缓存比较（切换即失效）
     compatFlat: !!S.feat.compatFlat,
@@ -4368,8 +4755,11 @@ function buildPages(files, settings) {
 // =====================================================
 var _saveTimer = null;
 var _importingSettings = false; // 导入写入后到 reload 之间禁止自动保存，防止内存旧配置覆盖刚导入的内容
+var _restoringSettings = false; // 启动恢复期禁止回写，防止空 DOM / 空 S.files 快照覆盖已恢复的文件级记忆
+var _restoreSavePending = false; // 恢复期内被拦截的保存请求，解锁后补一次，避免吞掉启动瞬间的操作
 function saveSettings() {
   if (_importingSettings) return;
+  if (_restoringSettings) { _restoreSavePending = true; return; }
   try { localStorage.setItem('ticketchan-settings', JSON.stringify(collectSettings())); } catch(e) {}
 }
 function updatePreview() {
@@ -4377,9 +4767,17 @@ function updatePreview() {
   _saveTimer = setTimeout(saveSettings, 500);
   var files = getActiveFiles();
   document.getElementById('stFiles').textContent = S.files.filter(function(f) { return f.checked; }).length + ' 张';
-  document.getElementById('stLayout').textContent = S.feat.reimburse ? '报销单' : (S.layout.rows + '×' + S.layout.cols);
+  var stLayoutText;
+  if (S.feat.photoMode) {
+    syncPhotoModeUI();
+    var _pg = getPhotoGrid(getSettings());
+    stLayoutText = '\u76f8\u7eb8 ' + _pg.cols + '\u00D7' + _pg.rows;
+  } else {
+    stLayoutText = S.feat.reimburse ? '\u62a5\u9500\u5355' : (S.layout.rows + '\u00D7' + S.layout.cols);
+  }
+  document.getElementById('stLayout').textContent = stLayoutText;
   var ps = document.getElementById('paperSize').value;
-  document.getElementById('stPaper').textContent = ps + ' ' + (document.getElementById('orientation').value === 'portrait' ? '纵' : '横');
+  document.getElementById('stPaper').textContent = paperDisplayLabel(ps) + ' ' + (document.getElementById('orientation').value === 'portrait' ? '纵' : '横');
   updatePrintBtn();
 
   if (!files.length) {
@@ -4435,7 +4833,7 @@ function getFitZoom() {
   if (!wrap) return 100;
   var ps = document.getElementById('paperSize').value;
   var pw, ph;
-  if (ps === 'custom') { pw = parseFloat(document.getElementById('customW').value) || 210; ph = parseFloat(document.getElementById('customH').value) || 297; }
+  if (ps === 'custom') { var c = getCustomPaperMm(); pw = c.w; ph = c.h; }
   else { var p = PAPER[ps] || PAPER.A4; pw = p.w; ph = p.h; }
   if (document.getElementById('orientation').value === 'landscape') { var tmp = pw; pw = ph; ph = tmp; }
   var fitScale = Math.min((wrap.clientWidth - 40) / (pw * MM2PX), (wrap.clientHeight - 40) / (ph * MM2PX), 1.2);
@@ -4477,6 +4875,7 @@ document.addEventListener('click', function(e) {
   }
   var xm = document.getElementById('ctxMenu');
   if (xm && !xm.classList.contains('hidden') && !e.target.closest('#ctxMenu')) xm.classList.add('hidden');
+  if (!e.target.closest('#slotCopyMenu') && !e.target.closest('#slotCopiesBtn')) closeSlotCopyMenu();
 });
 function updatePrintBtn() { document.getElementById('printBtn').disabled = !S.files.some(function(f) { return f.checked; }); }
 function updateSummaryBtn() { var btn = document.getElementById('summaryBtn'); if (btn) btn.disabled = !S.files.some(function(f) { return f.checked; }); }
@@ -4489,6 +4888,7 @@ function collectSettings() {
   var o = {
     layout: { cols: S.layout.cols, rows: S.layout.rows },
     paperSize: document.getElementById('paperSize').value,
+    paperUnit: document.getElementById('paperUnit').value,
     orientation: document.getElementById('orientation').value,
     customW: document.getElementById('customW').value,
     customH: document.getElementById('customH').value,
@@ -4505,20 +4905,26 @@ function collectSettings() {
     colorMode: document.getElementById('colorMode').value,
     pageOrder: document.getElementById('pageOrder').value,
     printMode: document.getElementById('printMode').value,
-    printerName: document.getElementById('printerSel').value || null,
+    printerName: document.getElementById('printerSel').value || (typeof _savedPrinterName === 'string' && _savedPrinterName) || null,
     feat: {}
   };
-  var featKeys = ['cutline','number','border','trimWhite','watermark','collate','duplex','pageNum','printDate','footer','autoOpenPdf','customFM','slotAdjMemory','fileListMemory','autoDedup','reimburse','copyBadge','autoEnhance','compatFlat','pasteMode','pasteBindLine','pasteShowSig'];
+  var featKeys = ['cutline','number','border','trimWhite','watermark','collate','duplex','pageNum','printDate','footer','autoOpenPdf','customFM','slotAdjMemory','fileListMemory','autoDedup','reimburse','copyBadge','autoEnhance','compatFlat','pasteMode','pasteBindLine','pasteShowSig','photoMode'];
   featKeys.forEach(function(k) { o.feat[k] = S.feat[k]; });
   o.reimburseHeight = document.getElementById('reimburseHeight').value;
+  o.reimburseAlign = document.getElementById('reimburseAlign').value;
   o.trimPad = getTrimPad();
   o.quickLayouts = cloneQuickLayouts(S.quickLayouts);
   o.quickLayoutMax = normalizeQuickLayoutMax(S.quickLayoutMax);
   o.fileView = S.fileView;
   o.filterCollapsed = S.filterCollapsed;
-  // Save per-file slot adjustments when memory is enabled
+  o.viewZoom = S.viewZoom;
+  // Save per-file slot adjustments when memory is enabled.
+  // 以已恢复的内存 Map 打底再用当前文件覆盖：启动时 S.files 可能还没恢复，
+  // 直接重建会把上次记住的调整写成空表。
   if (S.feat.slotAdjMemory) {
     var adjMap = {};
+    var savedAdj = S._fileAdjMap || {};
+    Object.keys(savedAdj).forEach(function(k) { adjMap[k] = savedAdj[k]; });
     S.files.forEach(function(f) {
       if (f.name && (f.slotScale !== undefined || f.slotOffsetX !== undefined || f.slotOffsetY !== undefined)) {
         adjMap[f.name] = {
@@ -4557,18 +4963,33 @@ function collectSettings() {
   o.pasteSigRowH = document.getElementById('pasteSigRowH').value;
   o.pasteSigBodyH = document.getElementById('pasteSigBodyH').value;
   o.pasteSigGap = document.getElementById('pasteSigGap').value;
+  // 相纸模式参数（始终保存，模式关闭时保留用户设置）
+  o.photoSize = document.getElementById('photoSize').value;
+  o.photoCustomW = document.getElementById('photoCustomW').value;
+  o.photoCustomH = document.getElementById('photoCustomH').value;
+  o.photoGap = document.getElementById('photoGap').value;
+  o.photoMargin = document.getElementById('photoMargin').value;
+  o.photoCols = document.getElementById('photoCols').value;
+  o.photoRows = document.getElementById('photoRows').value;
   if (_summaryActiveCols && _summaryActiveCols.length > 0) {
     o.summaryCols = _summaryActiveCols;
   }
   // Persist rename template and separator
   if (_renameTemplate && _renameTemplate.length > 0) o.renameTemplate = _renameTemplate;
   if (_renameSeparator) o.renameSeparator = _renameSeparator;
-  // Persist per-file notes (keyed by file name)
+  // Persist per-file notes (keyed by file name)，同样以内存 Map 打底
   var notesMap = {};
-  S.files.forEach(function(f) { if (f.note && f.name) notesMap[f.name] = f.note; });
+  var savedNotes = S._notesMap || {};
+  Object.keys(savedNotes).forEach(function(k) { notesMap[k] = savedNotes[k]; });
+  S.files.forEach(function(f) {
+    if (!f.name) return;
+    if (f.note) notesMap[f.name] = f.note;
+    else delete notesMap[f.name];
+  });
   if (Object.keys(notesMap).length > 0) o.summaryNotes = notesMap;
-  // Save printed state (always, regardless of fileListMemory switch)
+  // Save printed state (always, regardless of fileListMemory switch)，以内存 Map 打底
   var printedMap = {};
+  Object.keys(_printedMap || {}).forEach(function(k) { printedMap[k] = true; });
   S.files.forEach(function(f) {
     var key = f._filePath || f._pdfPath;
     if (key && f._printed) printedMap[key] = true;
@@ -4611,15 +5032,24 @@ function loadSettings() {
   if (o.quickLayoutMax != null) S.quickLayoutMax = normalizeQuickLayoutMax(o.quickLayoutMax);
   if (o.fileView === 'grid') S.fileView = 'grid';
   if (o.filterCollapsed === false) S.filterCollapsed = false;
+  if (o.viewZoom != null) {
+    var _zv = parseInt(o.viewZoom, 10);
+    S.viewZoom = (isNaN(_zv) || _zv < 0 || _zv > 500) ? 0 : _zv;
+    updateZoomDisplay();
+  }
   syncFileViewBtn();
   syncFilterPanel();
   updateFilterSummary();
   document.getElementById('quickLayoutMax').value = S.quickLayoutMax;
   renderQuickLayoutBar();
+  if (o.paperUnit) document.getElementById('paperUnit').value = o.paperUnit === 'px' ? 'px' : 'mm';
+  renderPaperOptions();
+  renderPhotoSizeOptions();
+  syncPaperUnitUI();
   if (o.paperSize) { document.getElementById('paperSize').value = o.paperSize; onPaperChange(); }
   if (o.orientation) document.getElementById('orientation').value = o.orientation;
-  if (o.customW) document.getElementById('customW').value = o.customW;
-  if (o.customH) document.getElementById('customH').value = o.customH;
+  if (o.customW != null) document.getElementById('customW').value = o.customW;
+  if (o.customH != null) document.getElementById('customH').value = o.customH;
   var sliders = ['marginTop','marginBottom','marginLeft','marginRight','gapH','gapV','customScale'];
   sliders.forEach(function(id) {
     if (o[id] != null) {
@@ -4651,7 +5081,8 @@ function loadSettings() {
       compatFlat: 'toggleCompatFlat',
       pasteMode: 'togglePasteMode',
       pasteBindLine: 'togglePasteBindLine',
-      pasteShowSig: 'togglePasteSig'
+      pasteShowSig: 'togglePasteSig',
+      photoMode: 'togglePhotoMode'
     };
     Object.keys(featMap).forEach(function(k) {
       if (o.feat[k] != null) {
@@ -4708,18 +5139,25 @@ function loadSettings() {
     var k = id.replace(/N$/, '');
     if (o[k] != null) document.getElementById(id).value = o[k];
   });
+  // 相纸模式参数恢复
+  var photoIds = ['photoSize','photoCustomW','photoCustomH','photoGap','photoMargin','photoCols','photoRows'];
+  photoIds.forEach(function(id) {
+    if (o[id] != null) document.getElementById(id).value = o[id];
+  });
   if (o.footerText != null) document.getElementById('footerText').value = o.footerText;
   if (o.footerMargin != null) {
     document.getElementById('footerMargin').value = o.footerMargin;
     document.getElementById('footerMarginN').value = o.footerMargin;
   }
   if (o.reimburseHeight != null) document.getElementById('reimburseHeight').value = o.reimburseHeight;
+  if (o.reimburseAlign != null) document.getElementById('reimburseAlign').value = o.reimburseAlign;
   if (o.trimPad != null) {
     var _tp = parseInt(o.trimPad, 10);
     S.feat.trimPad = isNaN(_tp) ? 3 : Math.max(0, Math.min(TRIM_PAD_MAX, _tp));
   }
   document.getElementById('trimPad').value = getTrimPad();
   syncReimburseUI();
+  syncPhotoModeUI();
   // Restore summary table column selection
   if (o.summaryCols && Array.isArray(o.summaryCols) && o.summaryCols.length > 0) {
     _summaryActiveCols = o.summaryCols;
@@ -4761,14 +5199,18 @@ function togglePref(k, btn) {
 function toggleReimburseMode(btn) {
   S.feat.reimburse = !S.feat.reimburse;
   btn.classList.toggle('on', S.feat.reimburse);
-  // 报销单与粘贴单互斥：开启报销单时关闭粘贴单
+  // 报销单与粘贴单/相纸模式互斥：开启报销单时关闭其他版式模式
   if (S.feat.reimburse && S.feat.pasteMode) {
     S.feat.pasteMode = false;
     document.getElementById('togglePasteMode').classList.remove('on');
     document.getElementById('pasteOpts').style.display = 'none';
     toast('报销单模式已接管版式，已关闭粘贴单模式');
   }
-  syncReimburseUI();
+  if (S.feat.reimburse && S.feat.photoMode) {
+    S.feat.photoMode = false;
+    document.getElementById('togglePhotoMode').classList.remove('on');
+  }
+  syncPhotoModeUI();
   saveSettings();
   updatePreview();
 }
@@ -4776,14 +5218,28 @@ function toggleReimburseMode(btn) {
 // 同步报销单模式相关 UI 状态（选项显隐 + 网格/间距/裁切线控件置灰）
 function syncReimburseUI() {
   var on = !!S.feat.reimburse;
+  var photo = !!S.feat.photoMode;
   document.getElementById('reimburseOpts').style.display = on ? 'block' : 'none';
-  ['gridSel', 'customLayoutRow', 'gapSec', 'cutlineRow'].forEach(function(id) {
+  var lockGrid = on || photo;
+  ['gridSel', 'customLayoutRow', 'gapSec'].forEach(function(id) {
     var el = document.getElementById(id);
     if (el) {
-      el.style.opacity = on ? '0.4' : '';
-      el.style.pointerEvents = on ? 'none' : '';
+      el.style.opacity = lockGrid ? '0.4' : '';
+      el.style.pointerEvents = lockGrid ? 'none' : '';
     }
   });
+  // 裁切线：相纸模式保留开关（issue #57），报销单模式段边界强制绘制才置灰
+  var cutRow = document.getElementById('cutlineRow');
+  if (cutRow) {
+    cutRow.style.opacity = on ? '0.4' : '';
+    cutRow.style.pointerEvents = on ? 'none' : '';
+  }
+  // 相纸模式接管普通边距；报销单模式仍需边距作为段内安全边距，不能置灰
+  var marginSec = document.getElementById('marginSec');
+  if (marginSec) {
+    marginSec.style.opacity = photo ? '0.4' : '';
+    marginSec.style.pointerEvents = photo ? 'none' : '';
+  }
 }
 
 // 粘贴单标准边距：上 2.08cm（装订区）、下/左/右 0.41cm
@@ -4866,6 +5322,8 @@ async function exportSettings() {
   data.pdfTextEnabled = !!S.feat.pdfTextEnabled;
   data.ocrPrecision = S.ocrPrecision;
   data.saveDir = getSaveDir();
+  data.updateChannel = getUpdateChannel();
+  data.autoUpdateCheck = !isIgnoreAllUpdates();
   var json = JSON.stringify(data, null, 2);
   if (isTauri && invoke) {
     try {
@@ -4942,7 +5400,7 @@ async function importSettings() {
   }
   if (!confirm('导入将覆盖当前全部设置与本地记忆（已打印标记 / 文件列表 / 单票调整 / 备注），并重新加载界面，确认继续？')) return;
   // 设置主体写回 ticketchan-settings；独立存储的偏好项写回各自的 key
-  var extraKeys = ['_meta', 'theme', 'amtMode', 'ocrEnabled', 'pdfTextEnabled', 'ocrPrecision', 'saveDir'];
+  var extraKeys = ['_meta', 'theme', 'amtMode', 'ocrEnabled', 'pdfTextEnabled', 'ocrPrecision', 'saveDir', 'updateChannel', 'autoUpdateCheck'];
   var settings = {};
   Object.keys(data).forEach(function(k) { if (extraKeys.indexOf(k) < 0) settings[k] = data[k]; });
   _importingSettings = true; // 写入期间起锁：清挂起的防抖保存 + 拦截重载窗口内新触发的自动保存
@@ -4954,6 +5412,8 @@ async function importSettings() {
     if (typeof data.pdfTextEnabled === 'boolean') localStorage.setItem('ticketchan-pdf-text-enabled', data.pdfTextEnabled ? '1' : '0');
     if (data.ocrPrecision === 'fast' || data.ocrPrecision === 'standard' || data.ocrPrecision === 'precise') localStorage.setItem('ticketchan-ocr-precision', data.ocrPrecision);
     if (typeof data.saveDir === 'string') localStorage.setItem('ticketchan-save-dir', data.saveDir);
+    if (data.updateChannel === 'stable' || data.updateChannel === 'beta') localStorage.setItem('ticketchan-update-channel', data.updateChannel);
+    if (typeof data.autoUpdateCheck === 'boolean') localStorage.setItem(_UPDATE_IGNORE_ALL_KEY, data.autoUpdateCheck ? '' : '1');
   } catch(e) {
     _importingSettings = false; // 写入失败解锁，恢复自动保存
     toast('导入失败: ' + e);
@@ -4969,19 +5429,24 @@ function resetSettings(scope) {
   // scope='layout'：仅恢复「排版」页（纸张/行列/边距/间距/水印等），不动打印与偏好（issue #33）
   var layoutOnly = scope === 'layout';
   if (!confirm(layoutOnly ? '仅恢复「排版」页默认设置（纸张/行列/边距/间距/水印等），不影响打印、OCR、主题等偏好？' : '确认恢复所有默认设置？')) return;
-  var featDefaults = { cutline: true, number: false, border: false, trimWhite: false, trimPad: 3, watermark: false, footer: false, customFM: false, collate: true, duplex: false, pageNum: false, printDate: false, autoOpenPdf: true, ocrEnabled: false, pdfTextEnabled: true, slotAdjMemory: false, fileListMemory: false, autoDedup: false, reimburse: false, copyBadge: false, autoEnhance: false, compatFlat: false, pasteMode: false, pasteBindLine: true, pasteShowSig: true };
+  var featDefaults = { cutline: true, number: false, border: false, trimWhite: false, trimPad: 3, watermark: false, footer: false, customFM: false, collate: true, duplex: false, pageNum: false, printDate: false, autoOpenPdf: true, ocrEnabled: false, pdfTextEnabled: true, slotAdjMemory: false, fileListMemory: false, autoDedup: false, reimburse: false, copyBadge: false, autoEnhance: false, compatFlat: false, pasteMode: false, pasteBindLine: true, pasteShowSig: true, photoMode: false };
   S.layout = { cols: 1, rows: 1 };
   if (layoutOnly) {
-    ['cutline','number','border','trimWhite','watermark','reimburse','copyBadge','pasteMode'].forEach(function(k) { S.feat[k] = featDefaults[k]; });
+    ['cutline','number','border','trimWhite','watermark','reimburse','copyBadge','pasteMode','photoMode'].forEach(function(k) { S.feat[k] = featDefaults[k]; });
   } else {
     S.feat = featDefaults;
   }
-  S.viewZoom = 0;
-  S.quickLayouts = defaultQuickLayouts();
-  S.quickLayoutMax = 0;
-  document.getElementById('quickLayoutMax').value = 0;
-  renderQuickLayoutBar();
-  renderQuickLayoutList();
+  if (!layoutOnly) {
+    S.viewZoom = 0;
+    S.quickLayouts = defaultQuickLayouts();
+    S.quickLayoutMax = 0;
+    document.getElementById('quickLayoutMax').value = 0;
+    renderQuickLayoutBar();
+    renderQuickLayoutList();
+  }
+  document.getElementById('paperUnit').value = 'mm';
+  renderPaperOptions();
+  syncPaperUnitUI();
   document.getElementById('paperSize').value = 'A4';
   document.getElementById('orientation').value = 'landscape';
   document.getElementById('customRows').value = 1;
@@ -5019,9 +5484,19 @@ function resetSettings(scope) {
   document.getElementById('togglePasteMode').classList.remove('on');
   document.getElementById('pasteOpts').style.display = 'none';
   document.getElementById('reimburseHeight').value = 120;
+  document.getElementById('reimburseAlign').value = 'left';
   S.feat.trimPad = 3;
   document.getElementById('trimPad').value = 3;
-  syncReimburseUI();
+  // 相纸模式恢复默认
+  document.getElementById('togglePhotoMode').classList.remove('on');
+  document.getElementById('photoSize').value = 'photo1';
+  document.getElementById('photoCustomW').value = 25;
+  document.getElementById('photoCustomH').value = 35;
+  document.getElementById('photoGap').value = 2;
+  document.getElementById('photoMargin').value = 3;
+  document.getElementById('photoCols').value = 0;
+  document.getElementById('photoRows').value = 0;
+  syncPhotoModeUI();
   // 清晰度优化恢复默认
   if (!layoutOnly) {
     document.getElementById('toggleAutoEnhance').classList.remove('on');
@@ -5049,6 +5524,7 @@ function resetSettings(scope) {
   document.getElementById('pasteSigGap').value = 2;
   if (layoutOnly) {
     syncLayoutHighlight();
+    saveSettings();
     updatePreview();
     toast('已恢复默认版面设置');
     return;
@@ -5081,6 +5557,10 @@ function resetSettings(scope) {
   try { localStorage.removeItem('ticketchan-ocr-enabled'); } catch(e) {}
   try { localStorage.removeItem('ticketchan-ocr-precision'); } catch(e) {}
   try { localStorage.removeItem('ticketchan-pdf-text-enabled'); } catch(e) {}
+  try { localStorage.removeItem('ticketchan-update-channel'); } catch(e) {}
+  try { localStorage.removeItem(_UPDATE_IGNORE_ALL_KEY); } catch(e) {}
+  syncUpdateChannelUI();
+  syncAutoUpdateCheckUI();
   try { localStorage.removeItem('ticketchan-settings'); } catch(e) {}
   try { localStorage.removeItem('ticketchan-print-mode'); } catch(e) {}
   _renameTemplate = ['amountTax', 'sellerName', 'invoiceNo'];
@@ -5199,15 +5679,9 @@ document.getElementById('previewWrap').addEventListener('wheel', function(e) {
   }
 }, { passive: false });
 
-// Double-click: on selected slot → reset per-slot adj (size+position); elsewhere → reset preview zoom
+// Double-click on blank preview area: reset view zoom (票面双击不再设份数，见 issue #60)
 document.getElementById('previewWrap').addEventListener('dblclick', function(e) {
-  if (S.selectedSlot >= 0) {
-    var slotEl = e.target.closest('.invoice-slot');
-    if (slotEl && parseInt(slotEl.dataset.slotIdx) === S.selectedSlot) {
-      resetSlotAdj();
-      return;
-    }
-  }
+  if (e.target.closest('.invoice-slot')) return;
   if (S.viewZoom !== 0) { setZoom('fit'); }
 });
 
@@ -5290,6 +5764,7 @@ window._tauriFileDrop = function(paths) {
 // =====================================================
 if (isTauri && invoke) {
   invoke('get_config').then(function(config) {
+    if (config && typeof config.hasOcr === 'boolean') _ocrBuildFeature = config.hasOcr;
     if (config && config.renderDpi && config.renderDpi !== PDF_RENDER_DPI) {
       console.error('[DPI] 前后端 DPI 不一致！前端=' + PDF_RENDER_DPI + ', Rust=' + config.renderDpi + '，请检查代码');
       toast('警告：渲染DPI配置不一致，打印质量可能受影响', 5000);
@@ -5336,12 +5811,16 @@ document.getElementById('orientation').value = 'landscape';
 (function() {
   try {
     var pm = localStorage.getItem('ticketchan-print-mode');
-    if (pm && (pm === 'confirm' || pm === 'direct' || pm === 'pdfium' || pm === 'pdf')) {
-      document.getElementById('printMode').value = pm;
-    } else {
+    if (!(pm === 'confirm' || pm === 'direct' || pm === 'pdfium' || pm === 'pdf')) {
       // 默认 PDFium 静默打印 — PDF 阅读器模式无法可靠切换打印机(Edge/Chrome 内置查看器不支持 printto)
       document.getElementById('printMode').value = 'pdfium';
+      return;
     }
+    // 旧版独立键 → ticketchan-settings.printMode 的一次性迁移（settings 优先）
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem('ticketchan-settings') || 'null'); } catch(e) {}
+    if (!saved || !saved.printMode) document.getElementById('printMode').value = pm;
+    localStorage.removeItem('ticketchan-print-mode');
   } catch(e) {}
 })();
 
@@ -5390,7 +5869,19 @@ var _renameTemplate = ['amountTax', 'sellerName', 'invoiceNo'];
 var _renameSeparator = '_';
 
 // Restore all layout & feature settings
+// 恢复期间上锁：loadSettings 内部的 onPaperChange/onFitChange 会排一次 500ms 防抖保存，
+// 若此时 S.files 还没恢复，会把打印机 / 已打印标记 / 备注 / 单票调整写成空表。
+// 锁必须活过那次防抖（1000ms）再解，否则等于没加。
+renderPaperOptions();
+renderPhotoSizeOptions();
+_restoringSettings = true;
 loadSettings();
+if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+setTimeout(function() {
+  _restoringSettings = false;
+  if (_restoreSavePending) { _restoreSavePending = false; saveSettings(); }
+}, 1000);
+syncPhotoModeUI();
 applyPerSectionLabelWidth();
 
 // Render quick layout buttons — also covers first run (loadSettings returns early with no saved data)
@@ -5404,6 +5895,13 @@ renderQuickLayoutList();
   function showApp() {
     syncAutoUpdateCheckUI();
     if (isTauri && invoke) {
+      // 上次更新若只替换到一半（例如文件被占用），启动时补偿完成并自动重启
+      invoke('check_pending_update').then(function(r) {
+        if (r === 'applied') console.log('[Update] 已应用待安装更新');
+      }).catch(function(err) {
+        console.warn('[Update] pending update skipped:', err);
+      });
+      initUpdateProgressListener();
       // Check OCR availability at startup
       invoke('check_ocr_available').then(function(available) {
         hasOcr = !!available;
@@ -5439,6 +5937,7 @@ renderQuickLayoutList();
         // Update version display in prefs panel too
         var pv = document.getElementById('prefsCurrentVersion');
         if (pv) pv.textContent = 'v' + v;
+        syncUpdateChannelUI();
         console.log('发票酱 v' + v + ' | isTauri:', isTauri);
         // Auto-check for updates 5s after startup (silent — only shows modal if update exists)
         setTimeout(function() { checkForUpdates(true); }, 5000);
@@ -5473,7 +5972,65 @@ var _UPDATE_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 var _UPDATE_IGNORE_KEY = 'ticketchan-update-ignore';
 var _UPDATE_IGNORE_ALL_KEY = 'ticketchan-update-ignore-all';
 var _updateChecking = false;
+var _updateRequestId = 0; // 切渠道时令旧请求失效，允许立即检查新渠道
 var _lastUpdateInfo = null;
+var _UPDATE_CHANNEL_KEY = 'ticketchan-update-channel';
+
+// 应用内自更新状态（issue #58）：下载 → 校验 → 替换 exe → 自动重启
+var _updateAssetPicked = null; // 当前可自动替换的产物（带 digest）
+var _updateDownloading = false;
+var _updateApplying = false;
+var _updateProgressListening = false;
+
+/** 安装版本的默认渠道：版本号带预发布后缀（如 2.6.16-beta.3）即测试版 */
+function getDefaultUpdateChannel() {
+  return APP_VERSION.indexOf('-') >= 0 ? 'beta' : 'stable';
+}
+
+/**
+ * 当前使用的更新渠道：设置→关于可手动切换并持久化，未选择时按安装版本。
+ * 正式版渠道只查 GitHub /releases/latest（不含预发布）；
+ * 测试版渠道查完整 release 列表，按 semver 取高于当前版本的最大者——
+ * 避免旧正式版被当成新版本提示（issue #58）。
+ */
+function getUpdateChannel() {
+  try {
+    var saved = localStorage.getItem(_UPDATE_CHANNEL_KEY);
+    if (saved === 'stable' || saved === 'beta') return saved;
+  } catch(e) {}
+  return getDefaultUpdateChannel();
+}
+
+function setUpdateChannel(v) {
+  if (v !== 'stable' && v !== 'beta') return;
+  if (v === getUpdateChannel()) return;
+  try { localStorage.setItem(_UPDATE_CHANNEL_KEY, v); } catch(e) {}
+  _updateRequestId++;
+  _updateChecking = false;
+  _lastUpdateInfo = null;
+  closeUpdateModal();
+  // 渠道变了旧检查结果不再适用
+  try { localStorage.removeItem(_UPDATE_CACHE_KEY); } catch(e) {}
+  syncUpdateChannelUI();
+  toast(v === 'beta' ? '已切换到测试版更新渠道' : '已切换到正式版更新渠道', 2500);
+}
+
+function syncUpdateChannelUI() {
+  var ch = getUpdateChannel();
+  var sel = document.getElementById('updateChannel');
+  if (sel) sel.value = ch;
+  // 徽章标示「安装的版本类型」，与可切换的检查渠道相互独立
+  var isBetaInstall = getDefaultUpdateChannel() === 'beta';
+  var badge = document.getElementById('prefsChannelBadge');
+  if (badge) {
+    badge.textContent = isBetaInstall ? '测试版' : '正式版';
+    badge.classList.toggle('beta', isBetaInstall);
+  }
+  var desc = document.getElementById('prefsChannelDesc');
+  if (desc) desc.textContent = ch === 'beta'
+    ? '检查测试版与正式版中版本更高的一个；正式版用户不会收到测试版提示'
+    : '只检查稳定版本，不会收到测试版更新提示';
+}
 
 function getIgnoredUpdateVersion() {
   try { return localStorage.getItem(_UPDATE_IGNORE_KEY) || ''; } catch(e) { return ''; }
@@ -5501,16 +6058,20 @@ function checkForUpdates(silent) {
   if (!isTauri || !invoke) return;
   if (_updateChecking) return;
   _updateChecking = true;
+  var channel = getUpdateChannel();
+  var version = APP_VERSION;
+  var requestId = ++_updateRequestId;
 
   // Silent auto-check: respect cache TTL to avoid rate limits.
-  // 缓存必须属于当前版本（data.ver）：升级后旧缓存的 has_update 是对旧版本算的，
-  // 沿用会导致已升级用户被误弹"发现新版本"（issue #30）
+  // 缓存必须属于当前版本（data.ver）与当前渠道（data.channel）：升级或切换渠道后
+  // 旧缓存的 has_update 是针对旧状态算的，沿用会导致误弹/漏弹
   if (silent) {
     try {
       var cached = localStorage.getItem(_UPDATE_CACHE_KEY);
       if (cached) {
         var data = JSON.parse(cached);
-        if (data.ver === APP_VERSION && Date.now() - data.ts < _UPDATE_CACHE_TTL) {
+        if (data.ver === version && data.channel === channel && data.info && data.info.channel === channel &&
+            Date.now() - data.ts < _UPDATE_CACHE_TTL) {
           _updateChecking = false;
           if (shouldAutoShowUpdate(data.info)) {
             showUpdateModal(data.info);
@@ -5523,11 +6084,12 @@ function checkForUpdates(silent) {
 
   if (!silent) toast('正在检查更新...', 1500);
 
-  invoke('check_for_updates').then(function(info) {
+  invoke('check_for_updates', { channel: channel }).then(function(info) {
+    if (requestId !== _updateRequestId || channel !== getUpdateChannel() || version !== APP_VERSION) return;
     _updateChecking = false;
     // Cache result for silent auto-check
     try {
-      localStorage.setItem(_UPDATE_CACHE_KEY, JSON.stringify({ ts: Date.now(), ver: APP_VERSION, info: info }));
+      localStorage.setItem(_UPDATE_CACHE_KEY, JSON.stringify({ ts: Date.now(), ver: version, channel: channel, info: info }));
     } catch(e) {}
 
     if (info.has_update) {
@@ -5536,9 +6098,10 @@ function checkForUpdates(silent) {
         showUpdateModal(info);
       }
     } else if (!silent) {
-      toast('已是最新版本 v' + info.current_version, 2500);
+      toast((channel === 'beta' ? '已是最新测试版 v' : '已是最新版本 v') + info.current_version, 2500);
     }
   }).catch(function(err) {
+    if (requestId !== _updateRequestId || channel !== getUpdateChannel() || version !== APP_VERSION) return;
     _updateChecking = false;
     if (!silent) toast('检查更新失败: ' + err, 4000);
     console.warn('[Update] check failed:', err);
@@ -5553,7 +6116,7 @@ function ignoreUpdateVersion() {
   var v = (_lastUpdateInfo && _lastUpdateInfo.latest_version) || '';
   if (v) {
     try { localStorage.setItem(_UPDATE_IGNORE_KEY, v); } catch(e) {}
-    toast('已忽略 v' + v + '，发布更新版本后会再次提醒', 3000);
+    toast('已跳过 v' + v + '，发布更新版本后会再次提醒', 3000);
   }
   closeUpdateModal();
 }
@@ -5583,12 +6146,237 @@ function syncAutoUpdateCheckUI() {
 }
 
 /**
+ * Release notes 轻量 Markdown 渲染（更新说明来自 CHANGELOG 段落）：
+ * 支持 ### 小标题、- 列表、> 引用、--- 分隔、粗体、代码与 http(s) 链接。
+ * 先整体转义 HTML 再做行内替换，避免说明文本注入。
+ */
+function renderReleaseNotes(text) {
+  function inline(s) {
+    return s
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, function(m, label, url) {
+        // 链接走系统浏览器打开，避免 WebView 内导航离开应用
+        return '<a href="#" onclick="openUpdateAsset(\'' + url.replace(/'/g, "\\'") + '\');return false;">' + label + '</a>';
+      })
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
+  }
+  var lines = escHtml(text || '').replace(/\r\n/g, '\n').split('\n');
+  var out = [];
+  var listOpen = false;
+  function closeList() { if (listOpen) { out.push('</ul>'); listOpen = false; } }
+
+  lines.forEach(function(raw) {
+    var line = raw.trim();
+    if (!line) { closeList(); return; }
+    // 版本标题（## vX.Y.Z — …）直接跳过，弹窗顶部已展示
+    if (/^##\s/.test(line)) { closeList(); return; }
+    if (/^_.*_$/.test(line)) {        // _2026-10-29_ 日期行
+      closeList();
+      out.push('<div class="update-quote">' + inline(line.replace(/^_+|_+$/g, '')) + '</div>');
+      return;
+    }
+    if (/^-{3,}$/.test(line)) { closeList(); out.push('<hr>'); return; }
+    var h = line.match(/^#{3,}\s*(.*)$/);
+    if (h) { closeList(); out.push('<h4>' + inline(h[1]) + '</h4>'); return; }
+    if (/^&gt;\s?/.test(line)) {
+      closeList();
+      out.push('<div class="update-quote">' + inline(line.replace(/^&gt;\s?/, '')) + '</div>');
+      return;
+    }
+    var li = line.match(/^(?:[-*•]|\d+\.)\s+(.*)$/);
+    if (li) {
+      if (!listOpen) { out.push('<ul>'); listOpen = true; }
+      out.push('<li>' + inline(li[1]) + '</li>');
+      return;
+    }
+    closeList();
+    out.push('<p>' + inline(line) + '</p>');
+  });
+  closeList();
+  return out.join('') || '<p>（无更新说明）</p>';
+}
+
+function formatUpdateSize(size) {
+  return size > 1048576
+    ? (size / 1048576).toFixed(1) + ' MB'
+    : size > 1024
+      ? (size / 1024).toFixed(0) + ' KB'
+      : size + ' B';
+}
+
+/** 从产物文件名推断版本类型：轻量/OCR × 安装包/绿色版（单文件 exe / zip） */
+function getAssetVariant(name) {
+  var n = String(name || '').toLowerCase();
+  var ocr = n.indexOf('_ocr') >= 0;
+  var kind = n.indexOf('-setup') >= 0 ? 'installer'
+    : n.slice(-4) === '.zip' ? 'portable-zip'
+      : n.slice(-4) === '.exe' ? 'portable-exe' : '';
+  var label = ocr ? 'OCR 版' : '轻量版';
+  if (kind === 'installer') label += ' · 安装包';
+  else if (kind === 'portable-zip') label += ' · 绿色版（压缩包）';
+  else if (kind === 'portable-exe') label += ' · 绿色版（单文件）';
+  return { ocr: ocr, kind: kind, label: label };
+}
+
+/** 当前安装是否为 OCR 版：编译期 feature 优先，异步探测结果为兜底 */
+function isOcrBuild() {
+  return _ocrBuildFeature === null ? hasOcr : _ocrBuildFeature;
+}
+
+/**
+ * 选择可用于应用内自更新的资产：必须与当前安装类型（轻量/OCR）一致、带 sha256 摘要，
+ * 且是可直接替换 exe 的绿色版产物——安装包（NSIS）不能当主程序用。
+ * 轻量版优先单文件 exe；OCR 版只有 zip（内含 exe + models）。
+ */
+function pickAutoUpdateAsset(info) {
+  if (!info || !info.assets || !info.assets.length) return null;
+  // 以编译期 OCR feature 为准：check_ocr_available 是异步探测，未完成时会把 OCR 版误判成轻量版
+  var wantOcr = isOcrBuild();
+  var wanted = wantOcr ? ['portable-zip', 'portable-exe'] : ['portable-exe', 'portable-zip'];
+  for (var i = 0; i < wanted.length; i++) {
+    for (var j = 0; j < info.assets.length; j++) {
+      var a = info.assets[j];
+      var v = getAssetVariant(a.name);
+      if (v.ocr !== wantOcr || v.kind !== wanted[i] || !a.download_url || !a.digest || !a.size) continue;
+      return a;
+    }
+  }
+  return null;
+}
+
+/**
+ * 监听后端 update-download-progress 事件。
+ * 项目未引入 @tauri-apps/api，直接用 Tauri 2 内部的 listen 实现注册一次即可。
+ */
+function initUpdateProgressListener() {
+  if (!isTauri || _updateProgressListening) return;
+  var internals = window.__TAURI_INTERNALS__;
+  if (!internals || !internals.transformCallback || !internals.invoke) return;
+  _updateProgressListening = true;
+  try {
+    var handlerId = internals.transformCallback(function(e) {
+      var p = (e && e.payload) || e || {};
+      if (!_updateDownloading) return;
+      renderUpdateProgress(p);
+    });
+    internals.invoke('plugin:event|listen', {
+      event: 'update-download-progress',
+      target: { kind: 'Any' },
+      handler: handlerId
+    }).catch(function() {});
+  } catch(e) { _updateProgressListening = false; }
+}
+
+function setUpdateProgressUI(show) {
+  var wrap = document.getElementById('updateProgress');
+  if (wrap) wrap.classList.toggle('hidden', !show);
+}
+
+/** 按下载状态刷新弹窗按钮：下载中只留「取消」，应用阶段全部禁用 */
+function syncUpdateDownloadUI() {
+  var busy = _updateDownloading;
+  var dl = document.getElementById('updateDownloadBtn');
+  var cancel = document.getElementById('updateCancelBtn');
+  var open = document.getElementById('updateOpenBtn');
+  if (dl) {
+    dl.classList.toggle('hidden', busy || _updateApplying || !_updateAssetPicked);
+    dl.disabled = busy || _updateApplying;
+  }
+  if (cancel) cancel.classList.toggle('hidden', !busy);
+  if (open) open.disabled = busy || _updateApplying;
+  setUpdateProgressUI(busy || _updateApplying);
+}
+
+function resetUpdateProgressState() {
+  _updateDownloading = false;
+  _updateApplying = false;
+  var fill = document.getElementById('updateProgressFill');
+  if (fill) fill.style.width = '0%';
+  var txt = document.getElementById('updateProgressText');
+  if (txt) txt.textContent = '准备下载…';
+}
+
+function renderUpdateProgress(p) {
+  var pct = (p && typeof p.percent === 'number' && isFinite(p.percent)) ? p.percent : 0;
+  pct = Math.max(0, Math.min(100, pct));
+  var fill = document.getElementById('updateProgressFill');
+  if (fill) fill.style.width = pct.toFixed(1) + '%';
+  var txt = document.getElementById('updateProgressText');
+  if (!txt) return;
+  txt.textContent = p && p.total > 0
+    ? '下载中 ' + pct.toFixed(0) + '% · ' + formatUpdateSize(p.current || 0) + ' / ' + formatUpdateSize(p.total)
+    : '下载中 ' + formatUpdateSize((p && p.current) || 0);
+}
+
+/** 下载并校验更新包，成功后自动替换 exe 并重启 */
+function startUpdateDownload() {
+  if (!_updateAssetPicked || _updateDownloading || _updateApplying || !isTauri || !invoke) return;
+  var asset = _updateAssetPicked;
+  var variant = getAssetVariant(asset.name);
+  resetUpdateProgressState();
+  _updateDownloading = true;
+  syncUpdateDownloadUI();
+
+  invoke('download_update', {
+    url: asset.download_url,
+    sha256: asset.digest,
+    size: asset.size,
+    isZip: variant.kind === 'portable-zip'
+  }).then(function() {
+    _updateDownloading = false;
+    _updateApplying = true;
+    syncUpdateDownloadUI();
+    renderUpdateProgress({ current: asset.size, total: asset.size, percent: 100 });
+    var txt = document.getElementById('updateProgressText');
+    if (txt) txt.textContent = '下载完成，正在替换程序并重启…';
+    // 留一帧让「完成」状态可见，再执行替换
+    setTimeout(function() {
+      invoke('apply_update_and_restart').catch(function(err) {
+        _updateApplying = false;
+        syncUpdateDownloadUI();
+        var txt = document.getElementById('updateProgressText');
+        if (txt) txt.textContent = '替换失败，更新包已保留，下次启动会自动完成';
+        toast('自动更新失败: ' + err + '；更新包已保留，下次启动会自动完成，也可前往 GitHub 手动下载', 6000);
+      });
+    }, 400);
+  }).catch(function(err) {
+    var msg = String(err);
+    _updateDownloading = false;
+    _updateApplying = false;
+    syncUpdateDownloadUI();
+    if (msg.indexOf('下载已取消') >= 0) toast('已取消更新下载', 2500);
+    else toast('自动更新失败: ' + msg, 5000);
+  });
+}
+
+function cancelUpdateDownload() {
+  if (!_updateDownloading || !invoke) return;
+  invoke('cancel_update_download').catch(function() {});
+  var txt = document.getElementById('updateProgressText');
+  if (txt) txt.textContent = '正在取消…';
+}
+
+/**
  * Render the update modal with release info.
  */
 function showUpdateModal(info) {
   var modal = document.getElementById('updateModal');
   if (!modal) return;
   _lastUpdateInfo = info;
+
+  // 下载/替换进行中时不要重置状态，否则可再次点击下载导致两个任务并发写同一文件
+  if (!_updateDownloading && !_updateApplying) {
+    resetUpdateProgressState();
+    _updateAssetPicked = pickAutoUpdateAsset(info);
+  }
+  syncUpdateDownloadUI();
+
+  document.getElementById('updateModalTitle').textContent = info.is_prerelease ? '🧪 发现新测试版' : '🆕 发现新版本';
+  var badge = document.getElementById('updateChannelBadge');
+  if (badge) {
+    badge.textContent = info.is_prerelease ? '测试版' : '正式版';
+    badge.className = 'ver-badge' + (info.is_prerelease ? ' beta' : '');
+  }
 
   document.getElementById('updateCurrentVersion').textContent = 'v' + info.current_version;
   document.getElementById('updateLatestVersion').textContent = 'v' + info.latest_version;
@@ -5602,29 +6390,23 @@ function showUpdateModal(info) {
   }
   document.getElementById('updatePubDate').textContent = dateStr;
 
-  // Release notes — escape HTML then convert basic markdown
-  var notes = info.release_notes || '（无更新说明）';
-  var escaped = notes
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\r\n/g, '\n')
-    .replace(/\n/g, '<br>');
-  document.getElementById('updateNotes').innerHTML = escaped;
+  document.getElementById('updateNotes').innerHTML = renderReleaseNotes(info.release_notes);
 
-  // Build asset list (download links)
+  // Build asset list — 与当前安装类型一致（轻量/OCR）的产物标记「推荐」
   var assetsHtml = '';
   if (info.assets && info.assets.length) {
     assetsHtml = '<div class="update-assets-title">下载文件：</div><ul class="update-assets">';
     info.assets.forEach(function(a) {
-      var sizeStr = a.size > 1048576
-        ? (a.size / 1048576).toFixed(1) + ' MB'
-        : a.size > 1024
-          ? (a.size / 1024).toFixed(0) + ' KB'
-          : a.size + ' B';
-      assetsHtml += '<li class="update-asset" onclick="openUpdateAsset(\'' + a.download_url.replace(/'/g, "\\'") + '\')">' +
-        '<span class="update-asset-name">📥 ' + a.name + '</span>' +
-        '<span class="update-asset-size">' + sizeStr + '</span></li>';
+      var variant = getAssetVariant(a.name);
+      var recommended = isOcrBuild() ? variant.ocr : !variant.ocr;
+      assetsHtml += '<li class="update-asset' + (recommended ? ' recommended' : '') + '" onclick="openUpdateAsset(\'' + a.download_url.replace(/'/g, "\\'") + '\')">' +
+        '<div class="update-asset-info">' +
+          '<span class="update-asset-name">📥 ' + escHtml(a.name) + '</span>' +
+          '<span class="update-asset-meta">' + variant.label +
+            (recommended ? '<span class="update-asset-rec">推荐</span>' : '') +
+          '</span>' +
+        '</div>' +
+        '<span class="update-asset-size">' + formatUpdateSize(a.size) + '</span></li>';
     });
     assetsHtml += '</ul>';
   }
@@ -5633,6 +6415,10 @@ function showUpdateModal(info) {
   // Open release page button
   var openBtn = document.getElementById('updateOpenBtn');
   if (openBtn) {
+    // 没有可自动更新的产物时，「前往 GitHub」升为主按钮
+    openBtn.textContent = _updateAssetPicked ? '🌐 前往 GitHub 下载' : '⬇️ 前往 GitHub 下载';
+    openBtn.classList.toggle('btn-primary', !_updateAssetPicked);
+    openBtn.disabled = false;
     openBtn.onclick = function() {
       if (info.release_url && isTauri && invoke) {
         invoke('open_url', { url: info.release_url }).catch(function(){});

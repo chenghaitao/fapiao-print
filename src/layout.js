@@ -4,13 +4,44 @@
 // Dependencies (global): S, MM2PX, PDF_RENDER_DPI, MIN_RENDER_PX
 
 /**
- * Slots per page — reimburse mode: fixed-height segments, otherwise cols*rows.
+ * Slots per page — photo mode: photo grid capacity; reimburse: fixed-height segments; otherwise cols*rows.
  */
 function getPerPage(s) {
+  if (s.photoMode) {
+    var pg = getPhotoGrid(s);
+    return Math.max(1, pg.cols * pg.rows);
+  }
   if (s.reimburseMode) {
     return Math.max(1, Math.floor(s.paperH / (s.reimburseHeight || 120)));
   }
   return s.cols * s.rows;
+}
+
+/**
+ * 相纸模式网格（mm）：按证件照实际尺寸推算每页列/行、间距、留边与居中栅格。
+ * 手动列/行（>0）超出可容纳数量时收敛到上限，防止栅格溢出纸张。
+ */
+function getPhotoGrid(s) {
+  var w = Math.max(1, parseFloat(s.photoW) || 25);
+  var h = Math.max(1, parseFloat(s.photoH) || 35);
+  var gap = Math.max(0, parseFloat(s.photoGap) || 0);
+  var margin = Math.max(0, parseFloat(s.photoMargin) || 0);
+  var pw = s.paperW, ph = s.paperH;
+  // 留边不能把照片挤出纸张；纸张本身小于照片时留边归零（UI 另行提示可能被裁切）
+  var mx = Math.min(margin, Math.max(0, (pw - w) / 2));
+  var my = Math.min(margin, Math.max(0, (ph - h) / 2));
+  var availW = Math.max(1, pw - 2 * mx);
+  var availH = Math.max(1, ph - 2 * my);
+  // 自动铺满：按留边计算；手动列/行：只受纸张物理尺寸约束（留边可被压缩，栅格仍居中）
+  var maxCols = Math.max(1, Math.floor((availW + gap) / (w + gap)));
+  var maxRows = Math.max(1, Math.floor((availH + gap) / (h + gap)));
+  var fitCols = Math.max(1, Math.floor((pw + gap) / (w + gap)));
+  var fitRows = Math.max(1, Math.floor((ph + gap) / (h + gap)));
+  var cols = s.photoCols > 0 ? Math.min(s.photoCols, fitCols) : maxCols;
+  var rows = s.photoRows > 0 ? Math.min(s.photoRows, fitRows) : maxRows;
+  var gridW = cols * w + (cols - 1) * gap;
+  var gridH = rows * h + (rows - 1) * gap;
+  return { w: w, h: h, gap: gap, cols: cols, rows: rows, maxCols: maxCols, maxRows: maxRows, gridW: gridW, gridH: gridH };
 }
 
 /**
@@ -25,6 +56,44 @@ function calculateLayout(settings, pxPerMm) {
 
   var pw = settings.paperW * pxPerMm;
   var ph = settings.paperH * pxPerMm;
+
+  // 相纸模式：槽位严格等于证件照实际尺寸，整版居中；普通行列/边距/间距/页脚全部忽略。
+  // 与 Rust calculate_layout_mm 的 photo 分支逐字对应。
+  if (settings.photoMode) {
+    var pg = getPhotoGrid(settings);
+    var startX = (settings.paperW - pg.gridW) / 2;
+    var startY = (settings.paperH - pg.gridH) / 2;
+    var pSlots = [];
+    for (var pr = 0; pr < pg.rows; pr++) {
+      for (var pc = 0; pc < pg.cols; pc++) {
+        pSlots.push({
+          row: pr, col: pc,
+          x: (startX + pc * (pg.w + pg.gap)) * pxPerMm,
+          y: (startY + pr * (pg.h + pg.gap)) * pxPerMm,
+          w: pg.w * pxPerMm,
+          h: pg.h * pxPerMm
+        });
+      }
+    }
+    var pCuts = [];
+    if (settings.cutline) {
+      for (var pcx = 1; pcx < pg.cols; pcx++) {
+        pCuts.push({ type: 'vertical', pos: (startX + pcx * (pg.w + pg.gap) - pg.gap / 2) * pxPerMm, endY: ph });
+      }
+      for (var pry = 1; pry < pg.rows; pry++) {
+        pCuts.push({ type: 'horizontal', pos: (startY + pry * (pg.h + pg.gap) - pg.gap / 2) * pxPerMm });
+      }
+    }
+    return {
+      pw: pw, ph: ph,
+      mt: startY * pxPerMm, mb: (settings.paperH - startY - pg.gridH) * pxPerMm, fm: 0,
+      ml: startX * pxPerMm, mr: (settings.paperW - startX - pg.gridW) * pxPerMm,
+      gh: pg.gap * pxPerMm, gv: pg.gap * pxPerMm,
+      sw: pg.w * pxPerMm, sh: pg.h * pxPerMm,
+      slots: pSlots, cutLines: pCuts, photo: true
+    };
+  }
+
   var mt = settings.marginTop * pxPerMm;
   var mb = settings.marginBottom * pxPerMm;
   var fm = (settings.footerMargin || 0) * pxPerMm; // 页脚边距（独立于发票边距）
@@ -74,7 +143,7 @@ function calculateLayout(settings, pxPerMm) {
   // When there is no footer content: no deduction (no footer to collide with).
   var hasFooterContent = settings.pageNum || settings.printDate || (settings.footerText || '').trim();
   var autoFm = 3 + ((settings.pageNum || settings.printDate ? 1 : 0) + ((settings.footerText || '').trim() ? 1 : 0)) * 5;
-  var footerFm = hasFooterContent ? (settings.customFM ? fm : autoFm * pxPerMm) : 0;
+  var footerFm = hasFooterContent ? (settings.customFm ? fm : autoFm * pxPerMm) : 0;
   // 粘贴单：在页面底部为右下角签字栏预留一整条带（表头行 + 填写行 + 与票据区的间距），
   // 保证票据只排版在装订线下方、签字栏上方。签字栏底边落在下边距处，故此处不含 mb。
   var sigPx = (settings.pasteMode && settings.pasteShowSig !== false)
@@ -111,7 +180,7 @@ function calculateLayout(settings, pxPerMm) {
     }
     // Footer cut line: between bottom row and footer area
     if (hasFooterContent) {
-      if (settings.customFM && fm > 0) {
+      if (settings.customFm && fm > 0) {
         // 自定义下边距模式：分割线在用户指定的 fm 位置
         cutLines.push({ type: 'horizontal', pos: ph - fm });
       } else {
@@ -271,7 +340,9 @@ function renderPage(pageFiles, pi, total, s) {
     var selClass = isSelected ? ' selected' : '';
 
     if (f && f.previewUrl) {
-      var src = S.feat.trimWhite && f.trimmedUrl ? f.trimmedUrl : f.previewUrl;
+      // 用 settings.trimWhite 而非 S.feat.trimWhite：相纸模式在 getSettings 里强制关闭裁剪，
+      // 若这里仍看功能开关，会出现「预览是裁剪图、PDF 未裁剪」的不一致。
+      var src = s.trimWhite && f.trimmedUrl ? f.trimmedUrl : f.previewUrl;
       var rot = getRotation(f, slot, s);
       var filt = s.colorMode === 'grayscale' ? 'filter:grayscale(1);' : s.colorMode === 'bw' ? 'filter:grayscale(1) contrast(1.5);' : '';
       var fit = 'contain';
@@ -319,18 +390,18 @@ function renderPage(pageFiles, pi, total, s) {
         containedH = isRot90 ? visW : visH;
       }
       // Image wrapper: explicit dimensions, same transforms, optional border
-      // 报销单模式：左上对齐（贴段内区域左上角），常规模式：居中
+      // 报销单模式：纵向贴段顶，水平按设置（靠左/居中/靠右）；常规模式：居中
       var wrapperStyle = 'width:' + containedW.toFixed(1) + 'px;height:' + containedH.toFixed(1) + 'px;';
       wrapperStyle += 'position:absolute;';
       if (layout.reimburse) {
-        if (isRot90) {
-          // 旋转后视觉盒以 wrapper 中心为中心，须把 wrapper 中心移到视觉盒中心位置，
-          // 旋转落位后视觉盒才贴住槽位左上角（与 Rust 端报销单左上对齐一致）
-          wrapperStyle += 'left:' + ((containedH - containedW) / 2).toFixed(1) + 'px;';
-          wrapperStyle += 'top:' + ((containedW - containedH) / 2).toFixed(1) + 'px;';
-        } else {
-          wrapperStyle += 'left:0;top:0;';
-        }
+        // 视觉盒（旋转+缩放后）按对齐方式落位，wrapper 中心对齐视觉盒中心
+        var _reimbAlign = s.reimburseAlign || 'left';
+        var _reimbEffScale = perScale * ((s.fitMode === 'custom') ? (s.customScale || 1) : 1);
+        var _visW = visW * _reimbEffScale;
+        var _visH = visH * _reimbEffScale;
+        var _visX = _reimbAlign === 'center' ? (imgW - _visW) / 2 : (_reimbAlign === 'right' ? imgW - _visW : 0);
+        wrapperStyle += 'left:' + (_visX + _visW / 2 - containedW / 2).toFixed(1) + 'px;';
+        wrapperStyle += 'top:' + (_visH / 2 - containedH / 2).toFixed(1) + 'px;';
       } else {
         // 「裁剪白边」开启时垂直贴顶（视觉盒顶 = 槽位顶）：wrapper 中心对齐到 visH/2，
         // 否则居中。水平方向始终居中 —— 左右裁剪本来就对得准。
@@ -465,10 +536,21 @@ function initSlotInteraction() {
   }, true);
   // Click on empty area deselects (floating slot toolbar excluded, issue #33)
   document.getElementById('previewWrap').addEventListener('mousedown', function(e) {
-    if (!e.target.closest('.invoice-slot') && !e.target.closest('.slot-handle') && !e.target.closest('#slotToolbar')) {
+    if (!e.target.closest('.invoice-slot') && !e.target.closest('.slot-handle') &&
+        !e.target.closest('#slotCopyMenu') && !hitSlotToolbar(e)) {
       selectSlot(-1);
     }
   });
+}
+
+// 工具条容器是 pointer-events:none（只有按钮吃事件，见 styles.css），点它的内边距 / 按钮间隙时
+// e.target 已经穿透成票面或预览底，closest('#slotToolbar') 命不中 —— 这里按矩形兜底，
+// 否则想点按钮偏出去 2px 就会当成「点空白处」把选中和工具条一起清掉
+function hitSlotToolbar(e) {
+  var tb = document.getElementById('slotToolbar');
+  if (!tb || tb.classList.contains('hidden')) return false;
+  var r = tb.getBoundingClientRect();
+  return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
 }
 
 // 尾部空槽按下即拖：临时创建空白占位进入拖拽链路，松手落到实体之间 = 中间留白，未移动则销毁
@@ -529,6 +611,9 @@ function onSlotMouseDown(e) {
     // 空白占位（slot-blank）：与常规文件一样可拖拽排序，click 仍触发上传
   }
   if (!f && !pendingTail) return;
+
+  // 选中票面后由浮动工具条设置份数（issue #60：双击入口已移除——首次点击会重建预览 DOM，
+  // 第二下常落到重建后的元素或压在票面上的工具条里，手势判定无法稳定命中原票面）
 
   // Otherwise: click to select + drag to move
   // 尾部空槽的纯点击不进拖拽：不 preventDefault、不加 dragging，保证 click 正常派发
@@ -842,6 +927,8 @@ function swapSlotInvoices(fromIdx, toIdx) {
   if (a === b) { updatePreview(); return; }
   var ia = S.files.indexOf(a), ib = S.files.indexOf(b);
   if (ia < 0 || ib < 0) { updatePreview(); return; }
+  // 互换后槽位序号对不上原票：选中按对象重定位，否则工具条会指到换过来的那张
+  var keep = captureSlotSelection();
   var offA = a.slotOffsetX, offB = b.slotOffsetX;
   var offAY = a.slotOffsetY, offBY = b.slotOffsetY;
   S.files[ia] = b; S.files[ib] = a;
@@ -849,9 +936,8 @@ function swapSlotInvoices(fromIdx, toIdx) {
   b.slotOffsetX = offB; b.slotOffsetY = offBY;
   if (_activeFileIdx === ia) { _activeFileIdx = ib; }
   else if (_activeFileIdx === ib) { _activeFileIdx = ia; }
-  renderFileList();
   toast('已互换位置');
-  updatePreview();
+  if (keep) refreshAfterCopiesChange(keep); else { renderFileList(); updatePreview(); }
 }
 
 // Move invoice into a neighbor position (insert before/after instead of swapping)

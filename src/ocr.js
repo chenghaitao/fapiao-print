@@ -826,6 +826,8 @@ function _cleanName(raw) {
     name = name.replace(/\d{1,2}月\d{1,2}日/g, '');
     // Reject if name is primarily a date fragment (digits + 年月日/-) with no real company name
     if (/^[\d年月日\-/\s]+$/.test(name)) return '';
+    // Reject Chinese financial numerals（大写金额，如「捌仟捌佰壹拾玖圆陆角整」）— 不是名称
+    if (/^[零壹贰叁肆伍陆柒捌玖拾佰仟万亿萬億圆元角分整正]+$/.test(name)) return '';
     // Remove trailing punctuation and whitespace
     name = name.replace(/[，,。.、：:；;！!？?\s]+$/, '');
   // Remove leading whitespace/colons
@@ -856,6 +858,76 @@ function _cleanName(raw) {
 }
 
 /**
+ * 判断某处文本是否是备注/页脚区的公司名（如「销方开户银行:招商银行…支行」）。
+ * 名称兜底取公司名时必须排除这类候选，否则备注里的银行名会顶替销售方名称。
+ * 判定依据：
+ *   1. 词坐标落在实际备注标签右侧的备注框内，或紧跟银行/落款等标签；
+ *   2. 无坐标时才按公司名之前的同行标签判断。
+ *      旧式增值税票的销售方在下部，不能仅凭页面高度排除。
+ *
+ * @param {string} name - 公司名候选
+ * @param {string} text - 全文文本
+ * @param {number} [index] - 候选在 text 中的起始位置（取不到时用 indexOf）
+ * @param {Array} [words] - 带坐标的词数组
+ * @returns {boolean} true = 属于备注/页脚区
+ */
+function _isRemarkAreaName(name, text, index, words) {
+  if (!name) return true;
+  if (words && words.length) {
+    var matched = null;
+    for (var i = 0; i < words.length; i++) {
+      var wt = (words[i].text || '').trim();
+      var wn = (words[i].normText || '').trim();
+      if (wt === name || wn === name ||
+          (name.length >= 4 && (wt.indexOf(name) >= 0 || wn.indexOf(name) >= 0))) {
+        matched = words[i];
+        break;
+      }
+    }
+    if (matched) {
+      var remark = _findRemarkLabel(words);
+      if (remark) {
+        var top = _getRemarkTop(words, remark);
+        if (matched.x >= remark.x + remark.w * 0.5 && matched.cy >= top) return true;
+      }
+      // 同一词或相邻左侧词中的标签才有约束力；远处「地址电话」不能误伤名称。
+      var labels = /开户银行|开户行|银行账号|账\s*号|地\s*址|电\s*话|收款人|复核人|开票人|备\s*注/;
+      var namePos = matched.normText.indexOf(name);
+      if (namePos >= 0 && labels.test(matched.normText.substring(0, namePos))) return true;
+      var left = words.filter(function(w) {
+        return w !== matched && w.x + w.w <= matched.x + 1 &&
+          Math.abs(w.cy - matched.cy) <= Math.max(w.h, matched.h, 8) * 0.6;
+      }).sort(function(a, b) { return b.x + b.w - a.x - a.w; });
+      if (left.length && matched.x - left[0].x - left[0].w <= Math.max(matched.h, 8) * 2 &&
+          labels.test(left[0].normText)) return true;
+      return false;
+    }
+  }
+  if (!text) return false;
+  var pos = typeof index === 'number' && index >= 0 ? index : text.indexOf(name);
+  if (pos < 0) return false;
+  var lineStart = text.lastIndexOf('\n', pos) + 1;
+  var line = text.substring(lineStart, pos);
+  return /(?:开户银行|开户行|银行账号|账\s*号|地\s*址|电\s*话|收款人|复核人|开票人|备\s*注)/.test(line);
+}
+
+/**
+ * 税务机关 / 发票监制章 / 查验平台 文本不是购销方名称。
+ * 数电票 PDF 的文字层常带「国家税务总局全国统一发票监制章」或查验平台页脚，
+ * 取公司名兜底时若不过滤，这类文本会顶替销售方名称（issue #56）。
+ */
+function _isTaxAuthorityText(s) {
+  if (!s) return false;
+  return /国家税务总局|全国统一发票监制章|发票监制章|增值税发票查验平台/.test(s);
+}
+
+/** 是否像企业/机构名（以公司类后缀结尾）。用于判断兜底取到的销售方值是否可信 */
+function _looksLikeCompanyName(s) {
+  if (!s) return false;
+  return /(?:公司|集团|商行|商店|厂|部|院|所|中心|店|馆|站|社|行|会|处|室|局|办|坊|铺|企业|事务所|合作社|医院|学校|幼儿园|经营部|门市部|工作室)$/.test(s);
+}
+
+/**
  * 坐标法与跨行法结果择优：
  * - 坐标值含冒号 → 标签残留（脏值），用跨行候选；
  * - 两值互为子串 → 坐标法截断/丢字，取更长的跨行候选；
@@ -869,6 +941,78 @@ function _betterCoordName(coord, cross) {
     return cross.length > coord.length ? cross : coord;
   }
   return coord;
+}
+
+/**
+ * 销售方名称兜底：按销售方信用代码定位购销方信息块，取代码行及上方最近的带后缀名称。
+ * 名称标签/文字顺序异常时，不再用「全文最后一个公司名」这种会被备注、监制章污染的策略。
+ *
+ * @param {Array} words - _buildWords() 输出的词数组
+ * @param {string} sellerCreditCode - 销售方统一社会信用代码
+ * @param {string} [buyerName] - 已识别的购买方名称（排除同名）
+ * @returns {string} 名称，找不到返回空串
+ */
+function _findSellerNameNearCreditCode(words, sellerCreditCode, buyerName) {
+  if (!words || !words.length || !sellerCreditCode) return '';
+  var code = String(sellerCreditCode).replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  if (code.length < 15) return '';
+  var ccWord = null;
+  for (var i = 0; i < words.length; i++) {
+    var cw = words[i];
+    if (cw.normText.replace(/[^A-Za-z0-9]/g, '').toUpperCase() === code) { ccWord = cw; break; }
+  }
+  if (!ccWord) return '';
+  var boundary = _getSideBoundary(words);
+  var codeOnRight = ccWord.nx >= boundary;
+  function inCodeColumn(w) { return (w.nx >= boundary) === codeOnRight; }
+
+  var _suffix = '(?:公司|集团|商行|商店|厂|部|院|所|中心|店|馆|站|社|行|会|处|室|局|办|坊|铺|有限合伙|合伙企业|个体工商户|个体户|工作室|经营部|门市部|分公司|事业部|事务所|医院|学校|幼儿园|合作社|企业|商社|贸易行|服务部)';
+  var _nameRe = new RegExp('^[\\u4e00-\\u9fff][\\u4e00-\\u9fff\\w（）()·\\-\\.]{2,30}' + _suffix + '$');
+  var _notNameRe = /统一社会|信用代码|纳税人识别号|[:：]|地\s*址|电\s*话|开户|账\s*号|备\s*注|开\s*票\s*人|收\s*款\s*人|复\s*核\s*人/;
+  var cands = words.filter(function(w) {
+    if (w === ccWord) return false;
+    if (!inCodeColumn(w)) return false;             // 跟随代码所在列，兼容旧票下部左侧的销方
+    if (w.cy > ccWord.cy + w.h * 0.6) return false;  // 只看代码行及上方
+    if (w.cy < ccWord.y - w.h * 4) return false;     // 最多向上 4 行
+    var t = w.normText;
+    if (!_nameRe.test(t)) return false;
+    if (_isLabelFragmentWord(w) || _isTaxAuthorityText(t) || _notNameRe.test(t)) return false;
+    if (_isRemarkAreaName(t, '', -1, words)) return false;
+    if (buyerName && (t.indexOf(buyerName) >= 0 || buyerName.indexOf(t) >= 0)) return false;
+    return true;
+  });
+  if (!cands.length) return '';
+  cands.sort(function(a, b) { return Math.abs(a.cy - ccWord.cy) - Math.abs(b.cy - ccWord.cy); });
+
+  // 名称被拆成多个词时，把首选词同行的相邻词按间距并回（拆字 PDF 常见）
+  var anchor = cands[0];
+  var lineWords = words.filter(function(w) {
+    return Math.abs(w.cy - anchor.cy) <= Math.max(anchor.h, 8) * 0.6 && inCodeColumn(w);
+  }).sort(function(a, b) { return a.x - b.x; });
+  var ai = lineWords.indexOf(anchor);
+  var parts = [anchor];
+  var _gap = Math.max(anchor.h, 8) * 1.2;
+  for (var l = ai - 1; l >= 0; l--) {
+    var prev = lineWords[l];
+    if (parts[0].x - (prev.x + prev.w) > _gap) break;
+    if (_isLabelFragmentWord(prev) || _isTaxAuthorityText(prev.normText) || _notNameRe.test(prev.normText)) break;
+    parts.unshift(prev);
+  }
+  for (var r = ai + 1; r < lineWords.length; r++) {
+    var next = lineWords[r];
+    var last = parts[parts.length - 1];
+    if (next.x - (last.x + last.w) > _gap) break;
+    if (_isLabelFragmentWord(next) || _isTaxAuthorityText(next.normText) || _notNameRe.test(next.normText)) break;
+    parts.push(next);
+  }
+  var joined = parts.map(function(w) { return w.text; }).join('');
+  var cleaned = _cleanName(joined);
+  if (!cleaned || _isTaxAuthorityText(cleaned) || !_nameRe.test(cleaned)) {
+    // 并回后不成型（把邻列内容带进来），退回首选词本身
+    cleaned = _cleanName(anchor.normText);
+  }
+  if (!cleaned || _isTaxAuthorityText(cleaned)) return '';
+  return cleaned;
 }
 
 /**
@@ -913,8 +1057,13 @@ function _extractNamesCrossLine(text, result) {
   // Find all potential company names (Chinese strings of reasonable length)
   var potentialNames = [];
   var companyNameRegex = /^[\u4e00-\u9fa5][\u4e00-\u9fa50-9a-zA-Z（）()·\-\.]{2,50}$/;
+  // 备注/页脚行里的公司名（开户银行、账号、地址电话、落款）不能当名称候选
+  var _REMARK_LINE_RE = /开户银行|开户行|银行账号|账\s*号|地\s*址|电\s*话|收款人|复核人|开票人|备\s*注/;
   for (var i = 0; i < lines.length; i++) {
-    if (companyNameRegex.test(lines[i])) {
+    // 标签值跨行时（「开票人：」下一行才是人名/公司名），值所在行的上一行同样是页脚标签，
+    // 这类值不能当名称候选
+    var _prevLine = i > 0 ? lines[i - 1] : '';
+    if (companyNameRegex.test(lines[i]) && !_REMARK_LINE_RE.test(lines[i]) && !_REMARK_LINE_RE.test(_prevLine)) {
       var cleaned = _cleanName(lines[i]);
       if (cleaned) {
         potentialNames.push({ line: i, name: cleaned });
@@ -948,12 +1097,15 @@ function _extractNamesCrossLine(text, result) {
       nameEntries.push({ 
         labelLine: nameLabels[i], 
         valueLine: potentialNames[i].line, 
-        name: potentialNames[i].name 
+        name: potentialNames[i].name,
+        _weak: true   // 位置配对（非标签邻近），可信度低，销售方要求像企业名
       });
     }
   }
 
   if (nameEntries.length === 0) return;
+  // 弱配对（Strategy 2）给出的销售方必须像企业/机构名，避免把页脚人名、大写金额等当名称
+  function _canBeSeller(e) { return e && (!e._weak || _looksLikeCompanyName(e.name)); }
 
   // Find credit code positions to anchor buyer/seller determination
   // Allow \s* between CJK chars in labels for extreme dzcp split-char (each char on own line)
@@ -972,18 +1124,18 @@ function _extractNamesCrossLine(text, result) {
   if (nameEntries.length >= 2 && codes.length >= 2) {
     // Two names and two codes: first name = buyer, second name = seller
     if (!result.buyerName) result.buyerName = nameEntries[0].name;
-    if (!result.sellerName) result.sellerName = nameEntries[1].name;
+    if (!result.sellerName && _canBeSeller(nameEntries[1])) result.sellerName = nameEntries[1].name;
   } else if (nameEntries.length >= 2) {
     // Two names but unknown codes: assume first = buyer, second = seller
     if (!result.buyerName) result.buyerName = nameEntries[0].name;
-    if (!result.sellerName) result.sellerName = nameEntries[1].name;
+    if (!result.sellerName && _canBeSeller(nameEntries[1])) result.sellerName = nameEntries[1].name;
   } else if (nameEntries.length === 1) {
     // Only one name found: could be seller if we already have buyer credit code
     // or buyer if we have no other info
     if (!result.buyerName && !result.sellerName) {
       // No names yet: assign as buyer (conservative)
       result.buyerName = nameEntries[0].name;
-    } else if (!result.sellerName) {
+    } else if (!result.sellerName && _canBeSeller(nameEntries[0])) {
       // Have buyer but no seller: assign as seller
       result.sellerName = nameEntries[0].name;
     }
@@ -1234,7 +1386,10 @@ function _extractNamesByCoords(words, result) {
   if (!words || words.length === 0) return;
 
   var nameLabels = words.filter(function(w) {
-    return /^名\s*称\s*[:：]/.test(w.text) || /^名\s*称\s*[:：]/.test(w.normText);
+    if (/^名\s*称\s*[:：]/.test(w.text) || /^名\s*称\s*[:：]/.test(w.normText)) return true;
+    // 个别 PDF 把冒号单独绘制，「名称」成为独立词；只接受页面上部（购销方信息块），
+    // 避免把明细表/清单里的「名称」列头当成标签
+    return (w.text === '名称' || w.normText === '名称') && w.ny < 0.35;
   });
 
   // CJK split-character fallback: when PDF text layer splits "名称" into separate
@@ -1450,7 +1605,11 @@ function _extractNamesByCoords(words, result) {
       // 过滤纯空格词(内容流顺序混乱时可能独立出现)
       var isNotWhitespace = !/^\s*$/.test(w.text || '');
 
-      if (isRightOfLabel && isInYRange && isNotLabel && isNotCreditLabel && isNotSectionLabel && isNotPagination && isNotDateFragment && isNotFullDate && isNotMetadata && isNotCreditCodeWord && isNotCcSingleChar && isNotWhitespace) {
+      // 税务机关/监制章/查验平台文本（如「国家税务总局」）只可能出现在右侧，
+      // 不能当销售方名称候选
+      var isNotTaxAuthority = isLeftSide || !_isTaxAuthorityText(w.text) && !_isTaxAuthorityText(w.normText);
+
+      if (isRightOfLabel && isInYRange && isNotLabel && isNotCreditLabel && isNotSectionLabel && isNotPagination && isNotDateFragment && isNotFullDate && isNotMetadata && isNotCreditCodeWord && isNotCcSingleChar && isNotWhitespace && isNotTaxAuthority) {
         var blockedByCredit = false;
         for (var ci = 0; ci < creditLabels.length; ci++) {
           var cl = creditLabels[ci];
@@ -1553,7 +1712,7 @@ function _extractNamesByCoords(words, result) {
 
   // Assign names based on spatial position (not word order which is unreliable for PDF text)
   var leftNames = foundNames.filter(function(n) { return n.isLeftSide; });
-  var rightNames = foundNames.filter(function(n) { return !n.isLeftSide; });
+  var rightNames = foundNames.filter(function(n) { return !n.isLeftSide && !_isTaxAuthorityText(n.name); });
 
   // Left half = buyer, right half = seller
   if (!result.buyerName && leftNames.length > 0) {
@@ -2034,11 +2193,20 @@ function _extractByText(fullText, words) {
         if (lastNameBeforeCc) result.sellerName = lastNameBeforeCc;
       }
       // Fallback: 2nd "名称" match
-      if (!result.sellerName && names.length >= 2) result.sellerName = names[1];
+      if (!result.sellerName && names.length >= 2 && !_isTaxAuthorityText(names[1])) result.sellerName = names[1];
       // When only 1 "名称" match, don't duplicate it as sellerName —
       // a single "名称" is almost always the buyer, and the seller should be
       // determined by other means (e.g., ticket type label, ride invoice layout)
     }
+  }
+
+  // Priority 3.5: 销售方名称优先贴着销售方信用代码取（信息块内），
+  // 比下面的「全文最后一个公司名」稳，不会被备注银行名、监制章文字顶替；
+  // 只补空：个人销售方没有企业后缀，可靠标签提取的名称不得被公司名候选覆盖。
+  if (!result.sellerName &&
+      result.sellerCreditCode && words && words.length > 0) {
+    var _nearSellerName = _findSellerNameNearCreditCode(words, result.sellerCreditCode, result.buyerName || '');
+    if (_nearSellerName) result.sellerName = _nearSellerName;
   }
 
   // Priority 4: "收款单位" / "销货单位" / "开票方" (non-standard invoices)
@@ -2059,7 +2227,7 @@ function _extractByText(fullText, words) {
     var compNearCc = afterLastCc.match(new RegExp('[A-Z0-9]{15,20}\\s*[:：]?\\s*([\\u4e00-\\u9fff][\\u4e00-\\u9fff\\w（）()·\\-\\.]+' + csSuffix + ')'));
     if (compNearCc) {
       var compName = _cleanName(compNearCc[1]);
-      if (compName) result.sellerName = compName;
+      if (compName && !_isTaxAuthorityText(compName)) result.sellerName = compName;
     }
   }
 
@@ -2071,7 +2239,9 @@ function _extractByText(fullText, words) {
     var ccm;
     while ((ccm = allCompRe.exec(text)) !== null) {
       var cn = ccm[1].trim();
-      if (cn.length > 3 && !/^(?:购买方|销售方|信息|名称|地址)/.test(cn)) {
+      if (cn.length > 3 && !/^(?:购买方|销售方|信息|名称|地址)/.test(cn) &&
+          !_isTaxAuthorityText(cn) &&
+          !_isRemarkAreaName(cn, text, ccm.index, words)) {
         allCompMatches.push(cn);
       }
     }
@@ -2124,10 +2294,12 @@ function _extractByText(fullText, words) {
     while ((_fcm = _allCompReFb.exec(text)) !== null) {
       var _fcn = _fcm[1].trim();
       // 最小长度6字(如"无锡天鹏菜篮子工程有限公司"),排除纯后缀如"有限公司"
-      // 同时排除buyerName及其子串,避免重复
+      // 同时排除buyerName及其子串,避免重复；排除备注/页脚里的公司名(如开户银行)
       if (_fcn.length >= 6 && _fcn !== result.buyerName &&
           !result.buyerName.includes(_fcn) && !_fcn.includes(result.buyerName) &&
-          !/^(?:购买方|销售方|信息|名称|地址)/.test(_fcn)) {
+          !/^(?:购买方|销售方|信息|名称|地址)/.test(_fcn) &&
+          !_isTaxAuthorityText(_fcn) &&
+          !_isRemarkAreaName(_fcn, text, _fcm.index, words)) {
         _fbMatches.push(_fcn);
       }
     }
@@ -3041,6 +3213,8 @@ function _extractSeller(words, imgW, imgH) {
       if (_isLabelFragmentWord(w)) return false;
       var t = (w.normText || w.text || '').trim();
       if (t.length < 6) return false;  // 排除"有限公司"等纯后缀片段
+      if (_isTaxAuthorityText(t)) return false;  // 税务机关/监制章文本（页面顶部居中）
+      if (_isRemarkAreaName(t, '', -1, words)) return false;
       return companyRe3.test(w.normText) || companyRe3.test(t);
     });
     if (sellerCompWords.length > 0) {
@@ -3054,7 +3228,7 @@ function _extractSeller(words, imgW, imgH) {
     var csSuffix = '(?:公司|集团|商行|商店|厂|部|院|所|中心|店|馆|站|社|行|会|处|室|局|办|坊|铺|有限合伙|合伙企业|个体工商户|个体户|工作室|经营部|门市部|分公司|事业部|事务所|医院|学校|幼儿园|合作社|企业|商社|贸易行|服务部)';
     var companyRe = new RegExp('([\\u4e00-\\u9fff][\\u4e00-\\u9fff\\w（）()·\\-\\.]{2,25}' + csSuffix + ')');
     var companyMatch = sellerText.match(companyRe);
-    if (companyMatch) sellerName = companyMatch[1].trim();
+    if (companyMatch && !_isTaxAuthorityText(companyMatch[1])) sellerName = companyMatch[1].trim();
   }
 
   // Cleanup
@@ -3072,6 +3246,8 @@ function _extractSeller(words, imgW, imgH) {
       sellerName = '';
     }
     if (sellerName.length < 2) sellerName = '';
+    // 税务机关/监制章/查验平台文本不是销售方名称
+    if (sellerName && _isTaxAuthorityText(sellerName)) sellerName = '';
   }
 
   return { sellerName: sellerName, sellerCreditCode: sellerCreditCode };
@@ -3184,21 +3360,40 @@ function _extractItemNameRemarkByCoords(words, imgW, imgH) {
   var remarkLabel = _findRemarkLabel(words);
   if (remarkLabel) {
     // 下界：备注标签下方最近的 开票人 / 收款人 / 复核人 行（没有则退到 97% 图高）
+    // 文字层可能把页脚拆成单字（开/票/人 各占一词），需先按行合并再识别
     var bottomLimit = imgH * 0.97;
+    var _footerRows = [];
     for (var m = 0; m < words.length; m++) {
       var wm = words[m];
       if (wm.cy <= remarkLabel.cy) continue;
-      if (/开\s*票\s*人|收\s*款\s*人|复\s*核\s*人/.test(wm.normText)) {
-        if (wm.y < bottomLimit) bottomLimit = wm.y;
+      var _row = null;
+      for (var ri = 0; ri < _footerRows.length; ri++) {
+        if (Math.abs(wm.cy - _footerRows[ri].cy) <= Math.max(wm.h, 8) * 0.6) {
+          _row = _footerRows[ri];
+          break;
+        }
+      }
+      if (!_row) {
+        _row = { cy: wm.cy, y: wm.y, words: [] };
+        _footerRows.push(_row);
+      }
+      _row.words.push(wm);
+      if (wm.y < _row.y) _row.y = wm.y;
+    }
+    for (var ri2 = 0; ri2 < _footerRows.length; ri2++) {
+      var _rowWords = _footerRows[ri2].words.slice().sort(function(a, b) { return a.x - b.x; });
+      var _rowText = _rowWords.map(function(w) { return w.normText; }).join('');
+      if (/开\s*票\s*人|收\s*款\s*人|复\s*核\s*人/.test(_rowText) && _footerRows[ri2].y < bottomLimit) {
+        bottomLimit = _footerRows[ri2].y;
       }
     }
     var parts = remarkLabel._parts || [];
     var rx = remarkLabel.x + remarkLabel.w * 0.5;
+    var _topLimit = _getRemarkTop(words, remarkLabel);
     var rcand = words.filter(function(w) {
       if (w.confidence < 0.3) return false;
       if (w === remarkLabel || parts.indexOf(w) >= 0) return false;
-      // 必须在标签顶部或以下（避免抓到上方的 价税合计 / 大写 / 小写 行）
-      if (w.cy < remarkLabel.y) return false;
+      if (w.cy < _topLimit) return false;
       if (w.cy > bottomLimit) return false;
       if (w.cx < rx) return false;
       if (/^备\s*注$/.test(w.normText.replace(/\s+/g, ''))) return false;
@@ -3226,12 +3421,97 @@ function _extractItemNameRemarkByCoords(words, imgW, imgH) {
         return ln.map(function(w) { return w.text; }).join('');
       }).join(' ').trim();
     }
+  } else {
+    // 部分模板把「备注」二字画成图形，或与内容并成一个整词，文字层里没有标签：
+    // 按版面区域兜底（合计行之下、页脚行之上、页面左侧 75%）
+    out.invoiceRemark = _extractRemarkByRegion(words, imgW, imgH);
   }
 
   return out;
 }
 
-/** 定位「备注」标签：可能是整词（备注），也可能是上下拆开的两词（备 / 注） */
+/** 找不到「备注」标签时的区域兜底：取合计类行之下、页脚行之上、页面左侧的文字。 */
+function _extractRemarkByRegion(words, imgW, imgH) {
+  if (!words || !words.length || !imgW || !imgH) return '';
+  // 上界：页面下半部最靠下的合计类锚点行，取整行底边（金额字可能比标签低一行）
+  var top = imgH * 0.66;
+  var anchorCy = -1;
+  words.forEach(function(w) {
+    if (!/价\s*税\s*合\s*计|金\s*额\s*合\s*计|大\s*写|小\s*写|合\s*计/.test(w.normText)) return;
+    if (w.cy <= imgH * 0.55 || w.cy >= imgH * 0.92) return;
+    if (w.cy > anchorCy) anchorCy = w.cy;
+  });
+  if (anchorCy >= 0) {
+    var anchorBottom = 0;
+    words.forEach(function(w) {
+      if (Math.abs(w.cy - anchorCy) <= Math.max(w.h, 8) * 0.9) anchorBottom = Math.max(anchorBottom, w.y + w.h);
+    });
+    if (anchorBottom > 0) top = anchorBottom;
+  }
+  // 下界：页脚行（开票人 / 收款人 / 复核人）之上，没有则退到 97% 图高
+  var bottomLimit = imgH * 0.97;
+  words.forEach(function(w) {
+    if (/开\s*票\s*人|收\s*款\s*人|复\s*核\s*人/.test(w.normText) && w.cy > top) {
+      bottomLimit = Math.min(bottomLimit, w.y);
+    }
+  });
+  var left = imgW * 0.75;
+  var region = words.filter(function(w) {
+    if (w.confidence < 0.3) return false;
+    if (w.cy < top || w.cy > bottomLimit) return false;
+    if (w.cx > left) return false;
+    // 拆字标签的单字（备 / 注）不是备注内容
+    if (/^(?:备|注|备\s*注)$/.test(w.normText.replace(/\s+/g, ''))) return false;
+    if (/(?:开\s*票\s*人|收\s*款\s*人|复\s*核\s*人)/.test(w.normText)) return false;
+    if (/价\s*税\s*合\s*计|大\s*写|小\s*写/.test(w.normText)) return false;
+    // 金额、二维码/查验提示都不是备注内容
+    if (/^[¥￥]/.test(w.normText.trim())) return false;
+    if (/^[¥￥]?[\d,]+\.\d{2}$/.test(w.normText.trim())) return false;
+    if (/扫\s*码|查\s*验|下\s*载\s*次\s*数|真\s*伪/.test(w.normText)) return false;
+    return true;
+  });
+  if (!region.length) return '';
+  region.sort(function(a, b) { return a.cy - b.cy || a.x - b.x; });
+  var lines = [], cur = [], lastCy = null;
+  region.forEach(function(w) {
+    if (lastCy !== null && Math.abs(w.cy - lastCy) > Math.max(w.h, 8) * 0.6) {
+      lines.push(cur); cur = [];
+    }
+    cur.push(w);
+    lastCy = w.cy;
+  });
+  if (cur.length) lines.push(cur);
+  return lines.map(function(ln) {
+    ln.sort(function(a, b) { return a.x - b.x; });
+    return ln.map(function(w) { return w.text; }).join('');
+  }).join(' ').trim();
+}
+
+/** 备注框上界：取完整合计行底边，兼容标签与金额字号/基线不齐。 */
+function _getRemarkTop(words, remark) {
+  var parts = remark._parts || [];
+  var lineH = parts.length ? parts[0].h : remark.h;
+  var top = remark.y - Math.max(lineH, 8) * 1.5;
+  var anchors = words.filter(function(w) {
+    return /价\s*税\s*合\s*计|金\s*额\s*合\s*计|大\s*写|小\s*写/.test(w.normText) && w.y < remark.y;
+  });
+  if (!anchors.length) return top;
+  // 大写金额/数字可能比标签低近一行；只按标签底边会把它们收进备注。
+  // 用整行几何位置排除，备注本身含有金额时仍正常保留。
+  var anchorBottom = 0;
+  anchors.forEach(function(a) { anchorBottom = Math.max(anchorBottom, a.y + a.h); });
+  top = -1;
+  words.forEach(function(w) {
+    if (w === remark || parts.indexOf(w) >= 0) return;
+    if (anchors.some(function(a) { return Math.abs(w.cy - a.cy) <= Math.max(w.h, a.h, 8) * 0.9; })) {
+      top = Math.max(top, w.y + w.h);
+    }
+  });
+  // 合计行只有标签一个词时不能返回 -1：那会让备注区上界失效
+  return top >= 0 ? top : anchorBottom;
+}
+
+/** 定位「备注」标签：整词（备注）、上下拆开的两词（备 / 注）或同行拉开的两词 */
 function _findRemarkLabel(words) {
   var best = null;
   for (var i = 0; i < words.length; i++) {
@@ -3245,24 +3525,53 @@ function _findRemarkLabel(words) {
       continue;
     }
     if (t !== '备') continue;
+    var label = null;
     // 竖排拆字：同一 x 附近、紧邻下方有「注」
     for (var j = 0; j < words.length; j++) {
       var w2 = words[j];
       if (w2 === w) continue;
       if (w2.normText.replace(/\s+/g, '') !== '注') continue;
       if (Math.abs(w2.cx - w.cx) > w.h * 0.8) continue;
-      if (w2.cy <= w.cy || w2.cy > w.cy + w.h * 2.2) continue;
+      // 竖向间距随模板变化：常见 1.9 行，部分数电票模板把「备」「注」拉开到 3.4 行
+      if (w2.cy <= w.cy || w2.cy > w.cy + w.h * 4.5) continue;
       // 合成一个虚拟标签，覆盖两词范围
-      var label = {
+      label = {
         text: '备注', normText: '备注',
         x: Math.min(w.x, w2.x), y: w.y,
         w: Math.max(w.w, w2.w), h: w2.y + w2.h - w.y,
         cx: (w.cx + w2.cx) / 2, cy: (w.cy + w2.cy) / 2,
         confidence: 1, _parts: [w, w2]
       };
-      if (!best || label.cy > best.cy) best = label;
       break;
     }
+    // 横排拆字：同行右侧的「注」，字距可能被模板拉宽到数个字宽（须在页面左侧）
+    if (!label && w.nx < 0.7) {
+      for (var k = 0; k < words.length; k++) {
+        var w3 = words[k];
+        if (w3 === w) continue;
+        if (w3.normText.replace(/\s+/g, '') !== '注') continue;
+        if (Math.abs(w3.cy - w.cy) > Math.max(w.h, 8) * 0.5) continue;
+        if (w3.cx <= w.cx) continue;
+        if (w3.x - (w.x + w.w) > w.h * 6) continue;
+        // 与合计标签 / 合计金额同一行的更可能是明细「合计」，不能当备注标签
+        var onTotalRow = words.some(function(o) {
+          if (o === w || o === w3) return false;
+          if (Math.abs(o.cy - w.cy) > Math.max(o.h, w.h, 8) * 0.9) return false;
+          return /价\s*税\s*合\s*计|金\s*额\s*合\s*计|大\s*写|小\s*写|合\s*计/.test(o.normText) || /^[¥￥]/.test(o.normText.trim());
+        });
+        if (onTotalRow) continue;
+        label = {
+          text: '备注', normText: '备注',
+          x: Math.min(w.x, w3.x), y: Math.min(w.y, w3.y),
+          w: w3.x + w3.w - Math.min(w.x, w3.x),
+          h: Math.max(w.y + w.h, w3.y + w3.h) - Math.min(w.y, w3.y),
+          cx: (w.cx + w3.cx) / 2, cy: (w.cy + w3.cy) / 2,
+          confidence: 1, _parts: [w, w3]
+        };
+        break;
+      }
+    }
+    if (label && (!best || label.cy > best.cy)) best = label;
   }
   return best;
 }
@@ -3313,6 +3622,10 @@ function _joinItems(items) {
 function _cleanRemark(raw) {
   if (!raw) return '';
   var s = String(raw).replace(/\r/g, '');
+  // 文本层可能带控制字符占位（如 \u0000），直接显示会是乱码
+  s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  // PDF 字体映射缺失时解码出替换字符，保留无意义
+  s = s.replace(/\uFFFD/g, '');
   s = s.replace(/^[：:\.\-—\s]+/, '');
   s = s.split('\n').map(function(t) { return t.trim(); }).filter(Boolean).join(' ');
   s = s.replace(/\s{2,}/g, ' ').trim();
@@ -3556,10 +3869,20 @@ function extractByCoordinates(ocrResult) {
   }
 
   // --- Seller info (coordinate-based FALLBACK — text-based is primary) ---
+  // 税务机关/监制章/查验平台文本（如「国家税务总局」）不是销售方名称，先清掉再兜底
+  if (sellerName && _isTaxAuthorityText(sellerName)) {
+    console.log('[校验] sellerName疑似税务机关/监制章文本，已清除:', sellerName);
+    sellerName = '';
+  }
   if (!sellerName || !sellerCreditCode) {
     var sellerInfo = _extractSeller(words, imgW, imgH);
     if (!sellerName) sellerName = sellerInfo.sellerName;
     if (!sellerCreditCode) sellerCreditCode = sellerInfo.sellerCreditCode;
+  }
+  // 仍取不到时，按销售方信用代码就近补空；保留个人销售方名称。
+  if (!sellerName) {
+    var _nearSeller = _findSellerNameNearCreditCode(words, sellerCreditCode, buyerName);
+    if (_nearSeller) sellerName = _nearSeller;
   }
 
   // --- Text-based amount extraction (PRIMARY for VAT invoices) ---
@@ -4243,7 +4566,7 @@ function extractByCoordinates(ocrResult) {
   // 任一路缺失由另一路补空。
   var _extra = _extractItemNameRemarkByCoords(words, imgW, imgH);
   var _itemName = _extra.itemName || textInfo.itemName || '';
-  var _invoiceRemark = textInfo.invoiceRemark || _extra.invoiceRemark || '';
+  var _invoiceRemark = _cleanRemark(textInfo.invoiceRemark || _extra.invoiceRemark || '');
 
   console.log('[坐标提取] 结果:', { amountTax: amountTax, amountNoTax: amountNoTax, taxAmount: taxAmount,
     sellerName: sellerName || '(空)', sellerCreditCode: sellerCreditCode || '(空)',

@@ -389,6 +389,66 @@ async function run() {
   equal(updates.source, { defaultSource: 'fork', savedSource: 'official', requestSource: 'fork', stale: true, cachedSource: 'official',
     syncedSource: ['official', 'official'], officialRequestSource: 'official', sourceSwitchClosedModal: true },
     '更新源默认 Fork、切换持久化且旧源响应失效');
+  // issue #62：双面 + 逐份按源文件边界补空白页；预览 / 保存 PDF 不补
+  const duplex = await evaluate(() => {
+    var mk = function (p) { return { id: p, name: p, _filePath: p, previewUrl: 'data:image/png;base64,AAAA', ow: 100, oh: 100, rotation: 0, type: 'image' }; };
+    var a = mk('C:/a.jpg'), b = mk('C:/b.jpg');
+    var flags = function (pages) { return pages.map(function (p) { return p === null; }); };
+    var s = getSettings();
+    s.rows = 1; s.cols = 1; s.copies = 1; s.duplex = true; s.collate = true;
+    s.reimburseMode = false; s.photoMode = false; s.pasteMode = false;
+    var reqPrint = buildLayoutRequest([a, b], s, null, { forPrint: true });
+    var reqSave = buildLayoutRequest([a, b], s);
+    s.copies = 2;
+    var reqMoreCopies = buildLayoutRequest([a, b], s, null, { forPrint: true });
+    return {
+      oneUp: flags(padDuplexSeparators([[a], [b]])),
+      sameFile: flags(padDuplexSeparators([[a], [a]])),
+      printBlanks: reqPrint.pages.filter(function (p) { return !!p.blank; }).length,
+      saveBlanks: reqSave.pages.filter(function (p) { return !!p.blank; }).length,
+      printPages: reqPrint.pages.length,
+      savePages: reqSave.pages.length,
+      copiesStable: JSON.stringify(reqMoreCopies.pages) === JSON.stringify(reqPrint.pages)
+    };
+  });
+  equal(duplex.oneUp, [false, true, false, true], '双面逐份：跨文件边界补空白页且末尾补齐偶数页');
+  equal(duplex.sameFile, [false, false], '双面逐份：同一文件多页不插空白页');
+  equal({ print: duplex.printBlanks, save: duplex.saveBlanks, printPages: duplex.printPages, savePages: duplex.savePages },
+    { print: 2, save: 0, printPages: 4, savePages: 2 }, '双面逐份：仅打印请求含空白分隔页');
+  equal(duplex.copiesStable, true, '双面逐份：改份数不改变 pages，PDF 缓存不误失效');
+  // 启动恢复期：文件列表恢复中禁止落盘，避免 filePaths 被残缺 S.files 覆盖
+  const restoreLock = await evaluate(() => {
+    var before = localStorage.getItem('ticketchan-settings');
+    _restoringFileList = true;
+    _restoreSavePending = false;
+    saveSettings();
+    var blocked = _restoreSavePending === true;
+    var unchanged = localStorage.getItem('ticketchan-settings') === before;
+    _restoringFileList = false;
+    _restoreSavePending = false;
+    return blocked && unchanged;
+  });
+  equal(restoreLock, true, '文件列表恢复期 saveSettings 挂起，不写残缺快照');
+  // printMode 旧键迁移：设置体写入失败时保留旧键，下次启动可再迁移
+  const migrateFallback = await evaluate(() => {
+    var settingsBefore = localStorage.getItem('ticketchan-settings');
+    var pmBefore = localStorage.getItem('ticketchan-print-mode');
+    var selectBefore = document.getElementById('printMode').value;
+    localStorage.setItem('ticketchan-print-mode', 'confirm');
+    localStorage.removeItem('ticketchan-settings');
+    var origSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function () { throw new Error('quota'); };
+    try { migrateLegacyPrintMode(); } finally { Storage.prototype.setItem = origSetItem; }
+    var kept = localStorage.getItem('ticketchan-print-mode') === 'confirm';
+    if (settingsBefore === null) localStorage.removeItem('ticketchan-settings');
+    else localStorage.setItem('ticketchan-settings', settingsBefore);
+    if (pmBefore === null) localStorage.removeItem('ticketchan-print-mode');
+    else localStorage.setItem('ticketchan-print-mode', pmBefore);
+    document.getElementById('printMode').value = selectBefore;
+    return kept;
+  });
+  equal(migrateFallback, true, 'printMode 迁移写入失败时保留旧键');
+
   await cdp('Browser.close');
   console.log('PASS: ' + checks + ' regression checks');
 }

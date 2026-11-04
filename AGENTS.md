@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- **版本**: v2.7.1-beta.2（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
+- **版本**: v2.7.1-beta.3（数据源 `package.json`，`npm run bump` 同步到 Cargo.toml + tauri.conf.json；`Cargo.lock` 的 `ticketchan` 包版本行需手动同步）
 - **技术栈**: Tauri 2.x (Rust) + 原生 HTML/CSS/JS（无框架、无打包）
 - **双版本**: 轻量版 / OCR 版（PP-OCRv6）；Cargo.toml 定义 `ocr` feature，`lib.rs` 按 `#[cfg(feature = "ocr")]` 条件注册命令，OCR 构建用 `tauri.ocr.conf.json` 叠加配置（仅追加 bundle.resources）
 - **目录结构**:
@@ -106,8 +106,10 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 **智能 PDF 缓存**（`print.js`）：
 
 - `deepEqual()` 深比较整个 `LayoutRenderRequest`，`canUseCachedPdf()` 判断复用——统一三个打印渠道 + 保存 PDF
-- `savePdf` 先生成到临时目录 → `updatePdfCache()` → `copy_file` 到用户路径；布局不变时直接复制缓存。v2.6.16 起保存前先弹窗选页码范围（全部 / 当前页 / 指定范围，单页不弹），范围经 `buildLayoutRequest(files, settings, pageRange)` 第三参切片 `pages`——属内容参数，缓存按范围自然失效
-- 缓存比较排除纯打印机参数（printerName/copies/duplex/collate），避免切打印机误判缓存失效
+- `savePdf` 先生成到临时目录 → `updatePdfCache()` → `copy_file` 到用户路径；布局不变时直接复制缓存。保存前支持选择页码范围，范围经 `buildLayoutRequest(files, settings, pageRange)` 切片 `pages`——属内容参数，缓存按范围自然失效
+- 缓存比较排除纯打印机参数（printerName/copies/duplex/collate），避免切打印机误判缓存失效；**例外**：「双面 / 逐份」在**确实需要插页时**会改变 `pages`（见下条），此时缓存自然失效并重生成；无需插页的场景（如单份且本身偶数页）`pages` 不变，缓存命中且结果正确
+- **双面 + 逐份隔离**（issue #62）：`duplex && collate` 时 `padDuplexSeparators()` 按源文件分组（`_pdfPath|_batchId` / `_filePath`），在页边界插入空白页把上一份补齐到偶数页，末尾也补齐（与份数无关，避免改份数触发 PDF 重生成），保证每份从纸张正面开始。空白页是 `PageSpec.blank`，两条 Rust 生成管道都要真实输出该页（**不能走「空页跳过」**）且不画裁切线 / 页脚 / 边框 / 水印；`pageNum` 的「共 N 页」按物理页计（含空白页），空白页自身不绘制页码。仅 `buildLayoutRequest(..., { forPrint:true })` 的 PDFium / SumatraPDF / HTML 兜底生效；预览、「保存为PDF」与「PDF阅读器」模式（双面由外部阅读器控制）不插页；多拼模式下同页内混排无法隔离
+- `collate` 经 `pdfium_vector_print` / `pdfium_print_pdf` 下发到 `build_dev_mode()`，多份时设 `DM_COLLATE + DMCOLLATE_TRUE`；关闭时保留驱动默认，**勿**强行设 `DMCOLLATE_FALSE`。**仅 PDFium 链路生效**：SumatraPDF 的 `-print-settings` 没有 collate 选项，备用模式下关闭「逐份打印」仍是整份重复打印；空白分隔页在该链路照常插入，故双面隔离不受影响
 
 ### 旋转与适配语义（全链路约定，issue #29）
 
@@ -174,7 +176,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **打印状态追踪**：四种模式成功后 `markFilesAsPrinted()` → ✓ 标识；`_printedMap` 持久化 localStorage；`clearAll()/executeRename()/resetSettings()` 迁移 key。
 
-**文件列表记忆**（可选 `S.feat.fileListMemory`）：启动 `restoreFiles()` 批量恢复路径，`check_path_exists` 校验；`_isRestoringFiles` 阻止恢复期触发 OCR。
+**文件列表记忆**（可选 `S.feat.fileListMemory`）：启动 `restoreFiles()` 批量恢复路径，`check_path_exists` 校验；`_isRestoringFiles` 阻止恢复期触发 OCR。启动期三层保存锁：`_restoringSettings`（loadSettings 后 1s 内禁止回写，防空 DOM 快照）、`_restoringFileList`（restoreFiles 全程禁止落盘，防残缺 `S.files` 覆盖 `filePaths`）、`_restoreSavePending`（被拦截的保存待恢复完成后补一次）；`slotAdj` / `notes` / `printed` 另以内存 Map 打底。
 
 **重复发票识别**：`getDupKey()` 按发票号（`no:`）或 销售方+金额+日期（`sum:` 疑似）生成 key 标记 `_dup`。**安全边界**：自动删除只信任 `no:` key，`sum:` 一律跳过（同日同销售方同金额的真发票会被误判，仅标记交人工核对）；「重复」筛选会覆盖原有勾选（toast 明示）。
 
@@ -233,9 +235,9 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 
 **相纸模式**（v2.6.16，issue #55）：与报销单 / 粘贴单并列的第三种版式模式（`S.feat.photoMode`，互斥）。`getPhotoGrid(settings)` 按证件照实际尺寸求每页列/行：自动铺满用「留边」算容量；手动列/行只受纸张物理尺寸约束（留边可被压缩，栅格仍居中），超出物理容量时收敛。默认间距 2mm、留边 3mm（对齐常见排版工具：6寸一寸自动 12 张、5寸一寸自动 9 张）；「常用张数」按钮（4/6/8/9/12/16）由 `findPhotoCountGrid()` 选能放下的最接近纸张比例的列×行，放不下则禁用。证件照规格下拉由 `renderPhotoSizeOptions()` 从 `PAPER_PHOTO_SIZES` 生成，每项括号内标注常用场景；`photoCard`（身份证实际卡片尺寸 85.6×54mm，issue #57）仅用于相纸模式、不进纸张规格；该函数须先于 `loadSettings()` 恢复 `photoSize` 调用，否则保存的规格会回落一寸。`calculateLayout` 的 photo 分支让槽位严格等于 `photoW × photoH`，整版居中，普通行列/边距/间距/页脚全部忽略；`getPerPage` 返回栅格容量；Rust `calculate_layout_mm` / `slot_size_mm` 的 photo 分支必须逐字镜像。`getSettings()` 在 photoMode 下强制 `trimWhite/watermark/pageNum/printDate/footerText=false`（这些会挤占版心或污染照片），裁切线沿用全局 `cutline` 开关（issue #57，预览 `calculateLayout` / Rust / HTML 兜底三处同口径）；`togglePhotoMode()` 开启时固定自适应适配与 0° 旋转，并与报销单/粘贴单互斥。`syncPhotoModeUI()` 负责选项显隐、被接管控件置灰（grid/margin/gap）、排列提示与常用张数按钮重绘；`syncReimburseUI()` 同时考虑 photoMode 的置灰（marginSec 仅相纸模式置灰，报销单仍需边距）。web 分支无报销单/粘贴单，但相纸模式与栅格逻辑完全同步（`js/layout.js` + `js/print.js` 的缓存键）。
 
-**导出 / 导入配置**（`exportSettings()`/`importSettings()`，issue #50）：数据同源——`collectSettings()`（saveSettings 的收集逻辑抽出共用）+ 独立存储的偏好键（theme/amtMode/ocrEnabled/pdfTextEnabled/ocrPrecision/saveDir/updateChannel）；导出经原生「另存为」写 JSON（含 `_meta` 头）；导入校验 `_meta.app`（或 layout+feat）→ 写回同名 localStorage 键 → **`location.reload()` 重载生效**（不重载会被下次自动保存覆盖回去），Rust 侧 `read_text_file` 与之配套。
+**导出 / 导入配置**（`exportSettings()`/`importSettings()`，issue #50）：数据同源——`collectSettings()`（saveSettings 的收集逻辑抽出共用）+ 独立存储的偏好键（theme/amtMode/ocrEnabled/pdfTextEnabled/ocrPrecision/saveDir/updateChannel/updateSource）；导出经原生「另存为」写 JSON（含 `_meta` 头）；导入校验 `_meta.app`（或 layout+feat）→ 写回同名 localStorage 键 → **`location.reload()` 重载生效**（不重载会被下次自动保存覆盖回去），Rust 侧 `read_text_file` 与之配套。
 
-**更新检查**：`check_for_updates(channel, source)`（ureq 调 GitHub Releases API，主源 `api.github.com` 失败回退 `gh-proxy.com`）；更新来源可在设置→关于或更新弹窗选择（`ticketchan-update-source`，默认 `fork` = `chenghaitao/fapiao-print` 最新正式版，`official` = `erma0/fapiao-print`，跟随所选正式 / 测试渠道）；导出 / 导入包含来源，切换来源即清缓存并重新检查。**双更新渠道**（v2.6.16-beta.6，issue #58）——渠道可在设置→关于手动选择（`ticketchan-update-channel`，未选择时按安装版本：版本号含 `-` 即测试版；导出 / 导入包含该项，切换即清 `ticketchan-update-cache`）。**正式渠道**只查 `/releases/latest`（GitHub 该接口天然排除预发布，不会收到 beta）；**测试渠道**查 `/releases?per_page=20` 并按 semver 取「高于当前版本的最大项」（能收到新 beta，也能在同版本转正后提示正式版，但绝不会把旧正式版 2.6.14 当成新版本；本 Fork 固定查 latest）。`compare_versions()` 支持预发布语义（`2.6.16-beta.3 < 2.6.16` 且 `> 2.6.14`），**禁止**退回纯数字分段比较（曾把 `2.6.16-beta.2` 解析成 `2.6.2`）。启动 5 秒后静默检查（1 小时缓存 `ticketchan-update-cache` 防速率限制，缓存按 `ver + channel + source` 校验），状态栏版本号/关于面板可手动触发；更新弹窗 `#updateModal` 展示渠道徽章（`is_prerelease`）、来源选择、Markdown 更新说明（前端 `renderReleaseNotes()`）、与当前安装类型（`hasOcr`）匹配的推荐产物（`getAssetVariant()`）。**忽略体系**（v2.6.0）：`shouldAutoShowUpdate()` 只拦静默弹窗——`ticketchan-update-ignore`（忽略此版本，弹窗按钮）+ `ticketchan-update-ignore-all`（忽略所有，弹窗按钮 + 设置→关于「自动检查更新」开关 `toggleAutoUpdateCheck`，`showApp` 里 `syncAutoUpdateCheckUI()` 同步）；手动检查不受忽略影响。未用 Tauri Updater（4 产物 + 无签名证书，引导用户去 Release 自选）。Release Notes 由 CI 从 CHANGELOG.md 提取 `## v<tag>` 段落写入 `release_body.txt`。
+**更新检查**：`check_for_updates(channel, source)`（ureq 调 GitHub Releases API，主源 `api.github.com` 失败回退 `gh-proxy.com`）；更新来源可在设置→关于或更新弹窗选择（`ticketchan-update-source`，默认 `fork` = `chenghaitao/fapiao-print` 最新 Release，含预发布；`official` = `erma0/fapiao-print`，跟随所选正式 / 测试渠道）；导出 / 导入包含来源，切换来源即清缓存并重新检查。**双更新渠道**（v2.6.16-beta.6，issue #58）——渠道可在设置→关于手动选择（`ticketchan-update-channel`，未选择时按安装版本：版本号含 `-` 即测试版；导出 / 导入包含该项，切换即清 `ticketchan-update-cache`）。**正式渠道**只查 `/releases/latest`（GitHub 该接口天然排除预发布，不会收到 beta）；**测试渠道**查 `/releases?per_page=20` 并按 semver 取「高于当前版本的最大项」（能收到新 beta，也能在同版本转正后提示正式版，但绝不会把旧正式版 2.6.14 当成新版本；本 Fork 总是选最高的新版本）。`compare_versions()` 支持预发布语义（`2.6.16-beta.3 < 2.6.16` 且 `> 2.6.14`），**禁止**退回纯数字分段比较（曾把 `2.6.16-beta.2` 解析成 `2.6.2`）。启动 5 秒后静默检查（1 小时缓存 `ticketchan-update-cache` 防速率限制，缓存按 `ver + channel + source` 校验），状态栏版本号/关于面板可手动触发；更新弹窗 `#updateModal` 展示渠道徽章（`is_prerelease`）、来源选择、Markdown 更新说明（前端 `renderReleaseNotes()`）、与当前安装类型（`hasOcr`）匹配的推荐产物（`getAssetVariant()`）。**忽略体系**（v2.6.0）：`shouldAutoShowUpdate()` 只拦静默弹窗——`ticketchan-update-ignore`（忽略此版本，弹窗按钮）+ `ticketchan-update-ignore-all`（忽略所有，弹窗按钮 + 设置→关于「自动检查更新」开关 `toggleAutoUpdateCheck`，`showApp` 里 `syncAutoUpdateCheckUI()` 同步）；手动检查不受忽略影响。未用 Tauri Updater（4 产物 + 无签名证书，引导用户去 Release 自选）。Release Notes 由 CI 从 CHANGELOG.md 提取 `## v<tag>` 段落写入 `release_body.txt`。
 
 **应用内自更新**（v2.7.0，`updater.rs`，issue #58）：更新弹窗「⬇️ 下载并更新」→ 下载 → 校验 → 替换 exe → 自动重启，不跑 NSIS 安装器。流程：`download_update(url, sha256, size, is_zip)` 下载到 exe 同目录 `ticketchan.part`（边下边算 sha256、emit `update-download-progress`），通过后落地 `ticketchan.update`；`apply_update_and_restart()` 隐藏窗口 → 当前 exe 改名 `ticketchan.old.exe` → `.update` 改回原名 → spawn 新 exe → 300ms 后 `TerminateProcess`；`check_pending_update()` 启动时清理 `.part`/`.tmp`/`.old`，若有 `.update` 则补偿应用（失败即删除，**绝不重启循环**）。硬约束：①**只换 exe**，OCR 模型不动（`<exe_dir>/models` 原样保留）——轻量版取 `*_portable.exe`，OCR 版取 `*_ocr-portable.zip` 内层 exe，安装包（NSIS）不可当主程序；②URL 必须命中白名单（Fork / 官方 GitHub Release、`objects.githubusercontent.com` / gh-proxy），sha256 取 GitHub API 的 `digest`（历史资产缺失则该按钮隐藏、回退浏览器），另校验 size 与 PE 头；API 走 gh-proxy 兜底时资产下载 URL 同步改写为 gh-proxy 形式，否则客户端仍会直连 github.com 而失败；③任一步失败必须回滚旧 exe 并保留 `.update`；④退出必须 `TerminateProcess`。`UpdateAsset` 的 `digest` 字段由 `parse_release()` 读取。
 
@@ -303,7 +305,7 @@ Rust generate_pdf_from_layout() — lopdf 直通管道 → 失败回退 printpdf
 6. 占位（`_placeholder`）只占槽位：打印/统计/汇总/重命名/OCR 全部排除
 7. 自动去重只删 `no:` key，`sum:` 仅标记
 8. 类型/格式筛选切换后必须重算勾选集合（`selectFilteredOnly()` / `applyFilterSelection()`）
-9. `deepEqual` 缓存比较排除纯打印机参数（printerName/copies/duplex/collate）
+9. `deepEqual` 缓存比较排除纯打印机参数（printerName/copies/duplex/collate）；双面 + 逐份**需要插页时**会改 `pages`，此时缓存自然失效重生成，勿为「缓存稳定」把插页挪到 Rust 端
 10. 桌面/web 双分支：识别（ocr.js ↔ js/pdf-text.js）与预览布局（layout.js ↔ js/layout.js）逻辑保持一致，同步时机为 **桌面端 release 前**，日常修复不必即时同步
 11. 新增 http 请求一律走 `build_http_agent()`；裸建 `ureq::AgentBuilder` 会丢 TLS 后端（见「关键踩坑」）
 12. 自更新只换 exe（不跑安装器、不动 models）；下载必须过 URL 白名单 + digest/size 校验，替换失败必须回滚，退出用 `TerminateProcess`（见「应用内自更新」）

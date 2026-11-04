@@ -583,12 +583,11 @@ fn fetch_releases_json(agent: &ureq::Agent, urls: &[String]) -> Result<(serde_js
 /// Returns update info including latest version, release notes, and download assets.
 /// Uses blocking ureq offloaded to the blocking thread pool.
 ///
-/// 更新渠道按前端选择分流（设置→关于可切换，默认按安装版本，issue #58）：
-/// - `stable`：只查 `/releases/latest`，GitHub 该接口天然排除预发布，
-///   因此正式版渠道不会收到测试版提示；
-/// - `beta`：查 `/releases` 列表，按 semver 规则选出高于当前版本的最大者——
-///   既能收到更新的 beta，也能在同版本转正后提示正式版，
-///   但绝不会把旧正式版（如 2.6.14）当成「新版本」。
+/// 更新来源和渠道按前端选择分流：
+/// - `fork`：查询 Fork 的完整 Release 列表，按 semver 选择最高的更新（含预发布）；
+/// - `official`：更新渠道按前端选择分流（设置→关于可切换，默认按安装版本，issue #58）：
+///   - `stable`：只查 `/releases/latest`，GitHub 该接口天然排除预发布；
+///   - `beta`：查 `/releases` 列表，按 semver 规则选出高于当前版本的最大者。
 /// `channel` 未传时按安装版本判定（版本号含 `-` 即测试版）。
 ///
 /// 主备双源: 先尝试直连 api.github.com,失败后 fallback 到 gh-proxy.com 加速代理。
@@ -613,10 +612,10 @@ async fn check_for_updates(
             Some("stable") => false,
             _ => current.contains('-'),
         };
-        let path = if source == "fork" || !is_beta_channel {
-            "/releases/latest"
-        } else {
+        let path = if source == "fork" || is_beta_channel {
             "/releases?per_page=20"
+        } else {
+            "/releases/latest"
         };
         let repo = if source == "fork" {
             "chenghaitao/fapiao-print"
@@ -1000,6 +999,7 @@ async fn pdfium_vector_print(
     printer_name: Option<String>,
     copies: u32,
     duplex: bool,
+    collate: Option<bool>,
 ) -> Result<pdf_engine::PdfResult, String> {
     use std::sync::atomic::Ordering;
 
@@ -1049,6 +1049,7 @@ async fn pdfium_vector_print(
         Some(resolved_printer),
         copies,
         duplex,
+        collate,
         color_mode,
         paper_w,
         paper_h,
@@ -1067,6 +1068,7 @@ async fn pdfium_print_pdf(
     printer_name: Option<String>,
     copies: u32,
     duplex: bool,
+    collate: Option<bool>,
     color_mode: String,
     paper_w: f32,
     paper_h: f32,
@@ -1107,6 +1109,7 @@ async fn pdfium_print_pdf(
             &printer,
             copies,
             duplex,
+            collate.unwrap_or(false),
             &color_mode,
             paper_w,
             paper_h,
@@ -1248,6 +1251,9 @@ async fn pdfium_vector_print(
     _app: tauri::AppHandle,
     _request: LayoutRenderRequest,
     _printer_name: Option<String>,
+    _copies: u32,
+    _duplex: bool,
+    _collate: Option<bool>,
 ) -> Result<pdf_engine::PdfResult, String> {
     Err("PDFium打印仅支持Windows系统".to_string())
 }
@@ -1260,6 +1266,7 @@ async fn pdfium_print_pdf(
     _printer_name: Option<String>,
     _copies: u32,
     _duplex: bool,
+    _collate: Option<bool>,
     _color_mode: String,
     _paper_w: f32,
     _paper_h: f32,

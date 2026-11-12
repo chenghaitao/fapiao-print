@@ -543,6 +543,10 @@ input[type="range"] { flex: 1; height: 5px; accent-color: var(--accent); cursor:
 /* ===== Per-slot adjustment ===== */
 .invoice-slot { cursor: pointer; }
 .invoice-slot.selected { outline: 2px solid var(--accent); z-index: 5; overflow: visible !important; }
+.slot-marquee {
+  position: absolute; pointer-events: none; z-index: 30;
+  border: 1px dashed var(--accent); background: rgba(37, 99, 235, 0.10);
+}
 .invoice-slot.dragging { opacity: 0.85; cursor: grabbing; overflow: visible !important; pointer-events: none; }
 .invoice-slot.drop-target { outline: 2px dashed var(--accent); z-index: 6; }
 /* 顺位插入落点：在目标槽位主轴边缘画插入指示线 */
@@ -787,6 +791,7 @@ html.dark .toast-spinner { border-color: rgba(226,232,240,0.3); border-top-color
 }
 .update-asset:hover { border-color: var(--accent); background: var(--accent-light); }
 .update-asset.recommended { border-color: var(--accent); }
+.update-asset.auto { border-color: var(--accent); background: var(--accent-light); }
 .update-asset-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .update-asset-name { color: var(--text-primary); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .update-asset-meta { font-size: 11px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }

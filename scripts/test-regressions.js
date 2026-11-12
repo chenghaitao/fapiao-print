@@ -120,6 +120,40 @@ async function run() {
   equal(names[1], { buyer: '购方测试有限公司', seller: '张三' }, '保留个人销售方');
   equal(names[2], { buyer: '购方测试有限公司', seller: '' }, '缺失销方不能拿购方填充');
 
+  // issue #56：拆字模板（购买方/名称/统一社会 全是单字）+ 横向压缩的长信用代码
+  // + 右边缘竖排词 + 顶部整词日期。旧实现里购方代码中心越过动态边界被判成销方，
+  // Rule 4 再把购方名称搬到销方；「开票日期」被拆字导致日期全空。
+  const splitTemplate = await evaluate(() => {
+    var rows = [
+      ['2026年11月07日', 1955.8, 145.0, 233.3],
+      ['购', 121, 283.3, 35.4], ['买', 121, 324.8, 35.4], ['方', 121, 366.8, 35.4],
+      ['名', 205, 283.3, 35.4], ['称', 275.9, 283.3, 35.4],
+      ['深圳博雅科技发展有限公司', 295.8, 283.3, 466.7],
+      ['统', 205, 324.8, 35.4], ['一', 275.9, 324.8, 35.4],
+      ['社', 346.8, 324.8, 35.4], ['会', 417.2, 324.8, 35.4],
+      ['91440300MA5FAB1234', 748.7, 324.8, 300.0],
+      ['销', 1264.5, 283.3, 35.4], ['售', 1264.5, 324.8, 35.4], ['方', 1264.5, 366.8, 35.4],
+      ['名', 1348.5, 283.3, 35.4], ['称', 1419.4, 283.3, 35.4],
+      ['上海某某科技有限公司', 1441.7, 283.3, 400.0],
+      ['统', 1417.0, 324.8, 35.4], ['一', 1488.0, 324.8, 35.4],
+      ['社', 1559.0, 324.8, 35.4], ['会', 1630.0, 324.8, 35.4],
+      ['91310115MA1K4AB123', 1886.6, 324.8, 300.0],
+      ['备注栏：9', 2401.6, 278.1, 37.5, 206.3],
+    ];
+    var input = { imgW: 2480, imgH: 1653, text: rows.map(r => r[0]).join('\n'),
+      lines: rows.map(r => ({ confidence: 1, words: [{ text: r[0], x: r[1], y: r[2], w: r[3], h: r[4] || 33.3 }] })) };
+    var info = extractByCoordinates(input);
+    return { date: info.invoiceDate, buyer: info.buyerName, seller: info.sellerName,
+      buyerCc: info.buyerCreditCode, sellerCc: info.sellerCreditCode };
+  });
+  equal(splitTemplate, {
+    date: '2026-11-07',
+    buyer: '深圳博雅科技发展有限公司',
+    seller: '上海某某科技有限公司',
+    buyerCc: '91440300MA5FAB1234',
+    sellerCc: '91310115MA1K4AB123',
+  }, 'issue #56 拆字模板的日期与购销方');
+
   const remarks = await evaluate(() => {
     function extract(withRemark) {
       var rows = [['价税合计（大写）', 40, 400, 120], ['（小写）', 650, 400, 60],
@@ -131,10 +165,38 @@ async function run() {
       }) };
       return _extractItemNameRemarkByCoords(_buildWords(input.lines, input.imgW, input.imgH), input.imgW, input.imgH).invoiceRemark;
     }
-    return [extract(false), extract(true)];
+    // issue #56：无合计锚点、竖排「备/注」标签在备注框下部、正文在标签上方、
+    // 页脚取值与标签字交错（开/票/张三/人/：）——页脚既不能混进备注，也不能按 x 排序拼出错序文本
+    function sample(hasLabel, withAmounts) {
+      var content = '购买方名称:测试公司;纳税人识别号:91310000123456789A;地址:测试地址;开户行及账号:测试银行1234567890';
+      var lines = [];
+      if (withAmounts) lines.push(
+        { confidence: 1, words: [
+          { text: '¥', x: 1775.0, y: 1080.8, w: 16.7, h: 33.3 },
+          { text: '1,250.00', x: 1808.3, y: 1080.8, w: 100.0, h: 33.3 }] },
+        { confidence: 1, words: [{ text: '（壹仟贰佰伍拾圆整）', x: 222.0, y: 1149.8, w: 500.0, h: 33.3 }] });
+      lines.push({ confidence: 1, words: [{ text: content, x: 187.9, y: 1226.8, w: 1600.0, h: 33.3 }] });
+      if (hasLabel) lines.push({ confidence: 1, words: [
+        { text: '备', x: 121.0, y: 1296.8, w: 35.4, h: 33.3 },
+        { text: '注', x: 121.0, y: 1364.8, w: 35.4, h: 33.3 }] });
+      lines.push({ confidence: 1, words: [
+        { text: '开', x: 205.5, y: 1572.3, w: 35.4, h: 33.3 },
+        { text: '票', x: 276.4, y: 1572.3, w: 35.4, h: 33.3 },
+        { text: '张三', x: 333.5, y: 1576.8, w: 100.0, h: 33.3 },
+        { text: '人', x: 347.3, y: 1572.3, w: 35.4, h: 33.3 },
+        { text: '：', x: 417.7, y: 1572.3, w: 35.4, h: 33.3 }] });
+      return _extractItemNameRemarkByCoords(_buildWords(lines, 2480, 1653), 2480, 1653).invoiceRemark;
+    }
+    return [extract(false), extract(true), sample(true, true), sample(false, false),
+      _isFooterLineText('开票金额合计人民币'), _isFooterLineText('开票张三人：')];
   });
   equal(remarks[0], '', '空备注不混入基线较低的大写/数字金额');
   equal(remarks[1], '合同金额250元，按月结算 收款银行：测试银行', '居中备注标签上方的正文及正文金额保留');
+  equal(remarks[2], '购买方名称:测试公司;纳税人识别号:91310000123456789A;地址:测试地址;开户行及账号:测试银行1234567890',
+    'issue #56 无锚点时取标签上方正文，交错页脚不混入');
+  equal(remarks[3], '购买方名称:测试公司;纳税人识别号:91310000123456789A;地址:测试地址;开户行及账号:测试银行1234567890',
+    'issue #56 无标签兜底同样剔除交错页脚行');
+  equal([remarks[4], remarks[5]], [false, true], '交错页脚识别不误伤正文');
 
   await evaluate(() => {
     window.reviewSetup = function(cols, reverse, ordinal) {
@@ -243,6 +305,67 @@ async function run() {
   const blankHit = await evaluate(() => { var r = document.getElementById('previewWrap').getBoundingClientRect(); return { x: Math.round(r.right - 12), y: Math.round(r.bottom - 12) }; });
   await click(blankHit);
   equal(await evaluate(() => S.selectedSlot), -1, '点预览空白仍取消选中');
+
+  // issue #64：Ctrl+点击 / 拖框多选，滚轮与工具条批量作用于全部选中票（仅当前页）
+  const multi = await evaluate(() => {
+    var svg = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="250" height="350"><rect width="250" height="350" fill="red"/></svg>');
+    function setup() {
+      S.feat.reimburse = false; S.feat.pasteMode = false; S.feat.photoMode = false;
+      S.layout = { cols: 1, rows: 2 };
+      S.files = ['A', 'B'].map(function(n) {
+        return createFileObj({ name: n + '.png', type: 'image', previewUrl: svg, ow: 250, oh: 350 });
+      });
+      S.currentPage = 0;
+      selectSlot(-1);
+      updatePreview();
+    }
+    function slot(idx) { return document.querySelector('.invoice-slot[data-slot-idx="' + idx + '"]'); }
+    function ctrlClick(idx) {
+      slot(idx).dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, ctrlKey: true }));
+    }
+    var out = {};
+    setup();
+    selectSlot(0);
+    ctrlClick(1);
+    out.selected = getSelectedSlotIndices();
+    slot(1).dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -100 }));
+    out.scaled = [S.files[0].slotScale, S.files[1].slotScale];
+    resetSlotAdj();
+    out.reset = [S.files[0].slotScale, S.files[1].slotScale];
+    rotateSelected();
+    out.rotated = [S.files[0].rotation, S.files[1].rotation];
+
+    setup();
+    selectSlot(0);
+    ctrlClick(1);
+    setSlotCopies(2);
+    out.copies = [S.files[0].copies, S.files[1].copies];
+
+    setup();
+    var box = document.querySelector('.preview-container');
+    var c = box.getBoundingClientRect();
+    var s0 = slot(0).getBoundingClientRect();
+    var start = { clientX: Math.max(c.left + 1, s0.left - 3), clientY: Math.max(c.top + 1, s0.top - 3) };
+    var end = { clientX: c.right - 2, clientY: c.bottom - 2 };
+    box.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, clientX: start.clientX, clientY: start.clientY }));
+    document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: end.clientX, clientY: end.clientY }));
+    document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: end.clientX, clientY: end.clientY }));
+    out.marquee = getSelectedSlotIndices();
+    out.marqueePrimary = S.selectedSlot;
+
+    deleteSlotInvoice();
+    out.afterDelete = S.files.length;
+    out.afterDeleteSel = S.selectedSlot;
+    return out;
+  });
+  equal(multi.selected, [0, 1], 'Ctrl+点击多选两个槽位');
+  equal(multi.scaled, [1.05, 1.05], '滚轮同步缩放全部选中票');
+  equal(multi.reset, [1, 1], '工具条重置作用于全部选中票');
+  equal(multi.rotated, [90, 90], '工具条旋转作用于全部选中票');
+  equal(multi.copies, [2, 2], '工具条份数作用于全部选中票');
+  equal(multi.marquee, [0, 1], '拖框选中当前页两张票');
+  equal(multi.marqueePrimary, 0, '拖框后首张为主选中');
+  equal([multi.afterDelete, multi.afterDeleteSel], [0, -1], '工具条删除批量移除选中票并清空选中');
 
   // 删除后按文件对象重定位选中：槽位序号会整体前移，沿用旧索引会指到别的票
   const rmState = await evaluate(() => {

@@ -5556,7 +5556,10 @@ async function importSettings() {
     if (data.ocrPrecision === 'fast' || data.ocrPrecision === 'standard' || data.ocrPrecision === 'precise') localStorage.setItem('ticketchan-ocr-precision', data.ocrPrecision);
     if (typeof data.saveDir === 'string') localStorage.setItem('ticketchan-save-dir', data.saveDir);
     if (data.updateChannel === 'stable' || data.updateChannel === 'beta') localStorage.setItem('ticketchan-update-channel', data.updateChannel);
-    if (data.updateSource === 'fork' || data.updateSource === 'official') localStorage.setItem(_UPDATE_SOURCE_KEY, data.updateSource);
+    if (data.updateSource === 'fork' || data.updateSource === 'official') {
+      localStorage.setItem(_UPDATE_SOURCE_KEY, data.updateSource);
+      localStorage.setItem(_UPDATE_SOURCE_SET_KEY, '1'); // 导入等同用户选择，升级时保留
+    }
     if (typeof data.autoUpdateCheck === 'boolean') localStorage.setItem(_UPDATE_IGNORE_ALL_KEY, data.autoUpdateCheck ? '' : '1');
   } catch(e) {
     _importingSettings = false; // 写入失败解锁，恢复自动保存
@@ -5703,6 +5706,7 @@ function resetSettings(scope) {
   try { localStorage.removeItem('ticketchan-pdf-text-enabled'); } catch(e) {}
   try { localStorage.removeItem('ticketchan-update-channel'); } catch(e) {}
   try { localStorage.removeItem(_UPDATE_SOURCE_KEY); } catch(e) {}
+  try { localStorage.removeItem(_UPDATE_SOURCE_SET_KEY); } catch(e) {}
   try { localStorage.removeItem(_UPDATE_IGNORE_ALL_KEY); } catch(e) {}
   syncUpdateChannelUI();
   syncUpdateSourceUI();
@@ -6061,6 +6065,7 @@ renderQuickLayoutList();
 (function() {
   function showApp() {
     syncAutoUpdateCheckUI();
+    migrateUpdateSourceDefault();
     syncUpdateSourceUI();
     if (isTauri && invoke) {
       // 上次更新若只替换到一半（例如文件被占用），启动时补偿完成并自动重启
@@ -6144,6 +6149,8 @@ var _updateRequestId = 0; // 切渠道时令旧请求失效，允许立即检查
 var _lastUpdateInfo = null;
 var _UPDATE_CHANNEL_KEY = 'ticketchan-update-channel';
 var _UPDATE_SOURCE_KEY = 'ticketchan-update-source';
+var _UPDATE_SOURCE_SET_KEY = 'ticketchan-update-source-set'; // 该 key 存在 = 用户明确选过来源
+var _UPDATE_SOURCE_DEFAULT = 'fork';                        // 默认更新来源：本 Fork
 
 // 应用内自更新状态（issue #58）：下载 → 校验 → 替换 exe → 自动重启
 var _updateAssetPicked = null; // 当前可自动替换的产物（带 digest）
@@ -6170,12 +6177,32 @@ function getUpdateChannel() {
   return getDefaultUpdateChannel();
 }
 
+/** 用户是否「明确选过」更新来源；旧版本没有该标记，其留下的值不算用户选择 */
+function isUpdateSourceChosen() {
+  try { return localStorage.getItem(_UPDATE_SOURCE_SET_KEY) === '1'; } catch(e) { return false; }
+}
+
 function getUpdateSource() {
+  if (!isUpdateSourceChosen()) return _UPDATE_SOURCE_DEFAULT;
   try {
     var saved = localStorage.getItem(_UPDATE_SOURCE_KEY);
     if (saved === 'fork' || saved === 'official') return saved;
   } catch(e) {}
-  return 'fork';
+  return _UPDATE_SOURCE_DEFAULT;
+}
+
+/**
+ * 升级迁移：来源选择器上线初期默认值是官方源，旧版本留下的 `official`
+ * 并不代表用户主动选择，这里一次性回落到默认的本 Fork。
+ * 用户在本版本里再切换时会被打上「明确选择」标记，之后一直沿用。
+ */
+function migrateUpdateSourceDefault() {
+  if (isUpdateSourceChosen()) return;
+  try {
+    if (localStorage.getItem(_UPDATE_SOURCE_KEY) !== _UPDATE_SOURCE_DEFAULT) {
+      localStorage.setItem(_UPDATE_SOURCE_KEY, _UPDATE_SOURCE_DEFAULT);
+    }
+  } catch(e) {}
 }
 
 function setUpdateSource(source) {
@@ -6185,7 +6212,10 @@ function setUpdateSource(source) {
     syncUpdateSourceUI();
     return;
   }
-  try { localStorage.setItem(_UPDATE_SOURCE_KEY, source); } catch(e) {}
+  try {
+    localStorage.setItem(_UPDATE_SOURCE_KEY, source);
+    localStorage.setItem(_UPDATE_SOURCE_SET_KEY, '1'); // 用户明确选择，升级时不再回落默认
+  } catch(e) {}
   _updateRequestId++;
   _updateChecking = false;
   _lastUpdateInfo = null;

@@ -523,8 +523,18 @@ async function run() {
     showUpdateModal = function(info) { shown.push(info.channel); };
     toast = function(text) { toasts.push(text); };
     localStorage.removeItem(_UPDATE_SOURCE_KEY);
+    localStorage.removeItem(_UPDATE_SOURCE_SET_KEY);
     var defaultSource = getUpdateSource();
+    // 旧版本留下的官方源（没有「明确选择」标记）升级后回落到默认的本 Fork
+    localStorage.setItem(_UPDATE_SOURCE_KEY, 'official');
+    var legacySource = getUpdateSource();
+    migrateUpdateSourceDefault();
+    var migratedStored = localStorage.getItem(_UPDATE_SOURCE_KEY);
+    // 用户明确切换后带标记，再次迁移不会覆盖
     setUpdateSource('official');
+    var chosenMarker = localStorage.getItem(_UPDATE_SOURCE_SET_KEY);
+    migrateUpdateSourceDefault();
+    var chosenKept = getUpdateSource();
     var savedSource = getUpdateSource();
     var syncedSource = [document.getElementById('updateSourcePrefs').value, document.getElementById('updateSource').value];
     setUpdateSource('fork');
@@ -574,7 +584,8 @@ async function run() {
       returnedChannelStale: returnedChannelStale,
       source: { defaultSource: defaultSource, savedSource: savedSource, requestSource: requests[0].source,
         stale: shown.length === 0, cachedSource: JSON.parse(localStorage.getItem(_UPDATE_CACHE_KEY)).source,
-        syncedSource: syncedSource, officialRequestSource: requests[7].source, sourceSwitchClosedModal: sourceSwitchClosedModal } };
+        syncedSource: syncedSource, officialRequestSource: requests[7].source, sourceSwitchClosedModal: sourceSwitchClosedModal,
+        legacySource: legacySource, migratedStored: migratedStored, chosenMarker: chosenMarker, chosenKept: chosenKept } };
   });
   equal(updates.stale, { shown: [], cache: null, checking: true, requests: 2 }, '旧响应不能污染缓存或解除新请求锁');
   equal(updates.accepted, { channel: 'stable', checking: false, message: '本 Fork 已是最新版本 v2.6.16-beta.8' }, '当前渠道响应正常生效');
@@ -582,7 +593,8 @@ async function run() {
   equal(updates.poisonedCacheFetched, true, '拒绝历史串渠道缓存');
   equal(updates.returnedChannelStale, true, '切走再切回仍丢弃旧响应');
   equal(updates.source, { defaultSource: 'fork', savedSource: 'official', requestSource: 'fork', stale: true, cachedSource: 'official',
-    syncedSource: ['official', 'official'], officialRequestSource: 'official', sourceSwitchClosedModal: true },
+    syncedSource: ['official', 'official'], officialRequestSource: 'official', sourceSwitchClosedModal: true,
+    legacySource: 'fork', migratedStored: 'fork', chosenMarker: '1', chosenKept: 'official' },
     '更新源默认 Fork、切换持久化且旧源响应失效');
   // issue #62：双面 + 逐份按源文件边界补空白页；预览 / 保存 PDF 不补
   const duplex = await evaluate(() => {

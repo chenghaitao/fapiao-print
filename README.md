@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue.svg)]()
 [![Tauri 2.x](https://img.shields.io/badge/Tauri-2.x-orange.svg)]()
-[![Version](https://img.shields.io/badge/Version-2.7.2-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-2.7.3-blue.svg)]()
 
 轻量桌面应用，专为批量打印电子发票设计。支持 PDF、OFD、图片等多格式导入，智能排版，一键打印或导出。
 
@@ -310,6 +310,7 @@ npm run bump 2.7.1   # 同步 package.json → Cargo.toml → tauri.conf.json
 - [x] 灰度 JPEG 色域修复 + 预览多选与滚轮同步缩放（issue #66 / #64）（v2.7.1-beta.7）
 - [x] 预览框选支持纸张外灰底起框 + 选框跟随滚动偏移（issue #64）（v2.7.2）
 - [x] 更新弹窗改版：渐变横幅 + 合并操作区 + 下载中拦截关闭（v2.7.2）
+- [x] 更新来源默认固定本 Fork（旧版本遗留的官方源选择自动回落，手动切换仍会保留）（v2.7.3）
 
 ## 🤖 关于此项目
 

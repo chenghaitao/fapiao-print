@@ -89,6 +89,14 @@ jobs:
         run: |
           chcp 65001
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          # ocr-rs 的 build.rs 用 `powershell`(5.1) 调 Expand-Archive 解压 MNN 预编译包。
+          # Runner 镜像把 PowerShell 7 的模块目录写进了 PSModulePath，5.1 会优先加载
+          # PS7 版 Microsoft.PowerShell.Archive —— 它内部调用只有 .NET Core 才有的三参
+          # ExtractToDirectory 重载，于是报「Cannot find an overload ... argument count: 3」
+          # 并 panic（2026-11-14 镜像更新后开始复现）。这里显式把模块搜索路径收回 5.1 默认目录。
+          $env:PSModulePath = 'C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules'
+          Write-Host "powershell.exe => $((Get-Command powershell).Source)"
+          Write-Host "PSModulePath  => $env:PSModulePath"
           npm run build:all
 
       - name: Verify artifacts
